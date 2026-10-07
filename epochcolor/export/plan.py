@@ -55,6 +55,7 @@ class AudioStream:
     codec: str
     channels: int
     title: str = ""
+    layout: str = ""
 
 
 @dataclass
@@ -258,7 +259,9 @@ def _speed_args(spec: EncoderSpec, s: ExportSettings, plan: ExportPlan) -> list[
 
 def resolve(s: ExportSettings, out: str | Path, audio: list[AudioStream],
             probe=None, ffmpeg_audio_encoders: set[str] | None = None,
-            vaapi_device: str | None = None) -> ExportPlan:
+            vaapi_device: str | None = None, edited: bool = False) -> ExportPlan:
+    """edited: the audio is cut or joined (anything but one whole clip), so
+    no track can be copied and every one needs a codec."""
     out = Path(out)
     ext = out.suffix.lower()
     s.container = ext
@@ -337,7 +340,7 @@ def resolve(s: ExportSettings, out: str | Path, audio: list[AudioStream],
         if s.codec == "h265":
             plan.mux_args += ["-tag:v", "hvc1"]
 
-    _plan_audio(plan, s, ext, audio, ffmpeg_audio_encoders)
+    _plan_audio(plan, s, ext, audio, ffmpeg_audio_encoders, edited)
     return plan
 
 
@@ -352,10 +355,12 @@ def default_audio_bitrate(codec: str, channels: int) -> int:
     return {"aac": 96, "opus": 64}.get(codec, 0) * ch
 
 
-def tracks_needing_choice(s: ExportSettings, ext: str, audio: list[AudioStream]) -> list[AudioStream]:
-    """Selected tracks that can't be copied into this container as they are."""
+def tracks_needing_choice(s: ExportSettings, ext: str, audio: list[AudioStream],
+                          edited: bool = False) -> list[AudioStream]:
+    """Selected tracks that can't be copied into this container as they are,
+    or every selected track when the timeline cuts or joins them."""
     sel = _selected(s, audio)
-    return [a for a in sel if not audio_copy_ok(ext, a.codec)]
+    return sel if edited else [a for a in sel if not audio_copy_ok(ext, a.codec)]
 
 
 def _selected(s: ExportSettings, audio: list[AudioStream]) -> list[AudioStream]:
@@ -370,7 +375,7 @@ def _selected(s: ExportSettings, audio: list[AudioStream]) -> list[AudioStream]:
 
 
 def _plan_audio(plan: ExportPlan, s: ExportSettings, ext: str, audio: list[AudioStream],
-                have: set[str] | None) -> None:
+                have: set[str] | None, edited: bool = False) -> None:
     sel = _selected(s, audio)
     want = s.audio_codec
     if want not in (None, "copy", "aac", "opus", "flac"):
@@ -382,7 +387,17 @@ def _plan_audio(plan: ExportPlan, s: ExportSettings, ext: str, audio: list[Audio
         plan.audio_maps.append(a.index)
         name = f"track {a.index + 1} ({a.codec}, {a.channels}ch{', ' + a.title if a.title else ''})"
         codec = want
-        if want in (None, "copy"):
+        if want == "copy" and edited:
+            raise ExportError(f"{name} is cut or joined on the timeline, so it can't be copied; "
+                              f"pick {', '.join(AUDIO_ENCODE_OK[ext])}")
+        if want is None and edited:
+            if not s.audio_fallback:
+                raise ExportError(f"{name} is cut or joined on the timeline, so it has to be "
+                                  f"re-encoded; pick {', '.join(AUDIO_ENCODE_OK[ext])}")
+            codec = s.audio_fallback
+            if codec not in AUDIO_ENCODE_OK[ext]:
+                raise ExportError(f"{ext} can't hold {codec}; use {', '.join(AUDIO_ENCODE_OK[ext])}")
+        elif want in (None, "copy"):
             if audio_copy_ok(ext, a.codec):
                 plan.audio_args += [f"-c:a:{j}", "copy"]
                 plan.audio_text.append(f"{name}, copied")

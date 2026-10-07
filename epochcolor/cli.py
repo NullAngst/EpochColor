@@ -253,7 +253,7 @@ def cmd_video(a: argparse.Namespace) -> int:
     vs = VideoSettings(
         working_size=a.working_size, grain=a.grain, denoise=a.denoise,
         stabilize=a.stabilize, shot_threshold=a.shot_threshold, guided=not a.no_guided,
-        saturation=a.saturation, frames=a.frames,
+        saturation=a.saturation, frames=a.frames, chroma_size=a.chroma_size,
     )
     try:
         rep = colorize_video(info, model, out, plan, vs, use_cache=not a.no_cache)
@@ -364,6 +364,15 @@ def cmd_device(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_gui(a: argparse.Namespace) -> int:
+    try:
+        from .gui.main import main as gui_main
+    except ImportError as e:
+        _err(f"the GUI needs PySide6: pip install PySide6 ({e})")
+        return 1
+    return gui_main([sys.argv[0]] + a.files)
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="epochcolor", description="Colorize black and white photos and film.")
     p.add_argument("--version", action="version", version=f"epochcolor {__version__}")
@@ -410,7 +419,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="chroma stabilizer, 0 off, 0.9 averages up to 10 frames each way (default)")
     g.add_argument("--shot-threshold", type=float, default=6.0,
                    help="cut sensitivity in L* units, lower finds more cuts (default 6)")
-    g.add_argument("--working-size", type=int, default=512, help="short side for chroma work")
+    g.add_argument("--working-size", type=int, default=512, help="short side the model works at")
+    g.add_argument("--chroma-size", type=int, default=256,
+                   help="short side of the stored colour (default 256); higher is crisper and bigger")
     g.add_argument("--saturation", type=float, default=1.0, help="chroma multiplier")
     g.add_argument("--no-guided", action="store_true", help="plain bicubic chroma upscale")
     e = vi.add_argument_group("export")
@@ -448,6 +459,10 @@ def build_parser() -> argparse.ArgumentParser:
     en.add_argument("--retest", action="store_true", help="forget cached results and test again")
     en.add_argument("--vaapi-device", help="VAAPI render node")
     en.set_defaults(func=cmd_encoders)
+
+    gu = sub.add_parser("gui", help="open the editor")
+    gu.add_argument("files", nargs="*", help="a project, clips or photos to open")
+    gu.set_defaults(func=cmd_gui)
 
     pr = sub.add_parser("presets", help="list export presets")
     pr.set_defaults(func=cmd_presets)

@@ -115,3 +115,33 @@ def lab_to_srgb(L: np.ndarray, ab: np.ndarray, gamut_iters: int = 12) -> np.ndar
         ab[idx] = abb * lo[:, None]
         lin = lab_to_linear(L, ab)
     return linear_to_srgb(np.clip(lin, 0.0, 1.0))
+
+
+_M32 = _XYZ2RGB.astype(np.float32)
+_GRAY_L8 = None
+
+
+def gray8_to_l(g: np.ndarray) -> np.ndarray:
+    """8-bit grey straight to L* through a lookup table, for previews."""
+    global _GRAY_L8
+    if _GRAY_L8 is None:
+        _GRAY_L8 = srgb_to_l(np.arange(256, dtype=np.float32) / 255.0)
+    return _GRAY_L8[g]
+
+
+def lab_to_srgb8_fast(L: np.ndarray, ab: np.ndarray) -> np.ndarray:
+    """Preview conversion: float32, channels clipped instead of the gamut
+    fit, 8-bit out. Close enough to judge colour while scrubbing; stills and
+    exports go through lab_to_srgb."""
+    fy = (L.astype(np.float32) + 16.0) / 116.0
+    fx = fy + ab[..., 0] / 500.0
+    fz = fy - ab[..., 1] / 200.0
+
+    def finv(t):
+        t3 = t * t * t
+        return np.where(t3 > _EPS, t3, (116.0 * t - 16.0) / _KAPPA)
+
+    xyz = np.stack([finv(fx) * _XN, finv(fy) * _YN, finv(fz) * _ZN], axis=-1).astype(np.float32)
+    lin = np.clip(xyz @ _M32.T, 0.0, 1.0)
+    srgb = np.where(lin <= 0.0031308, lin * 12.92, 1.055 * np.power(lin, 1.0 / 2.4) - 0.055)
+    return (srgb * 255.0 + 0.5).astype(np.uint8)

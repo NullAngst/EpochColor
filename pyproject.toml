@@ -25,10 +25,14 @@ dependencies = [
 raw = ["rawpy"]
 heic = ["pillow-heif"]
 safetensors = ["safetensors"]
+gui = ["PySide6"]
 test = ["pytest"]
 
 [project.scripts]
 epochcolor = "epochcolor.cli:main"
+
+[project.gui-scripts]
+epochcolor-gui = "epochcolor.gui.main:main"
 
 [tool.setuptools.dynamic]
 version = { attr = "epochcolor.__version__" }
@@ -38,3 +42,4 @@ include = ["epochcolor*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests"]

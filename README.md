@@ -2,7 +2,7 @@
 
 EpochColor colorizes black and white photos and film footage while keeping the original grain and detail exactly as they were. It's for one person working through an archive on a Linux desktop, with or without a GPU.
 
-**This is milestone 3: the command line pipeline for photos and video, with the full export matrix.** No GUI yet. It answers the question everything else depends on: does the output look good when the model only predicts color and the original luma passes through untouched, and does that color hold still from frame to frame?
+**This is milestone 4: the editor.** A viewer with before/after, a timeline for multiple clips with trims, splits and audio tracks, a photo filmstrip, and the full export matrix, on top of the command line pipeline from milestones 1 to 3. Painting hints in the editor, grading and the model manager come in later milestones.
 
 ## How it works
 
@@ -20,6 +20,7 @@ The model never touches brightness. A black and white photo already holds all of
 - Python 3.10 or newer
 - FFmpeg for video, with libx265, libx264 and libsvtav1. openSUSE's stock package leaves x264 and x265 out, so I use the Packman build. `epochcolor encoders` shows what yours has.
 - PyTorch for the network models (`siggraph17`, `eccv16`). The `hints` model runs without it.
+- PySide6 for the editor. The command line works without it.
 - About 300 MB of disk for both model weights
 
 ## Install
@@ -29,11 +30,35 @@ I run openSUSE with an AMD card, so in my case it's the ROCm wheel. It depends o
 1. `git clone https://github.com/NullAngst/EpochColor && cd EpochColor`
 2. `python3 -m venv .venv && source .venv/bin/activate`
 3. Install the PyTorch wheel for your hardware from [pytorch.org](https://pytorch.org/get-started/locally/). For me that's `pip install torch --index-url https://download.pytorch.org/whl/rocmX.Y`, with X.Y being whichever ROCm version the site lists right now. NVIDIA wants the CUDA index, Intel the XPU index, no GPU the CPU index.
-4. `pip install -e ".[raw,heic]"`, since that pulls in camera RAW and HEIC support too. Drop either one if you don't need it.
+4. `pip install -e ".[gui,raw,heic]"`, since that pulls in the editor, camera RAW and HEIC support. Drop any of them you don't need.
 5. `epochcolor device` to check what PyTorch found. ROCm shows up as a CUDA device, that's normal.
 6. `epochcolor fetch all` to download the weights to `~/.local/share/epochcolor/models`. Set `EPOCHCOLOR_MODELS` to put them elsewhere.
 
-## Use
+## The editor
+
+```
+epochcolor gui
+```
+
+Or `epochcolor-gui`, or `epochcolor gui reel1.mkv reel2.mkv` to open with clips already in, or `epochcolor gui film.epochcolor` for a saved project.
+
+1. File > Add clips (Ctrl+I). Each clip gets probed, a small proxy built for scrubbing, and its shots detected, in the background. The first clip sets the project's frame rate and resolution, and a clip that doesn't match is refused, same rule as the command line.
+2. Colour > Colorize all clips (Ctrl+Shift+R). This is the slow part. Progress shows in the Inspector, and Cancel stops it. Finished shots stay cached either way.
+3. Scrub and play. The viewer shows the proxy while moving and swaps in a full-size frame from the real pipeline once the playhead rests, so what you judge when paused is what exports. 1, 2 and 3 switch between colour, before/after (drag the divider), and the original.
+4. Edit: S splits at the playhead, Delete ripple-deletes the selected segment, drag a segment's edge to trim it, drag its middle onto another segment to move it, I and O set the export range, M drops a marker with a note. Click an audio track's name to switch it on or off.
+5. File > Export video (Ctrl+E). Same options as the command line, with a live plan that says what the RF became and which audio tracks get re-encoded.
+
+Everything is undoable, without limit, for the session: Ctrl+Z and Ctrl+Shift+Z. F1 lists every key. Projects save as `.epochcolor` JSON, which is plain enough to fix by hand if it ever breaks. Sources are never modified.
+
+**Shots.** Yellow lines on the timeline are shot cuts. Color is carried within a shot and never across one, so a missed cut smears one scene's colors into the next. B adds or removes a cut at the playhead. Colorize that clip again afterward, and only the changed shots rerun.
+
+**Photos.** File > Add photos switches the bottom panel to a filmstrip. Select one or more, Colour > Colorize selected photos, then File > Export photos to write PNG, 16-bit TIFF, JPEG or WebP into a folder.
+
+**Settings.** The Inspector's Colour box holds the project settings. Model, working size and denoise change what the model sees, so they need a new colorize pass, and the clip shows as not colorized until it's done. Stabilize reruns only the quick stabilizer pass. Grain and saturation apply straight away. Colour > Model device picks the GPU, `auto` by default.
+
+**Under the hood.** Everything slow runs in a separate worker process, so a long render doesn't freeze the window and a GPU driver crash takes down only the worker. You get told, and the next job starts a fresh one.
+
+## Use from the command line
 
 Colorize one photo, automatic only:
 
@@ -98,7 +123,11 @@ Useful switches:
 - `--stabilize 0.9` is the default, an average of up to 10 frames each way. `0.95` holds color longer, `0` turns it off so you can see what the model does raw.
 - `--probe` checks the clip and lists the audio tracks without doing anything.
 
-The model pass is the slow part, so its output is cached per shot in `~/.cache/epochcolor`. Run again with a different codec, RF, grain, stabilizer or saturation setting and it skips straight to the render. Stop it partway with Ctrl+C and the finished shots stay cached, so the same command picks up where it left off. `epochcolor cache` shows the size, `epochcolor cache clear` empties it. Set `EPOCHCOLOR_CACHE` to move it somewhere with room, since a feature runs to several gigabytes.
+The model pass is the slow part, so its output is cached per shot in `~/.cache/epochcolor`. Run again with a different codec, RF, grain, stabilizer or saturation setting and it skips straight to the render. Stop it partway with Ctrl+C and the finished shots stay cached, so the same command picks up where it left off. `epochcolor cache` shows the size, `epochcolor cache clear` empties it. Set `EPOCHCOLOR_CACHE` to move it somewhere with room.
+
+How much room? The cache keeps chroma at 256 px on the short side (the models' own output size, already softer than the chroma in 4:2:0 video), stored as 8-bit integers, plus the denoised luma at the same size for the stabilizer. That's about 0.7 MB per frame for a 16:9 source: roughly 1 GB per minute of 24 fps footage, so a 90 minute feature needs about 90 GB free while you work on it. The proxies the editor builds add a little on top. `epochcolor cache clear` frees all of it, and nothing in there is anything you can't rebuild.
+
+The 256 px chroma is a trade. Where two objects meet at the same grey (a red barn against green grass can be exactly that), nothing in the luma marks the edge, so the colour boundary comes out a few pixels soft. `--chroma-size 512` (or Chroma size in the editor) keeps it crisper for about four times the disk.
 
 To compare the two models on the same reel, just run it with `-m siggraph17` and then `-m eccv16`. Both stay cached.
 
@@ -178,17 +207,22 @@ Honest list, so nobody is surprised.
 - **None of the hardware encoders have run on real hardware yet.** My build machine has no GPU. Their arguments follow FFmpeg's documentation, `epochcolor encoders` proves whether each one starts, and auto falls back to software when a test encode fails. But the quality mappings (CQ, ICQ, QP) haven't been compared against the software encoders on real footage. VAAPI on AMD is what I'll check first, since that's my hardware. NVENC, QSV and AMF reports are welcome.
 - ProRes 4444 is stored as 12-bit inside whatever goes in, that's how the format works. The source is 10-bit anyway.
 - FLAC in MP4 is legal and FFmpeg writes it, but some players still skip the track. Use MKV, or re-encode to AAC, if that matters.
-- Audio passthrough with `--frames` trims at the nearest audio packet, not the exact frame. Fine for a test render. Edits on the timeline will force a re-encode of affected tracks when the timeline arrives in milestone 4.
+- Audio passthrough with `--frames` trims at the nearest audio packet, not the exact frame. Fine for a test render.
+- An edited timeline (any trim, split, cut, join or in/out range) re-encodes every audio track, since compressed audio frames don't line up with video frames. The export dialog says so and asks for the codec. Only a single untouched clip passes audio through as is. Each piece of audio gets padded or cut to its exact video length, so a source whose audio runs short can't pull later pieces out of sync.
+- **Playback in the editor is silent.** Audio shows as waveforms and goes into the export, but the preview doesn't play it yet.
+- Hints can't be painted in the editor yet (milestone 5), and there's no grading beyond saturation (milestone 7). For photos, hint files from the command line still work.
+- The cache is about 1 GB per minute of footage. A feature needs real disk space while you work on it. Compressing it per shot is the obvious next step if that turns out to hurt.
+- The editor draws through OpenGL where it can and falls back to plain painting where it can't (some VMs, remote sessions). My build machine had no GPU, so the GL path is untested. The fallback is what the tests ran on.
 - Optical flow runs on the CPU (OpenCV DIS). It's not the bottleneck yet. The model is: on a 2-core CPU with no GPU, `siggraph17` ran at under one frame per second on 640x360. A GPU changes that completely.
 - The grain slider below 100% uses a spatial denoise at full size for video, not the temporal one. The model's copy does get the temporal one.
 - Shot detection catches hard cuts. Dissolves and fades may get split oddly or missed. Check with `--list-shots`.
 
 ## Tests
 
-`pip install -e ".[test]" && pytest`. CI runs the same on CPU on every push.
+`pip install -e ".[test,gui]" && pytest`. The editor tests run headless (`QT_QPA_PLATFORM=offscreen`), drive the real worker process, and export through it. CI runs the same on CPU on every push.
 
 ## License
 
 GPL-3.0-or-later. Model weights aren't part of this repo and keep their own licenses.
 
-Now photos and reels go in black and white and come out in color with the grain they were shot with, the color holds still across each shot, and the export goes to whichever codec, container and quality you pick, lossless included, with every audio track where it should be.
+Now reels and photos go into an editor in black and white, get cut, trimmed and checked shot by shot against the original, and come out in color with the grain they were shot with, in whichever codec, container and quality you pick, with every audio track where it should be.

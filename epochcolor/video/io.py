@@ -73,7 +73,11 @@ def probe(path: str | Path, scan_frames: int = 240) -> ClipInfo:
             md = dict(a.metadata or {})
             title = md.get("title") or md.get("language") or ""
             ch = getattr(a.codec_context, "channels", 0) or getattr(a, "channels", 0) or 2
-            audio.append(AudioStream(i, a.codec_context.name, int(ch), title))
+            try:
+                layout = a.codec_context.layout.name
+            except AttributeError:
+                layout = ""
+            audio.append(AudioStream(i, a.codec_context.name, int(ch), title, layout))
 
         # Look at real timestamps instead of trusting the header.
         pts, interlaced = [], False
