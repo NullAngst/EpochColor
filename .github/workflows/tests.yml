@@ -2,8 +2,9 @@ name: tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   pull_request:
+  workflow_call:  # the build workflow runs these first
 
 jobs:
   test:
