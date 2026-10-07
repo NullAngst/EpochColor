@@ -97,10 +97,14 @@ def carry(Ldn, ab_raw, a: int, b: int, keys: dict[int, tuple[np.ndarray, np.ndar
     n = b - a
     ch, cw = Ldn[a].shape
     accT = np.zeros((n, ch, cw, 2), np.float32) if n * ch * cw * 12 < 6e8 else None
-    if accT is None:  # very long shot: accumulate on disk
+    tmp = None
+    if accT is None:  # very long shot: accumulate on disk, on the cache disk, not /tmp
         import tempfile
 
-        tmp = Path(tempfile.mkdtemp())
+        from .pipeline import cache_root
+
+        (cache_root() / "tmp").mkdir(parents=True, exist_ok=True)
+        tmp = Path(tempfile.mkdtemp(dir=cache_root() / "tmp"))
         accT = np.lib.format.open_memmap(str(tmp / "t.npy"), "w+", np.float32, (n, ch, cw, 2))
         accA = np.lib.format.open_memmap(str(tmp / "a.npy"), "w+", np.float32, (n, ch, cw))
         accW = np.lib.format.open_memmap(str(tmp / "w.npy"), "w+", np.float32, (n, ch, cw))
@@ -144,3 +148,8 @@ def carry(Ldn, ab_raw, a: int, b: int, keys: dict[int, tuple[np.ndarray, np.ndar
         Wm = accW[i][..., None]
         raw = np.asarray(ab_raw[a + i], np.float32)
         out[i] = Wm * T + (1 - Wm) * raw
+    if tmp is not None:
+        import shutil
+
+        del accT, accA, accW
+        shutil.rmtree(tmp, ignore_errors=True)

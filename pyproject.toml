@@ -35,7 +35,7 @@ epochcolor = "epochcolor.cli:main"
 epochcolor-gui = "epochcolor.gui.main:main"
 
 [tool.setuptools.dynamic]
-version = { attr = "epochcolor.__version__" }
+version = { attr = "epochcolor._version.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["epochcolor*"]

@@ -35,6 +35,12 @@ class TorchDialog(QDialog):
         lay.addWidget(text)
         f = QFormLayout()
         f.addRow("Detected", QLabel(why))
+        from ..diskspace import describe
+
+        room = QLabel(f"{describe(ts.torch_dir().parent)}. The install needs about "
+                      f"{ts.NEED_GB.get(fam, 12)} GB there while it unpacks.")
+        room.setWordWrap(True)
+        f.addRow("Room", room)
         self.variant = QComboBox()
         for key, label in (("auto", f"auto ({fam})"), ("rocm", "ROCm (AMD)"), ("cuda", "CUDA (NVIDIA)"),
                            ("xpu", "XPU (Intel)"), ("cpu", "CPU only")):

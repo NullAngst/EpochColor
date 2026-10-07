@@ -1,6 +1,8 @@
 """EpochColor: colorize black and white film and photos."""
 
-__version__ = "0.5.0"
+# its own file so setuptools can read it without tripping over epochcolor.py,
+# the source launcher next to this folder
+from ._version import __version__  # noqa: F401
 
 
 def _activate_torch() -> None:

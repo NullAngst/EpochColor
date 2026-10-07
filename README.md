@@ -10,7 +10,7 @@ Grab `EpochColor-<version>-x86_64.AppImage` from the [Releases page](https://git
 
 1. `chmod +x EpochColor-*-x86_64.AppImage`
 2. `./EpochColor-*-x86_64.AppImage`, or double-click it.
-3. On first start it offers to download PyTorch for your GPU: ROCm for AMD, CUDA for NVIDIA, XPU for Intel, CPU otherwise. Say yes, since the colorization models need it. It goes into `~/.local/share/epochcolor/torch`, separate from the AppImage, so app updates don't download it again. Colour > Install PyTorch brings this back later.
+3. On first start it offers to download PyTorch for your GPU: ROCm for AMD, CUDA for NVIDIA, XPU for Intel, CPU otherwise. Say yes, since the colorization models need it. It goes into `~/.local/share/epochcolor/torch-cpython-312`, separate from the AppImage, so app updates don't download it again. Colour > Install PyTorch brings this back later.
 4. Colour > Model manager. Download a model: `siggraph17` (130 MB) is the default and reads painted hints, `ddcolor-tiny` (220 MB) is the newer one that still runs on a CPU, and the full DDColor models (912 MB) want a GPU.
 
 That's it. FFmpeg (with x264, x265, SVT-AV1, NVENC, VAAPI, QSV and AMF) and Python are inside the AppImage, so nothing else needs installing. openSUSE's own FFmpeg doesn't matter here.
@@ -20,7 +20,8 @@ The same AppImage runs the command line, too: `./EpochColor-*-x86_64.AppImage vi
 A few notes on that first-run PyTorch download:
 
 - It checks PyTorch's index live and takes the newest build that fits: for NVIDIA, the newest CUDA build your driver can run, read from `/proc/driver/nvidia/version`. AMD needs `/dev/kfd`, which means the amdgpu kernel driver, standard on any current distro.
-- Sizes: CPU about 200 MB, CUDA about 3 GB, ROCm 4 to 6 GB.
+- Sizes: CPU about 200 MB, CUDA about 3 GB, ROCm 4 to 6 GB. While it unpacks it needs a lot more room than that, about 20 GB for ROCm and 12 GB for CUDA, and it checks before it starts.
+- It unpacks in `~/.local/share/epochcolor/pip-tmp`, not `/tmp`. Why? Because openSUSE, Fedora and Arch mount `/tmp` as tmpfs, which lives in RAM and tops out at half of it, so a ROCm build fills it and fails with "no space left on device" while your disk sits there with hundreds of gigabytes free. Versions before 0.5.1 had exactly that bug. If `~/.local/share` itself is on a small partition, set `XDG_DATA_HOME` to somewhere bigger before starting.
 - `epochcolor setup-torch --check` shows what it would pick. `--variant cpu` (or rocm, cuda, xpu) overrides it. `--remove` deletes it.
 - A PyTorch you installed yourself always wins over the downloaded one.
 
@@ -28,7 +29,18 @@ The AppImage needs glibc 2.28 or newer and the usual desktop libraries (OpenGL/E
 
 ## Run from source
 
-For hacking on it. Needs Python 3.10 or newer and an FFmpeg with libx264, libx265 and libsvtav1 in your PATH. openSUSE's stock package leaves x264 and x265 out, so I use the Packman build, it depends on your system. `epochcolor encoders` shows what yours has.
+For hacking on it, or if you'd rather not use an AppImage. Needs Python 3.10 or newer and an FFmpeg with libx264, libx265 and libsvtav1 in your PATH. openSUSE's stock package leaves x264 and x265 out, so I use the Packman build, it depends on your system. `epochcolor encoders` shows what yours has.
+
+The quick way:
+
+1. `git clone https://github.com/NullAngst/EpochColor && cd EpochColor`
+2. `python3 epochcolor.py`
+
+The first time, it asks to make a virtual environment in `.venv` next to the script and installs everything into it, so your system Python stays clean. After that, `python3 epochcolor.py` switches into `.venv` by itself and opens the editor. Subcommands work the same as the AppImage: `python3 epochcolor.py video reel.mkv --rf 18`. If the venv step fails, your distro split venv out into its own package: Debian and Ubuntu call it `python3-venv`, check yours.
+
+PyTorch gets its own folder per Python version (`torch-cpython-313` and so on), so a source checkout on your distro's Python and the AppImage's 3.12 don't trip over each other.
+
+The manual way, if you want the `epochcolor` command on your PATH inside the venv:
 
 1. `git clone https://github.com/NullAngst/EpochColor && cd EpochColor`
 2. `python3 -m venv .venv && source .venv/bin/activate`

@@ -480,7 +480,13 @@ def cmd_setup_torch(a: argparse.Namespace) -> int:
     if a.check:
         fam, why = ts.detect()
         print(f"detected: {why}; would install {fam}")
-        print(f"installed: {ts.installed_variant() or 'none'} in {ts.torch_dir()}")
+        print(f"installed: {ts.installed_variant() or 'none'} in {ts.active_dir() or ts.torch_dir()}")
+        from .diskspace import describe
+
+        print(f"room: {describe(ts.torch_dir().parent)}")
+        need = ts.NEED_GB.get(fam)
+        if need:
+            print(f"a {fam} install needs about {need} GB there while it unpacks")
         return 0
     try:
         ts.install(a.variant, log=print)
@@ -636,8 +642,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from .diskspace import explain, is_full
+
     a = build_parser().parse_args(argv)
-    return a.func(a)
+    try:
+        return a.func(a)
+    except OSError as e:
+        if not is_full(e):
+            raise
+        _err(explain(e))
+        return 1
 
 
 if __name__ == "__main__":

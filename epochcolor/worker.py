@@ -332,4 +332,7 @@ def worker_main(jobs, events) -> None:
             result = run_job(kind, job, progress, models)
             events.put(("done", jid, result))
         except BaseException as e:  # noqa: BLE001 - everything goes back to the GUI
-            events.put(("error", jid, f"{e}", traceback.format_exc()))
+            from .diskspace import explain, is_full
+
+            msg = explain(e) if is_full(e) else f"{e}"
+            events.put(("error", jid, msg, traceback.format_exc()))

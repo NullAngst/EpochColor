@@ -25,6 +25,7 @@ import time
 import urllib.request
 from pathlib import Path
 
+from .. import diskspace
 from .weights import models_dir, sha256_file
 
 CATALOG_URL = "https://raw.githubusercontent.com/NullAngst/EpochColor/HEAD/catalog.json"
@@ -191,6 +192,9 @@ def download(model_id: str, progress=None, accept_license: bool = False) -> Path
     part = dest.with_name(dest.name + ".part")
     have = part.stat().st_size if part.exists() else 0
     req = urllib.request.Request(url, headers={"User-Agent": "EpochColor"})
+    if src.get("size_mb") or e.get("size_mb"):
+        need = int((src.get("size_mb") or e["size_mb"]) * 1.05e6) - have
+        diskspace.need(folder, need, f"{model_id}")
     if have:
         req.add_header("Range", f"bytes={have}-")
     with urllib.request.urlopen(req, timeout=60) as resp:
@@ -198,18 +202,26 @@ def download(model_id: str, progress=None, accept_license: bool = False) -> Path
             have = 0  # the server ignored the range; start over
         size = resp.headers.get("Content-Length")
         total = int(size) + have if size else None
-        with open(part, "ab" if have else "wb") as f:
-            done = have
-            last = 0.0
-            while True:
-                chunk = resp.read(1 << 20)
-                if not chunk:
-                    break
-                f.write(chunk)
-                done += len(chunk)
-                if progress and time.time() - last > 0.3:
-                    progress("download", done, total or done)
-                    last = time.time()
+        if total:
+            diskspace.need(folder, total - have, f"{model_id}")
+        try:
+            with open(part, "ab" if have else "wb") as f:
+                done = have
+                last = 0.0
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    done += len(chunk)
+                    if progress and time.time() - last > 0.3:
+                        progress("download", done, total or done)
+                        last = time.time()
+        except OSError as ex:
+            if diskspace.is_full(ex):
+                raise ModelError(diskspace.explain(ex, part) +
+                                 " The partial download is kept and resumes next time.") from None
+            raise
     digest = sha256_file(part, progress)
     ok = digest == sha_full if sha_full else digest.startswith(sha_prefix)
     if not ok:
