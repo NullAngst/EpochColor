@@ -17,6 +17,7 @@ dependencies = [
     "pillow",
     "tifffile",
     "av",
+    "safetensors",
 ]
 
 [project.optional-dependencies]
@@ -24,7 +25,6 @@ dependencies = [
 # CUDA, XPU or CPU) and comes from PyTorch's own index. See the README.
 raw = ["rawpy"]
 heic = ["pillow-heif"]
-safetensors = ["safetensors"]
 gui = ["PySide6-Essentials"]
 test = ["pytest"]
 
@@ -39,6 +39,10 @@ version = { attr = "epochcolor.__version__" }
 
 [tool.setuptools.packages.find]
 include = ["epochcolor*"]
+
+[tool.setuptools.package-data]
+"epochcolor.models" = ["catalog.json"]
+"epochcolor.models.ddcolor_arch" = ["LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

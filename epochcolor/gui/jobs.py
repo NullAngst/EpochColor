@@ -70,6 +70,17 @@ class JobRunner(QObject):
         self.changed.emit()
         self._next()
 
+    def cancel_where(self, pred, running: bool = False) -> None:
+        """Drop queued jobs that match (a newer request replaces them). With
+        running=True a matching running job is stopped too."""
+        drop = [j for j in self.pending if pred(j)]
+        for j in drop:
+            self.pending.remove(j)
+        if running and self.current and pred(self.current):
+            self._kill("replaced by a newer request")
+        if drop:
+            self.changed.emit()
+
     def busy(self) -> bool:
         return bool(self.current or self.pending)
 

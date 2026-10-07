@@ -1,6 +1,6 @@
 """EpochColor: colorize black and white film and photos."""
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 
 def _activate_torch() -> None:

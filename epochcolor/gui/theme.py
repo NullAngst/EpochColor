@@ -43,6 +43,8 @@ def apply(app) -> None:
     p.setColor(QPalette.Highlight, c(ACCENT))
     p.setColor(QPalette.HighlightedText, c("#111111"))
     p.setColor(QPalette.PlaceholderText, c(DIM))
+    p.setColor(QPalette.Link, c("#8fbbe8"))
+    p.setColor(QPalette.LinkVisited, c("#b49be0"))
     for role in (QPalette.WindowText, QPalette.Text, QPalette.ButtonText):
         p.setColor(QPalette.Disabled, role, c("#666666"))
     app.setPalette(p)

@@ -302,6 +302,57 @@ def cmd_presets(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_render(a: argparse.Namespace) -> int:
+    """Export a project saved in the editor: its timeline, hints and grades."""
+    from .export.plan import ExportError, ExportSettings
+    from .project import Project, ProjectError
+    from .timeline_export import analysis_state, build_export
+
+    try:
+        p = Project.load(a.project)
+    except (OSError, ValueError, ProjectError) as e:
+        _err(str(e))
+        return 2
+    if not a.inout:
+        p.d.range = None
+    if a.preset:
+        from .export.presets import load_preset
+
+        es, _ = load_preset(a.preset)
+    else:
+        es, _ = ExportSettings.from_dict({k: v for k, v in p.d.export.items() if k != "last_out"})
+    if a.audio_fallback:
+        es.audio_fallback = a.audio_fallback
+    out = Path(a.output) if a.output else Path(p.d.export.get("last_out") or Path(a.project).with_suffix(es.container))
+    try:
+        det = _detector()
+        audio_enc = {e for e in det.encoders() if e in ("aac", "libopus", "flac")}
+        job = build_export(p, None, es, out, model_name=p.d.settings["model"], probe=det.check,
+                           audio_encoders=audio_enc, vaapi_device=det.vaapi_device)
+    except (ExportError, ValueError, RuntimeError) as e:
+        _err(str(e))
+        return 2
+    print(job.plan.describe(), file=sys.stderr)
+    need = [c for c in job.clips if analysis_state(c, job.settings, job.model_name, None, job.hints.get(c.id)) != "ready"]
+    model = None
+    if need:
+        print(f"colorizing first: {', '.join(c.name for c in need)}", file=sys.stderr)
+        try:
+            model = _load_model(p.d.settings["model"], None, a.device)
+        except (RuntimeError, FileNotFoundError, ValueError) as e:
+            _err(str(e))
+            return 1
+    try:
+        job.run(model, quiet=False)
+    except Exception as e:
+        _err(str(e))
+        if a.debug:
+            raise
+        return 1
+    print(f"{Path(a.project).name} -> {out}")
+    return 0
+
+
 def cmd_cache(a: argparse.Namespace) -> int:
     from .video.pipeline import cache_root, clear_cache
 
@@ -314,40 +365,96 @@ def cmd_cache(a: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_fetch(a: argparse.Namespace) -> int:
-    from .models.weights import CATALOG, fetch
+def _progress_printer(label: str):
+    def show(stage, done, total):
+        if total:
+            print(f"\r{label}: {stage} {done * 100 // max(1, total)}%   ", end="", file=sys.stderr)
+    return show
 
-    names = list(CATALOG) if a.model == "all" else [a.model]
+
+def cmd_fetch(a: argparse.Namespace) -> int:
+    from .models.manager import ModelError, catalog, download, human_size, installed
+
+    ids = [e["id"] for e in catalog()] if a.model == "all" else [a.model]
+    if a.model == "all":
+        ids = [i for i in ids if next(e for e in catalog() if e["id"] == i).get("license_ok")]
+        print("all = every model whose license needs no accepting: " + ", ".join(ids), file=sys.stderr)
     rc = 0
-    for n in names:
-        if n not in CATALOG:
-            _err(f"nothing to fetch for {n}; known: {', '.join(CATALOG)}")
+    for mid in ids:
+        e = next((x for x in catalog() if x["id"] == mid), None)
+        if e is None:
+            _err(f"{mid} is not in the catalog; `epochcolor models` lists it")
             return 2
-        e = CATALOG[n]
-        print(f"{n}: about {e.size_mb} MB, license {e.license}", file=sys.stderr)
+        if mid in installed():
+            print(f"{mid}: installed already")
+            continue
+        print(f"{mid}: about {human_size(e.get('size_mb'))}, license {e['license']}", file=sys.stderr)
         try:
-            print(fetch(n))
-        except Exception as ex:
-            _err(f"{n}: {ex}")
+            path = download(mid, _progress_printer(mid), accept_license=a.accept_license)
+            print(file=sys.stderr)
+            print(path)
+        except (ModelError, OSError) as ex:
+            print(file=sys.stderr)
+            _err(f"{mid}: {ex}")
             rc = 1
     return rc
 
 
 def cmd_models(a: argparse.Namespace) -> int:
-    from .models import DEFAULT_MODEL, REGISTRY
-    from .models.weights import CATALOG, models_dir
+    from .models import DEFAULT_MODEL
+    from .models.manager import (
+        ModelError, add_from_file, catalog, check_loads, human_size, installed, move_storage,
+        refresh_catalog, remove,
+    )
+    from .models.weights import models_dir
 
-    print(f"weights folder: {models_dir()}")
-    for name, cls in REGISTRY.items():
-        info = cls.info
-        if info.needs_weights:
-            e = CATALOG.get(name)
-            have = e is not None and (models_dir() / e.filename).is_file()
-            state = "ready" if have else "not downloaded"
-        else:
-            state = "built in"
-        star = " (default)" if name == DEFAULT_MODEL else ""
-        print(f"  {name:<11} {info.mode:<11} {state:<15} {info.license:<13} {info.description}{star}")
+    try:
+        if a.action == "refresh":
+            good, bad = refresh_catalog()
+            print(f"catalog: {good} models" + (f", {bad} skipped (need a newer EpochColor)" if bad else ""))
+            return 0
+        if a.action == "add":
+            if len(a.args) != 2:
+                _err("models add WEIGHTS MANIFEST.json")
+                return 2
+            mid = add_from_file(a.args[0], a.args[1])
+            print(f"added {mid}; checking it loads...")
+            try:
+                check_loads(mid)
+            except Exception as e:
+                remove(mid)
+                _err(f"{mid} doesn't load, removed again: {e}")
+                return 1
+            print("ok")
+            return 0
+        if a.action == "remove":
+            if len(a.args) != 1:
+                _err("models remove ID")
+                return 2
+            print("removed" if remove(a.args[0]) else f"{a.args[0]} is not installed")
+            return 0
+        if a.action == "dir":
+            if a.args:
+                print(f"models now in {move_storage(a.args[0] if a.args[0] != 'default' else None)}")
+            else:
+                print(models_dir())
+            return 0
+    except (ModelError, OSError, ValueError) as e:
+        _err(str(e))
+        return 1
+
+    have = installed()
+    print(f"models folder: {models_dir()}")
+    print(f"  {'id':<20} {'mode':<10} {'state':<15} {'size':>7}  license")
+    print(f"  {'hints':<20} {'paint':<10} {'built in':<15} {'':>7}  GPL-3.0")
+    for e in catalog():
+        state = "installed" if e["id"] in have else "available"
+        star = " (default)" if e["id"] == DEFAULT_MODEL else ""
+        lic = e["license"] if len(e["license"]) < 40 else e["license"][:37] + "..."
+        print(f"  {e['id']:<20} {e['mode']:<10} {state:<15} {human_size(e.get('size_mb')):>7}  {lic}{star}")
+    for mid, man in have.items():
+        if not any(e["id"] == mid for e in catalog()):
+            print(f"  {mid:<20} {man.get('mode', ''):<10} {'installed':<15} {'':>7}  {man.get('license', '')}")
     return 0
 
 
@@ -403,7 +510,8 @@ def build_parser() -> argparse.ArgumentParser:
     ph.add_argument("--out-dir", help="output folder (default: next to each source)")
     ph.add_argument("--format", default="png", choices=["png", "tif", "jpg", "webp"],
                     help="output type when -o is not given (default png)")
-    ph.add_argument("-m", "--model", default="siggraph17", help="siggraph17, eccv16 or hints")
+    ph.add_argument("-m", "--model", default="siggraph17",
+                    help="an installed model id (see `epochcolor models`), or hints")
     ph.add_argument("--weights", help="weights file, instead of the downloaded one")
     ph.add_argument("--hints", help="hint image for a single source")
     ph.add_argument("--hints-dir", help="folder of hint images named after each source")
@@ -428,7 +536,7 @@ def build_parser() -> argparse.ArgumentParser:
     vi = sub.add_parser("video", help="colorize a clip")
     vi.add_argument("source", help="input clip, constant frame rate")
     vi.add_argument("-o", "--output", help="output .mkv, .mp4 or .mov (default: <name>.color.mkv)")
-    vi.add_argument("-m", "--model", default="siggraph17", help="siggraph17 or eccv16")
+    vi.add_argument("-m", "--model", default="siggraph17", help="an installed model id (see `epochcolor models`)")
     vi.add_argument("--weights", help="weights file, instead of the downloaded one")
     g = vi.add_argument_group("colour")
     g.add_argument("--grain", type=float, default=100.0, help="percent of original luma kept (default 100)")
@@ -493,15 +601,32 @@ def build_parser() -> argparse.ArgumentParser:
     pr = sub.add_parser("presets", help="list export presets")
     pr.set_defaults(func=cmd_presets)
 
+    re_ = sub.add_parser("render", help="export a project saved in the editor")
+    re_.add_argument("project", help="a .epochcolor project")
+    re_.add_argument("-o", "--output", help="output file (default: the project's last export)")
+    re_.add_argument("--preset", help="export preset instead of the project's export settings")
+    re_.add_argument("--inout", action="store_true", help="only the in/out range")
+    re_.add_argument("--audio-fallback", choices=["aac", "opus", "flac"],
+                     help="codec for audio that has to be re-encoded")
+    re_.add_argument("--device", default="auto")
+    re_.add_argument("--debug", action="store_true")
+    re_.set_defaults(func=cmd_render)
+
     ca = sub.add_parser("cache", help="show or clear the video cache")
     ca.add_argument("action", nargs="?", default="show", choices=["show", "clear"])
     ca.set_defaults(func=cmd_cache)
 
-    fe = sub.add_parser("fetch", help="download model weights")
-    fe.add_argument("model", help="siggraph17, eccv16 or all")
+    fe = sub.add_parser("fetch", help="download a model from the catalog")
+    fe.add_argument("model", help="a model id from `epochcolor models`, or all")
+    fe.add_argument("--accept-license", action="store_true",
+                    help="accept the model's license terms (read them first: `epochcolor models`)")
     fe.set_defaults(func=cmd_fetch)
 
-    mo = sub.add_parser("models", help="list models and weight status")
+    mo = sub.add_parser("models", help="list, refresh, add or remove models")
+    mo.add_argument("action", nargs="?", default="list", choices=["list", "refresh", "add", "remove", "dir"],
+                    help="list (default), refresh the catalog, add WEIGHTS MANIFEST, remove ID, "
+                         "dir [PATH|default] to show or move the models folder")
+    mo.add_argument("args", nargs="*")
     mo.set_defaults(func=cmd_models)
 
     de = sub.add_parser("device", help="show which device PyTorch would use")

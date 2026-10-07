@@ -21,7 +21,8 @@ def clip_info(c: Clip) -> ClipInfo:
                     start_time=c.start_time, codec=c.codec)
 
 
-def analysis_state(c: Clip, s: VideoSettings, model_name: str, weights: str | None = None) -> str:
+def analysis_state(c: Clip, s: VideoSettings, model_name: str, weights: str | None = None,
+                   hints: dict | None = None) -> str:
     """"ready" when the cached chroma matches the clip's current shots and
     the stabilizer setting, "partial" when some of the model pass is done,
     "none" otherwise."""
@@ -33,10 +34,15 @@ def analysis_state(c: Clip, s: VideoSettings, model_name: str, weights: str | No
         meta = json.loads(m.read_text())
     except ValueError:
         return "none"
+    from .video.pipeline import wanted_stab
+
     stab = meta.get("stab")
-    want = {"strength": s.stabilize, "shots": [list(x) for x in c.shots]}
-    if stab == want and (d / "ab.npy").exists():
+    want = wanted_stab([tuple(x) for x in c.shots], s.stabilize, hints)
+    if isinstance(stab, dict) and all(stab.get(k) == v for k, v in want.items()) and (d / "ab.npy").exists():
         return "ready"
+    done = {tuple(x) for x in meta.get("model_done", [])}
+    if done and all(tuple(x) in done for x in c.shots):
+        return "update"  # model pass done; only hints or the stabilizer need redoing
     return "partial" if meta.get("model_done") else "none"
 
 
@@ -64,24 +70,28 @@ class ExportJob:
     audio_timeline: AudioTimeline | None = None
     clips: list[Clip] = field(default_factory=list)
 
+    hints: dict = field(default_factory=dict)
+    grades: object = None
+
     def run(self, model: ColorModel | None = None, progress=None, quiet: bool = True) -> dict:
         timings = {}
         dirs = {}
         for c in self.clips:
-            if analysis_state(c, self.settings, self.model_name, self.weights) != "ready":
+            if analysis_state(c, self.settings, self.model_name, self.weights,
+                              self.hints.get(c.id)) != "ready":
                 if model is None:
                     raise RuntimeError(f"{c.name} is not colorized yet")
             if model is None:
                 dirs[c.id] = analysis_dir(Path(c.path), self.settings, self.model_name, self.weights)
                 continue
             rep = analyze(clip_info(c), model, self.settings, shots=c.shots, quiet=quiet,
-                          progress=progress)
+                          progress=progress, hints=self.hints.get(c.id))
             dirs[c.id] = rep.dir
-        pieces = [Piece(Path(c.path), c.fps, c.width, c.height, dirs[c.id], a, b)
+        pieces = [Piece(Path(c.path), c.fps, c.width, c.height, dirs[c.id], a, b, c.id)
                   for c, a, b in self.project_pieces]
         timings.update(render(pieces, self.plan, self.out, self.settings,
                               audio_source=self.audio_source, audio_timeline=self.audio_timeline,
-                              quiet=quiet, progress=progress))
+                              quiet=quiet, progress=progress, grades=self.grades))
         return timings
 
 
@@ -104,7 +114,10 @@ def build_export(p: Project, model: ColorModel | None, es: ExportSettings, out: 
         if c.id not in seen:
             seen.add(c.id)
             clips.append(c)
-    job = ExportJob(pieces, plan, out, s, name, weights, clips=clips)
+    from .grade import GradeBook
+
+    job = ExportJob(pieces, plan, out, s, name, weights, clips=clips, hints=dict(p.d.hints),
+                    grades=GradeBook(p.d.grades, {cid: c.shots for cid, c in p.d.clips.items()}))
     if plan.audio_maps:
         if edited:
             inputs, index = [], {}

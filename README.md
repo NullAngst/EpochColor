@@ -2,7 +2,7 @@
 
 EpochColor colorizes black and white photos and film footage while keeping the original grain and detail exactly as they were. It's for one person working through an archive on a Linux desktop, with or without a GPU.
 
-**This is milestone 4: the editor.** A viewer with before/after, a timeline for multiple clips with trims, splits and audio tracks, a photo filmstrip, and the full export matrix, on top of the command line pipeline from milestones 1 to 3. Painting hints in the editor, grading and the model manager come in later milestones.
+**Where it's at:** the editor with a before/after viewer, a timeline for multiple clips, painted colour hints that follow objects through a shot, saved colours, per-shot grading with keyframes and scopes, a model manager with newer models, and the full export matrix. Still to come: negative inversion, regrain and deflicker, the Flatpak, and Windows.
 
 ## Download and run
 
@@ -11,7 +11,7 @@ Grab `EpochColor-<version>-x86_64.AppImage` from the [Releases page](https://git
 1. `chmod +x EpochColor-*-x86_64.AppImage`
 2. `./EpochColor-*-x86_64.AppImage`, or double-click it.
 3. On first start it offers to download PyTorch for your GPU: ROCm for AMD, CUDA for NVIDIA, XPU for Intel, CPU otherwise. Say yes, since the colorization models need it. It goes into `~/.local/share/epochcolor/torch`, separate from the AppImage, so app updates don't download it again. Colour > Install PyTorch brings this back later.
-4. Colour > Download weights for the current model. About 140 MB, once.
+4. Colour > Model manager. Download a model: `siggraph17` (130 MB) is the default and reads painted hints, `ddcolor-tiny` (220 MB) is the newer one that still runs on a CPU, and the full DDColor models (912 MB) want a GPU.
 
 That's it. FFmpeg (with x264, x265, SVT-AV1, NVENC, VAAPI, QSV and AMF) and Python are inside the AppImage, so nothing else needs installing. openSUSE's own FFmpeg doesn't matter here.
 
@@ -35,7 +35,7 @@ For hacking on it. Needs Python 3.10 or newer and an FFmpeg with libx264, libx26
 3. `pip install -e ".[gui,raw,heic]"`, since that pulls in the editor, camera RAW and HEIC support. Drop any of them you don't need.
 4. `epochcolor setup-torch` downloads PyTorch for your GPU, same as the AppImage. Or install it into the venv yourself from [pytorch.org](https://pytorch.org/get-started/locally/).
 5. `epochcolor device` to check what PyTorch found. ROCm shows up as a CUDA device, that's normal.
-6. `epochcolor fetch all` to download the weights to `~/.local/share/epochcolor/models`. Set `EPOCHCOLOR_MODELS` to put them elsewhere.
+6. `epochcolor models` lists what's available, `epochcolor fetch siggraph17` downloads one (the DDColor ones want `--accept-license` once you've read their model card). They go to `~/.local/share/epochcolor/models`; `epochcolor models dir /somewhere/else` moves them.
 7. `epochcolor gui` for the editor.
 
 ## Making a release
@@ -82,7 +82,39 @@ Everything is undoable, without limit, for the session: Ctrl+Z and Ctrl+Shift+Z.
 
 **Photos.** File > Add photos switches the bottom panel to a filmstrip. Select one or more, Colour > Colorize selected photos, then File > Export photos to write PNG, 16-bit TIFF, JPEG or WebP into a folder.
 
+**Painting hints.** The automatic pass guesses, and it can't know a coat was navy. Tell it.
+
+1. Put the playhead on a frame where the object is clearly visible and press P (or Paint hints above the viewer).
+2. Pick the colour with the swatch, or Ctrl+click somewhere in the picture to take a colour from it.
+3. Drag a few strokes across the coat. You don't mask anything: the strokes spread out to the object's edges on their own. Grey paints "no colour here", for a white shirt or a grey wall. Right-click a stroke to remove it. [ and ] or the mouse wheel change the brush size.
+4. A moment after each stroke the hint pass runs (switch "Apply as I paint" off to do it by hand with Ctrl+Return). The fix gets carried forward and backward through the whole shot along the motion, and fades where the object leaves the frame or something covers it.
+
+Only the painted shot reruns, and the expensive model pass stays cached, so it takes seconds rather than minutes. Paint on several frames of a long shot and each frame of it takes the nearest fixes. White dots on the timeline mark painted frames.
+
+Photos work the same way: paint in the viewer with the Photos tab open.
+
+**Saved colours.** Paint a stroke, click Save colour, call it "Anna's coat, navy". In the Colours panel (next to Clips), Find in every shot and photo looks for that object everywhere else. By default the matches get marked in the viewer and listed, and you click Apply on the right ones. "Paint matches straight away" skips the asking, at the cost of sometimes painting the wrong thing. It's matching on what the model's own features say, at the moment you ask; nothing gets trained.
+
+**Grading.** The Grade panel (a tab next to the Inspector) grades the shot under the playhead, or the photo you picked. In order of how it's applied:
+
+- white balance: temperature and tint, or Pick neutral and click something that should be grey
+- lift, gamma, gain and offset wheels, each with a master level under it
+- contrast around a pivot, saturation, vibrance (pushes the dull colours more than the strong ones)
+- curves: master, red, green, blue, plus hue vs saturation and hue vs hue
+- a secondary: an HSL qualifier (Pick the colour to isolate, then Show the matte to see what it catches) and a shape mask, ellipse or rectangle, feathered, which Track through shot follows along the motion
+- a 3D LUT (.cube), with a mix amount
+
+Everything runs in 32-bit float and nothing clips until the export, so pushing gain up and pulling it back down loses nothing. The preview, the paused full-size frame, photo export and video export all use the same code.
+
+A shot's grade is static until you press Add key. With two or more keys the values move between them, linear or eased, and an edit between keys adds a new one. Copy and paste grades between shots with Ctrl+Alt+C and Ctrl+Alt+V. Export grade as .cube writes the global part of a grade as a LUT for use elsewhere; a LUT maps colour to colour, so it can't carry the shape mask.
+
+**Scopes.** The Scopes panel shows a waveform, RGB parade, vectorscope (with skin tone line and 75% targets) or histogram of what the viewer shows.
+
+**Models.** Colour > Model manager lists the catalog: the two Zhang models and four DDColor variants. It downloads with progress and resume, checks every file's SHA-256 before keeping it, and asks you to accept a license before downloading anything whose terms aren't plainly open. Add from file takes your own weights for an architecture EpochColor knows (DDColor, or either Zhang model) plus a small JSON manifest; it test-loads them before keeping them. Storage folder moves everything somewhere with room. The catalog refreshes from this repo's `catalog.json`, so a new set of weights for a known architecture shows up without an app update.
+
 **Settings.** The Inspector's Colour box holds the project settings. Model, working size and denoise change what the model sees, so they need a new colorize pass, and the clip shows as not colorized until it's done. Stabilize reruns only the quick stabilizer pass. Grain and saturation apply straight away. Colour > Model device picks the GPU, `auto` by default.
+
+**From the command line.** `epochcolor render film.epochcolor -o film.mkv` exports a saved project, hints, grades and all, without the editor. It uses the export settings you last picked in the editor, or `--preset`.
 
 **Under the hood.** Everything slow runs in a separate worker process, so a long render doesn't freeze the window and a GPU driver crash takes down only the worker. You get told, and the next job starts a fresh one.
 
@@ -118,13 +150,19 @@ For a set, put hint files in a folder named after each photo (`scan01.png` for `
 
 ### Models
 
-| Model | What it does |
-| --- | --- |
-| `siggraph17` (default) | Automatic, and reads your hints as input. The one to use. |
-| `eccv16` | Automatic only, more muted. Hints still apply afterward. |
-| `hints` | No network at all. Your strokes are the only color, everything unpainted stays grey. Good for full control, or for testing without PyTorch. |
+| Model | Size | What it does |
+| --- | --- | --- |
+| `siggraph17` (default) | 130 MB | Zhang et al. 2017. Automatic, and reads your hints as input. Small and quick, muted colour. |
+| `eccv16` | 125 MB | Zhang et al. 2016. Automatic only, more muted still. Hints still apply afterward. |
+| `ddcolor-modelscope` | 912 MB | DDColor 2023, ConvNeXt-L. Far more saturated and specific. The authors' all-round pick. |
+| `ddcolor-paper` | 912 MB | DDColor with the paper's weights, more conservative. |
+| `ddcolor-artistic` | 912 MB | DDColor trained for bolder colour. Less faithful, more striking. |
+| `ddcolor-tiny` | 220 MB | DDColor with ConvNeXt-T. Much faster, a little less accurate. The one to try on CPU. |
+| `hints` | built in | No network at all. Your strokes are the only colour, everything unpainted stays grey. |
 
-Both network models are Zhang et al., BSD-2-Clause, from [richzhang/colorization](https://github.com/richzhang/colorization). They're from 2016 and 2017, so expect plausible and somewhat muted. Newer models come in later milestones through the same adapter.
+The Zhang models are BSD-2-Clause, from [richzhang/colorization](https://github.com/richzhang/colorization). DDColor's code is Apache-2.0 and ships inside EpochColor (in `epochcolor/models/ddcolor_arch`, with its license); its weights come from the authors' Hugging Face repos, and their terms are on those model cards.
+
+`epochcolor models` lists them with what's installed. `epochcolor models add weights.pth manifest.json` adds your own, `epochcolor models remove ID` deletes one, `epochcolor models refresh` pulls the newest catalog.
 
 ### Video
 
@@ -218,7 +256,7 @@ Why 10-bit by default? Colorized footage is mostly smooth gradients: skies, skin
 - `--denoise N` sets the strength of the model's denoise in L* units. Auto by default. Raise it if colored blotches show up in grainy areas.
 - `--spread 0.15` is how far a hint travels through flat areas, as a fraction of the short side. Raise it when a stroke doesn't fill its object, lower it when it leaks.
 - `--working-size 512` is the short side for color work. Higher costs time and memory, and rarely looks different, since soft color is the whole trick.
-- `--saturation 1.2` is a plain chroma boost. Proper grading comes later.
+- `--saturation 1.2` is a plain chroma boost. For real grading, use the editor's Grade panel and `epochcolor render`.
 - `--device cpu` forces CPU. `cuda:1` picks a second GPU.
 
 ## Known limits
@@ -231,14 +269,19 @@ Honest list, so nobody is surprised.
 - EXIF is kept for JPEG, WebP and 8-bit PNG. 16-bit PNG and TIFF get the sRGB profile but not the EXIF yet.
 - The RAW develop path is written but hasn't been run against a real RAW file yet.
 - Large scans are fine on memory, but a 100 MP file will take a while on the final recombine. That part is CPU-only for now.
-- Video hints don't exist yet. Painting on a frame and having it carry through the shot is milestone 5. Video takes `siggraph17` or `eccv16`, not `hints`.
+- Video needs a network model; the `hints` model is for photos only.
+- **DDColor has never run on its real weights.** The architecture is the authors' own code, vendored unchanged, and builds with the paper's parameter counts (55.0M tiny, 227.9M large), but my build machine couldn't reach Hugging Face. The loader refuses weights that don't fit exactly, so a mismatch fails loudly instead of producing garbage. Which file each Hugging Face repo holds is looked up at download time, and its SHA-256 comes from Hugging Face's own listing.
+- **DDColor's weight licenses are marked unverified.** The code is Apache-2.0, but I couldn't read the model cards from here, so the manager asks you to accept the terms before downloading. Read the card.
+- Hint carrying is translation along optical flow plus an edge-aware fill. It holds well on things that move and turn slowly, and fades on fast motion, heavy motion blur, or objects that leave and come back. Paint another frame where it fades.
+- Saved-colour matching uses the model's features as they are. It finds the same object in other shots well enough to be useful and also finds look-alikes; that's why it asks by default. The `hints` model has no features, so matching needs a network model.
+- The qualifier and secondary corrections work in HSV, which is quick but shifts brightness a little when saturation changes a lot. Mask tracking follows position only, not scale or rotation.
+- A LUT is stored as a path in the project. Move the .cube and the grade loses it (you're told when it can't be read).
 - **None of the hardware encoders have run on real hardware yet.** My build machine has no GPU. Their arguments follow FFmpeg's documentation, `epochcolor encoders` proves whether each one starts, and auto falls back to software when a test encode fails. But the quality mappings (CQ, ICQ, QP) haven't been compared against the software encoders on real footage. VAAPI on AMD is what I'll check first, since that's my hardware. NVENC, QSV and AMF reports are welcome.
 - ProRes 4444 is stored as 12-bit inside whatever goes in, that's how the format works. The source is 10-bit anyway.
 - FLAC in MP4 is legal and FFmpeg writes it, but some players still skip the track. Use MKV, or re-encode to AAC, if that matters.
 - Audio passthrough with `--frames` trims at the nearest audio packet, not the exact frame. Fine for a test render.
 - An edited timeline (any trim, split, cut, join or in/out range) re-encodes every audio track, since compressed audio frames don't line up with video frames. The export dialog says so and asks for the codec. Only a single untouched clip passes audio through as is. Each piece of audio gets padded or cut to its exact video length, so a source whose audio runs short can't pull later pieces out of sync.
 - **Playback in the editor is silent.** Audio shows as waveforms and goes into the export, but the preview doesn't play it yet.
-- Hints can't be painted in the editor yet (milestone 5), and there's no grading beyond saturation (milestone 7). For photos, hint files from the command line still work.
 - The cache is about 1 GB per minute of footage. A feature needs real disk space while you work on it. Compressing it per shot is the obvious next step if that turns out to hurt.
 - Linux only for now. The Flatpak, its repo on GitHub Pages, and Windows builds are still milestone 8 and 9 work.
 - The first-run PyTorch download takes the newest build PyTorch offers for your hardware at that moment. The spec's pinned torch stack with a weekly test-and-bump workflow isn't built yet, so if a brand new PyTorch release breaks something, `epochcolor setup-torch --variant <yours>` after a fix, or report it.

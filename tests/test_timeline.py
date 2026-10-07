@@ -65,3 +65,32 @@ def test_whole_clip_passes_audio_through(tmp_path, monkeypatch):
     job.run(m, quiet=True)
     with av.open(str(tmp_path / "o.mkv")) as c:
         assert c.streams.audio[0].codec_context.name == "flac"
+
+
+def test_render_command_applies_grade(tmp_path, monkeypatch):
+    from test_video import JitterModel, _make_clip
+
+    from epochcolor import grade as G
+    from epochcolor.cli import main
+    from epochcolor.media import import_clip
+    from epochcolor.project import Project
+    from epochcolor.timeline_export import clip_info
+    from epochcolor.video.pipeline import VideoSettings, analyze
+
+    monkeypatch.setenv("EPOCHCOLOR_CACHE", str(tmp_path / "cache"))
+    a = tmp_path / "a.mkv"
+    _make_clip(a, n=12)
+    p = Project()
+    c = p.add_clip(import_clip(a)[0])
+    p.d.settings["model"] = "jitter"
+    analyze(clip_info(c), JitterModel(), VideoSettings.from_project(p.d.settings), shots=c.shots, quiet=True)
+    g = G.default_grade()
+    g["saturation"] = 0.0
+    p.set_grade_track(c.id, 0, G.new_track(g))
+    p.d.export = {"codec": "h265", "encoder": "software", "speed": "ultrafast", "rf": 18}
+    proj = p.save(tmp_path / "p.epochcolor")
+    out = tmp_path / "r.mkv"
+    assert main(["render", str(proj), "-o", str(out)]) == 0
+    with av.open(str(out)) as cont:
+        f = next(cont.decode(video=0)).to_ndarray(format="rgb24").astype(int)
+    assert np.abs(f[..., 0] - f[..., 2]).max() < 20  # graded to grey

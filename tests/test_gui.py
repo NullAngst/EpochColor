@@ -184,3 +184,143 @@ def test_worker_crash_is_reported(window):
     while w.runner.busy() and time.time() - t < 60:
         pump(app, 0.05)
     assert w.failures and "needs no download" in w.failures[0][1]
+
+
+def test_paint_grade_colours_and_models(tmp_path, window):
+    import av
+    from dataclasses import asdict
+
+    from epochcolor import grade as G
+    from epochcolor.export.plan import ExportSettings
+    from epochcolor.timeline_export import clip_info
+    from epochcolor.video.pipeline import VideoSettings, analysis_dir, analyze
+
+    app, w = window
+    truth = make_clip(tmp_path / "a.mkv")
+    w.add_clips([str(tmp_path / "a.mkv")])
+    wait(app, w)
+    p = w.project
+    c = next(iter(p.d.clips.values()))
+    analyze(clip_info(c), Oracle(truth), VideoSettings.from_project(p.d.settings), shots=c.shots, quiet=True)
+    w._refresh()
+    assert w.status[c.id] == "ready"
+
+    # ---- paint a hint through the viewer; it's applied through the worker
+    w.seek(12)
+    w.paintbar.paint.setChecked(True)
+    w.paintbar.set_rgb([30, 160, 60])
+    w.viewer.strokeFinished.emit({"rgb": [30, 160, 60], "neutral": False, "radius": 0.05,
+                                  "points": [[0.35, 0.5], [0.4, 0.5]]})
+    assert p.hint_frames(c.id) == [12]
+    assert w.status[c.id] == "update"
+    w.apply_hints()
+    wait(app, w)
+    w._refresh()
+    assert w.status[c.id] == "ready"
+    d = analysis_dir(c.path, VideoSettings.from_project(p.d.settings), p.d.settings["model"])
+    assert list(d.glob("hint_*.npy")), "the hinted shot was cached"
+    w.undo()  # undo the stroke
+    assert p.hint_frames(c.id) == []
+    w.redo()
+
+    # ---- erase it again with a right-click near the stroke
+    w._erase_at(0.37, 0.5)
+    assert p.hint_frames(c.id) == []
+    w.undo()
+
+    # ---- grade: edit through the panel, it lands on the shot's track
+    w.seek(5)
+    g = w.grade_panel.read()
+    g["gain"] = [0.0, 0.0, 0.4]  # push blue
+    w.grade_panel.changed.emit(g)
+    w._commit_grade()
+    track = p.grade_track(c.id, 5)
+    assert track and track["keys"][0]["grade"]["gain"][2] == 0.4
+    w.undo()
+    assert p.grade_track(c.id, 5) is None
+    w.redo()
+    # keyframes: a second key changes saturation over time
+    w.seek(20)
+    w._grade_key("add")
+    g = w.grade_panel.read()
+    g["saturation"] = 0.0
+    w.grade_panel.changed.emit(g)
+    w._commit_grade()
+    t = p.grade_track(c.id, 20)
+    assert [k["frame"] for k in t["keys"]] == [5, 20]
+    assert G.evaluate(t, 12)["saturation"] == pytest.approx(0.5, abs=0.05)
+    # copy, paste onto the same shot is a static grade
+    w.copy_grade()
+    w.paste_grade()
+    assert len(p.grade_track(c.id, 20)["keys"]) == 1
+
+    # ---- the preview shows the grade
+    got = {}
+    w.provider.ready.connect(lambda f, gi, col, full, raw: got.update(f=f, col=col, raw=raw, full=full))
+    w.seek(6)
+    pump(app, 1.5)
+    assert got.get("col") is not None and got.get("raw") is not None
+    px_graded = got["col"].pixelColor(10, 10)
+    px_raw = got["raw"].pixelColor(10, 10)
+    assert px_graded != px_raw
+
+    # ---- export carries the grade
+    out = tmp_path / "graded.mkv"
+    es = ExportSettings(encoder="software", speed="ultrafast", rf=16)
+    w.runner.submit("export", "export", {**w._job_payload(), "project": asdict(p.d),
+                                         "export": es.to_dict(), "out": str(out)})
+    wait(app, w)
+    with av.open(str(out)) as cont:
+        frames = [f.to_ndarray(format="rgb24") for f in cont.decode(video=0)]
+    static = p.grade_track(c.id, 20)["keys"][0]["grade"]
+    assert static["saturation"] == pytest.approx(0.0, abs=1e-6)
+    f0 = frames[3].astype(int)
+    assert np.abs(f0[..., 0] - f0[..., 2]).max() < 25  # saturation 0: grey
+
+    # ---- saved colours: save, find (worker, random siggraph17 features)
+    w.seek(12)
+    w.paintbar.set_rgb([200, 30, 30])
+    w.viewer.strokeFinished.emit({"rgb": [200, 30, 30], "neutral": False, "radius": 0.05, "points": [[0.3, 0.5]]})
+    from PySide6.QtWidgets import QInputDialog
+
+    orig = QInputDialog.getText
+    QInputDialog.getText = staticmethod(lambda *a, **k: ("red block", True))
+    try:
+        w.save_colour()
+    finally:
+        QInputDialog.getText = orig
+    assert p.d.colors and p.d.colors[0]["name"] == "red block"
+    p.set_setting("match_threshold", 0.3)
+    w._colour_request("find", "")
+    wait(app, w)
+    assert isinstance(p.d.suggestions, list)  # random features: count means nothing, plumbing does
+
+    # ---- photo: paint, colorize with hints, grade on display
+    import cv2
+
+    cv2.imwrite(str(tmp_path / "ph.png"), cv2.cvtColor(truth[0][..., ::-1], cv2.COLOR_RGB2GRAY))
+    w.add_photos([str(tmp_path / "ph.png")])
+    w.filmstrip.setCurrentRow(0)
+    w.viewer.strokeFinished.emit({"rgb": [30, 160, 60], "neutral": False, "radius": 0.05, "points": [[0.5, 0.5]]})
+    ph = p.d.photos[0]
+    assert len(ph.strokes) == 1
+    w.apply_hints()
+    wait(app, w)
+    from epochcolor.worker import photo_result_path
+
+    assert photo_result_path(ph.path, p.d.settings, p.d.settings["model"], ph.strokes).exists()
+    g = w.grade_panel.read()
+    g["saturation"] = 1.5
+    w.grade_panel.changed.emit(g)
+    w._commit_grade()
+    assert p.d.photos[0].grade["saturation"] == 1.5
+
+    # ---- model manager opens and lists the catalog
+    from epochcolor.gui.model_manager import ModelManager
+
+    mm = ModelManager(p.d.settings["model"], w)
+    ids = [mm.table.item(i, 0).data(0x0100) for i in range(mm.table.rowCount())]
+    assert "ddcolor-tiny" in ids and "siggraph17" in ids
+    states = [mm.table.item(i, 5).text() for i in range(mm.table.rowCount())]
+    assert any("installed" in s_ for s_ in states)
+    mm.close()

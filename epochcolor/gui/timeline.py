@@ -216,7 +216,7 @@ class TimelineCanvas(QWidget):
             # label strip
             name = self.project.d.clips[seg.clip].name
             state = self.status.get(seg.clip, "none")
-            dot = {"ready": "#6fbf73", "partial": theme.ACCENT, "none": "#777777"}[state]
+            dot = {"ready": "#6fbf73", "update": "#6fa8d9", "partial": theme.ACCENT, "none": "#777777"}.get(state, "#777777")
             p.fillRect(QRectF(r.left(), r.top(), r.width(), 14), QColor(0, 0, 0, 140))
             p.setBrush(QColor(dot))
             p.setPen(Qt.NoPen)
@@ -231,6 +231,25 @@ class TimelineCanvas(QWidget):
                 if seg.src_in < a < seg.src_out:
                     xc = self.x_of(start + a - seg.src_in)
                     p.drawLine(QPointF(xc, r.top() + 14), QPointF(xc, r.bottom()))
+            # painted hint frames: dots; grade keyframes: diamonds
+            p.setPen(Qt.NoPen)
+            for f in self.project.hint_frames(seg.clip):
+                if seg.src_in <= f < seg.src_out:
+                    xc = self.x_of(start + f - seg.src_in + 0.5)
+                    p.setBrush(QColor("#e8e8e8"))
+                    p.drawEllipse(QPointF(xc, r.bottom() - 6), 3.5, 3.5)
+            for track in self.project.d.grades.get(seg.clip, {}).values():
+                keys = track.get("keys", [])
+                if len(keys) < 2:
+                    continue
+                for k in keys:
+                    f = k["frame"]
+                    if seg.src_in <= f < seg.src_out:
+                        xc = self.x_of(start + f - seg.src_in + 0.5)
+                        y0 = r.bottom() - 16
+                        p.setBrush(QColor(theme.ACCENT))
+                        p.drawPolygon(QPolygonF([QPointF(xc, y0 - 4), QPointF(xc + 4, y0), QPointF(xc, y0 + 4),
+                                                 QPointF(xc - 4, y0)]))
             border = QPen(QColor(theme.ACCENT), 2) if i == self.sel else QPen(QColor("#111111"), 1)
             p.setPen(border)
             p.setBrush(Qt.NoBrush)

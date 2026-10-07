@@ -24,9 +24,12 @@ from ..media import MediaInfo, media_dir
 from ..project import Clip, AudioInfo, Project, ProjectError
 from ..timeline_export import analysis_state, project_audio
 from ..video.pipeline import VideoSettings, analysis_dir
+from .. import grade as G
 from . import theme
 from .export_dialog import ExportDialog, PhotoExportDialog
+from .grade_panel import GradePanel
 from .jobs import JobRunner
+from .panels import ColoursPanel, PaintBar, ScopesPanel
 from .preview import LayoutPiece, PreviewProvider, to_qimage
 from .timeline import MediaCache, Timeline, timecode
 from .viewer import Viewer
@@ -50,7 +53,12 @@ Alt+Left/R   move the selected segment
 B            add or remove a shot cut at the playhead
 M            marker with a note
 1  2  3      colour / before-after split / original
+P            paint hints on/off; [ and ] (or the wheel) brush size
+             drag paints, right-click removes a stroke, Ctrl+click picks a colour
+H            show or hide strokes
+Ctrl+Return  apply hints now
 Ctrl+R       colorize the selected clip (Ctrl+Shift+R: all)
+Ctrl+Alt+C/V copy / paste a shot's grade
 Ctrl+E       export video
 Ctrl+Z       undo, Ctrl+Shift+Z redo
 Ctrl+wheel   zoom the timeline, Shift+Z fits it"""
@@ -81,8 +89,13 @@ class Inspector(QWidget):
         c = QGroupBox("Colour")
         f = QFormLayout(c)
         self.model = QComboBox()
-        self.model.addItem("siggraph17 (hints, default)", "siggraph17")
-        self.model.addItem("eccv16 (automatic)", "eccv16")
+        self.manager_btn = QPushButton("Models...")
+        self.manager_btn.setToolTip("Download, add and remove models")
+        mrow = QWidget()
+        ml = QHBoxLayout(mrow)
+        ml.setContentsMargins(0, 0, 0, 0)
+        ml.addWidget(self.model, 1)
+        ml.addWidget(self.manager_btn)
         self.working = QSpinBox()
         self.working.setRange(128, 2048)
         self.working.setSingleStep(64)
@@ -112,7 +125,7 @@ class Inspector(QWidget):
         dl.setContentsMargins(0, 0, 0, 0)
         dl.addWidget(self.denoise_auto)
         dl.addWidget(self.denoise, 1)
-        f.addRow("Model", self.model)
+        f.addRow("Model", mrow)
         f.addRow("Working size", self.working)
         f.addRow("Chroma size", self.chroma)
         f.addRow("Stabilize", self.stabilize)
@@ -178,11 +191,28 @@ class Inspector(QWidget):
         self.denoise.setEnabled(not self.denoise_auto.isChecked())
         self._queue("denoise", None if self.denoise_auto.isChecked() else round(self.denoise.value(), 2))
 
+    def set_models(self, current: str) -> None:
+        from ..models import choices
+
+        self.model.blockSignals(True)
+        self.model.clear()
+        for mid, label, have in choices():
+            self.model.addItem(label if have else f"{label} (not downloaded)", mid)
+            if not have:
+                item = self.model.model().item(self.model.count() - 1)
+                item.setEnabled(False)
+        if self.model.findData(current) < 0:
+            self.model.addItem(f"{current} (not installed)", current)
+        self.model.setCurrentIndex(self.model.findData(current))
+        self.model.blockSignals(False)
+
     def show_settings(self, s: dict) -> None:
         widgets = (self.model, self.working, self.chroma, self.stabilize, self.grain, self.saturation,
                    self.denoise, self.denoise_auto)
         for w in widgets:
             w.blockSignals(True)
+        if self.model.findData(s.get("model")) < 0 or self.model.count() == 0:
+            self.set_models(s.get("model"))
         self.model.setCurrentIndex(max(0, self.model.findData(s.get("model"))))
         self.working.setValue(int(s.get("working_size", 512)))
         self.chroma.setValue(int(s.get("chroma_size", 256)))
@@ -211,6 +241,11 @@ class MainWindow(QMainWindow):
         self._play_t0 = 0.0
         self._play_f0 = 0
         self._importing: dict[int, str] = {}  # job id -> path, for re-imports of known clips
+        self._grade_before: dict | None = None  # project state when a run of grade edits began
+        self._grade_clip: dict | None = None  # copied grade
+        self._show_matte = False
+        self._manager = None
+        self._photo_raw = None
 
         self.runner = JobRunner(self)
         self.runner.changed.connect(self._jobs_changed)
@@ -224,6 +259,14 @@ class MainWindow(QMainWindow):
         self.play_timer = QTimer(self)
         self.play_timer.setInterval(8)
         self.play_timer.timeout.connect(self._tick)
+        self.hint_timer = QTimer(self)
+        self.hint_timer.setSingleShot(True)
+        self.hint_timer.setInterval(900)
+        self.hint_timer.timeout.connect(self.apply_hints)
+        self.grade_timer = QTimer(self)
+        self.grade_timer.setSingleShot(True)
+        self.grade_timer.setInterval(500)
+        self.grade_timer.timeout.connect(self._commit_grade)
 
         self.resize(1440, 900)
         if project_path:
@@ -269,10 +312,17 @@ class MainWindow(QMainWindow):
         self.btn["fwd"].clicked.connect(lambda: self.step(1))
         self.btn["play"].clicked.connect(self.toggle_play)
 
+        self.paintbar = PaintBar(self)
+        self.paintbar.changed.connect(self._brush_changed)
+        self.paintbar.action.connect(self._paint_action)
+        self.viewer.strokeFinished.connect(self._stroke_added)
+        self.viewer.eraseAt.connect(self._erase_at)
+        self.viewer.picked.connect(self._picked)
         top = QWidget()
         topl = QVBoxLayout(top)
         topl.setContentsMargins(0, 0, 0, 0)
         topl.setSpacing(0)
+        topl.addWidget(self.paintbar)
         topl.addWidget(self.viewer, 1)
         topl.addWidget(transport)
 
@@ -320,11 +370,44 @@ class MainWindow(QMainWindow):
         self.inspector.cancel_btn.clicked.connect(lambda: self.runner.cancel(
             self.runner.current.id if self.runner.current else -1))
         self.inspector.cancel_all_btn.clicked.connect(lambda: self.runner.cancel(None))
+        self.inspector.manager_btn.clicked.connect(self.open_model_manager)
         dock = QDockWidget("Inspector", self)
         dock.setObjectName("inspector")
         dock.setWidget(self.inspector)
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
         self.inspector_dock = dock
+
+        self.grade_panel = GradePanel()
+        self.grade_panel.changed.connect(self._grade_edited)
+        self.grade_panel.keyAction.connect(self._grade_key)
+        self.grade_panel.action.connect(self._grade_action)
+        gdock = QDockWidget("Grade", self)
+        gdock.setObjectName("grade")
+        gdock.setWidget(self.grade_panel)
+        self.addDockWidget(Qt.RightDockWidgetArea, gdock)
+        self.tabifyDockWidget(dock, gdock)
+        dock.raise_()
+        self.grade_dock = gdock
+
+        self.colours = ColoursPanel()
+        self.colours.useColour.connect(self._use_colour)
+        self.colours.request.connect(self._colour_request)
+        self.colours.settingChanged.connect(self._setting_changed)
+        cdock = QDockWidget("Colours", self)
+        cdock.setObjectName("colours")
+        cdock.setWidget(self.colours)
+        self.addDockWidget(Qt.LeftDockWidgetArea, cdock)
+        self.tabifyDockWidget(self.clips_dock, cdock)
+        self.colours_dock = cdock
+        self.clips_dock.raise_()
+
+        self.scopes = ScopesPanel()
+        sdock = QDockWidget("Scopes", self)
+        sdock.setObjectName("scopes")
+        sdock.setWidget(self.scopes)
+        self.addDockWidget(Qt.LeftDockWidgetArea, sdock)
+        self.scopes_dock = sdock
+        sdock.visibilityChanged.connect(lambda v: v and self.scopes.refresh())
 
     def _build_actions(self) -> None:
         mb = self.menuBar()
@@ -371,6 +454,10 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         act(m, "Remove clip from project", self.remove_clip)
         act(m, "Remove selected photos", self.remove_photos)
+        m.addSeparator()
+        act(m, "Copy grade", self.copy_grade, "Ctrl+Alt+C")
+        act(m, "Paste grade", self.paste_grade, "Ctrl+Alt+V")
+        act(m, "Reset grade", lambda: self._grade_action("reset"))
 
         m = mb.addMenu("&View")
         act(m, "Colour", lambda: self.viewer.set_mode("color"), "1")
@@ -380,6 +467,11 @@ class MainWindow(QMainWindow):
         act(m, "Zoom timeline in", lambda: self._zoom(1.5), ["=", "Ctrl+="])
         act(m, "Zoom timeline out", lambda: self._zoom(1 / 1.5), ["-", "Ctrl+-"])
         act(m, "Fit timeline", self._fit, "Shift+Z")
+        m.addSeparator()
+        act(m, "Paint hints", lambda: self.paintbar.paint.toggle(), "P")
+        act(m, "Show strokes", lambda: self.paintbar.show.toggle(), "H")
+        act(m, "Smaller brush", lambda: self.paintbar.size.setValue(int(self.paintbar.size.value() / 1.25)), "[")
+        act(m, "Bigger brush", lambda: self.paintbar.size.setValue(int(self.paintbar.size.value() * 1.25) + 1), "]")
 
         m = mb.addMenu("&Playback")
         act(m, "Play / pause", self.toggle_play, "Space")
@@ -399,7 +491,10 @@ class MainWindow(QMainWindow):
         act(m, "Colorize selected clip", self.colorize_selected, "Ctrl+R")
         act(m, "Colorize all clips", self.colorize_all, "Ctrl+Shift+R")
         act(m, "Colorize selected photos", self.colorize_photos, "Ctrl+Alt+R")
+        act(m, "Apply hints", self.apply_hints, ["Ctrl+Return", "Ctrl+Enter"])
+        act(m, "Find saved colours everywhere", lambda: self._colour_request("find", ""))
         m.addSeparator()
+        act(m, "Model manager...", self.open_model_manager)
         act(m, "Install PyTorch...", lambda: self.setup_torch(False))
         act(m, "Download weights for the current model", self.fetch_weights)
         act(m, "Model device...", self.choose_device)
@@ -429,7 +524,8 @@ class MainWindow(QMainWindow):
             if mi is None:
                 continue
             ab = None
-            if self.status.get(c.id) == "ready":
+            if self.status.get(c.id) in ("ready", "update"):
+                # "update": hints or the stabilizer changed; show the last result until it reruns
                 ab = str(analysis_dir(Path(c.path), s, model) / "ab.npy")
             out.append(LayoutPiece(start, seg.length, c.id, seg.src_in, str(mi.proxy), c.path, c.fps, ab))
         return out
@@ -438,16 +534,20 @@ class MainWindow(QMainWindow):
         """Bring every view in line with the project."""
         s = VideoSettings.from_project(self.project.d.settings)
         model = self.project.d.settings["model"]
-        self.status = {cid: analysis_state(c, s, model) for cid, c in self.project.d.clips.items()}
+        self.status = {cid: analysis_state(c, s, model, hints=self.project.d.hints.get(cid))
+                       for cid, c in self.project.d.clips.items()}
         self.timeline.canvas.status = self.status
         self.timeline.set_project(self.project) if self.timeline.canvas.project is not self.project \
             else self.timeline.refresh()
-        self.provider.layout_sig.emit(self._layout(), dict(self.project.d.settings))
+        self._push_layout()
         self.playhead = max(0, min(self.playhead, max(0, self.project.duration - 1)))
         self.timeline.canvas.playhead = self.playhead
         self._refresh_bin()
         self._refresh_inspector()
         self._refresh_title()
+        self._refresh_colours()
+        self._update_overlays()
+        self._load_grade_panel()
         self.undo_act.setText(f"Undo {self.project.undo_label}" if self.project.undo_label else "Undo")
         self.redo_act.setText(f"Redo {self.project.redo_label}" if self.project.redo_label else "Redo")
         self.undo_act.setEnabled(self.project.undo_label is not None)
@@ -457,13 +557,22 @@ class MainWindow(QMainWindow):
         else:
             self._show_photo(self.filmstrip.currentRow())
 
+    def _push_layout(self) -> None:
+        """Send the preview what it needs to draw: pieces, settings, grades."""
+        settings = dict(self.project.d.settings)
+        settings["_grades"] = G.copy.deepcopy(self.project.d.grades)
+        settings["_shots"] = {cid: [list(x) for x in c.shots] for cid, c in self.project.d.clips.items()}
+        settings["_matte"] = self._show_matte
+        self.provider.layout_sig.emit(self._layout(), settings)
+
     def _refresh_title(self) -> None:
         name = self.project.path.name if self.project.path else "untitled"
         self.setWindowTitle(f"{'*' if self.project.dirty else ''}{name} - EpochColor")
 
     def _refresh_bin(self) -> None:
         self.clip_list.clear()
-        labels = {"ready": "colorized", "partial": "partly colorized", "none": "not colorized"}
+        labels = {"ready": "colorized", "update": "hints changed, apply them", "partial": "partly colorized",
+                  "none": "not colorized"}
         for cid, c in self.project.d.clips.items():
             it = QListWidgetItem(f"{c.name}\n{c.width}x{c.height}, {c.frames} frames, "
                                  f"{len(c.shots)} shots, {labels[self.status.get(cid, 'none')]}")
@@ -481,7 +590,8 @@ class MainWindow(QMainWindow):
                 icon = self.photo_icons[ph.id] = self._photo_icon(ph.path)
             done = False
             try:
-                done = photo_result_path(ph.path, self.project.d.settings, self.project.d.settings["model"]).exists()
+                done = photo_result_path(ph.path, self.project.d.settings, self.project.d.settings["model"],
+                                         ph.strokes).exists()
             except OSError:
                 pass
             it = QListWidgetItem(icon, Path(ph.path).name + ("" if done else "\n(not colorized)"))
@@ -509,11 +619,12 @@ class MainWindow(QMainWindow):
                 ph = self.project.d.photos[row]
                 try:
                     done = photo_result_path(ph.path, self.project.d.settings,
-                                             self.project.d.settings["model"]).exists()
+                                             self.project.d.settings["model"], ph.strokes).exists()
                 except OSError:
                     done = False
+                state = "colorized" if done else ("hints changed, apply them" if ph.strokes else "not colorized yet")
                 ins.clip_info.setText(f"<b>{Path(ph.path).name}</b><br>{Path(ph.path).parent}<br>"
-                                      f"{'colorized' if done else 'not colorized yet'}")
+                                      f"{len(ph.strokes)} hint stroke(s)<br>{state}")
             else:
                 ins.clip_info.setText("No photo selected")
             ins.show_settings(self.project.d.settings)
@@ -524,8 +635,11 @@ class MainWindow(QMainWindow):
         if c is None:
             self.inspector.clip_info.setText("Nothing selected")
         else:
-            st = {"ready": "colorized", "partial": "partly colorized, run Colorize to finish",
+            st = {"ready": "colorized", "update": "hints or stabilizer changed: Apply hints (Ctrl+Return)",
+                  "partial": "partly colorized, run Colorize to finish",
                   "none": "not colorized yet"}[self.status.get(c.id, "none")]
+            nh = len(self.project.hint_frames(c.id))
+            st += f"<br>{nh} painted frame(s)" if nh else ""
             audio = ", ".join(f"{a.codec} {a.channels}ch" for a in c.audio) or "none"
             self.inspector.clip_info.setText(
                 f"<b>{c.name}</b><br>{c.width}x{c.height} at {float(c.fps):.3f} fps, {c.codec}<br>"
@@ -546,10 +660,12 @@ class MainWindow(QMainWindow):
             self.viewer.clear("Add clips with File > Add clips (Ctrl+I)" if not self.project.d.clips
                               else "The timeline is empty")
 
-    def _frame_ready(self, frame: int, gray, color, full: bool) -> None:
+    def _frame_ready(self, frame: int, gray, color, full: bool, raw=None) -> None:
         if frame != self.playhead or self.bottom.currentWidget() is not self.timeline:
             return
-        self.viewer.set_images(gray, color, full)
+        self.viewer.set_images(gray, color, full, raw=raw)
+        if self.scopes_dock.isVisible() and (full or not self.speed or frame % 4 == 0):
+            self.scopes.show_image(color or gray)
 
     def _mode_changed(self, mode: str) -> None:
         for m, b in self.mode_btns.items():
@@ -564,6 +680,8 @@ class MainWindow(QMainWindow):
         self.timeline.sync_scroll()
         if not playing:
             self._refresh_inspector()
+            self._update_overlays()
+            self._load_grade_panel()
         self._request(playing)
 
     def step(self, n: int) -> None:
@@ -775,7 +893,7 @@ class MainWindow(QMainWindow):
         if not 0 <= row < len(self.project.d.photos):
             self.viewer.clear("Add photos with File > Add photos (Ctrl+Shift+I)")
             return
-        from ..color import srgb_to_l
+        from ..color import lab_to_srgb, srgb_to_l, srgb_to_lab
         from ..worker import photo_result_path
 
         ph = self.project.d.photos[row]
@@ -783,14 +901,35 @@ class MainWindow(QMainWindow):
             src = self._photo_display(ph.path)
             if src.ndim == 3:  # show what the model sees: luminance only
                 gray = srgb_to_l(src.astype(np.float32) / 255)
-                from ..color import lab_to_srgb
-
                 src = (lab_to_srgb(gray, np.zeros(gray.shape + (2,), np.float32))[..., 0] * 255 + 0.5).astype(np.uint8)
             gimg = to_qimage(src)
-            res = photo_result_path(ph.path, self.project.d.settings, self.project.d.settings["model"])
-            cimg = to_qimage(self._photo_display(str(res))) if res.exists() else None
-            self.viewer.set_images(gimg, cimg, True, Path(ph.path).name)
+            res = photo_result_path(ph.path, self.project.d.settings, self.project.d.settings["model"], ph.strokes)
+            if not res.exists() and ph.strokes:
+                # hints not applied yet: show the last unhinted result meanwhile
+                res = photo_result_path(ph.path, self.project.d.settings, self.project.d.settings["model"])
+            cimg = raw = None
+            if res.exists():
+                rgb = self._photo_display(str(res)).astype(np.float32) / 255.0
+                sat = float(self.project.d.settings.get("saturation", 1.0))
+                if sat != 1.0:
+                    lab = srgb_to_lab(rgb)
+                    rgb = lab_to_srgb(lab[..., 0], lab[..., 1:] * sat)
+                raw = to_qimage((np.clip(rgb, 0, 1) * 255 + 0.5).astype(np.uint8))
+                cimg = raw
+                if ph.grade and not G.is_identity(ph.grade):
+                    matte = [] if self._show_matte else None
+                    out = G.apply(rgb, ph.grade, matte_out=matte)
+                    if self._show_matte:
+                        m = matte[0] if matte and matte[0] is not None else np.ones(rgb.shape[:2], np.float32)
+                        cimg = to_qimage((np.clip(m, 0, 1) * 255 + 0.5).astype(np.uint8))
+                    else:
+                        cimg = to_qimage((np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8))
+            self.viewer.set_images(gimg, cimg, True, Path(ph.path).name, raw=raw)
+            if self.scopes_dock.isVisible():
+                self.scopes.show_image(cimg or gimg)
             self._refresh_inspector()
+            self._update_overlays()
+            self._load_grade_panel()
         except Exception as e:
             self.viewer.clear(f"Can't show {Path(ph.path).name}: {e}")
 
@@ -830,7 +969,8 @@ class MainWindow(QMainWindow):
         for c in clips:
             if c.id in busy:
                 continue
-            self.runner.submit("analyze", f"Colorize {c.name}", {**self._job_payload(), "clip": asdict(c)})
+            self.runner.submit("analyze", f"Colorize {c.name}",
+                               {**self._job_payload(), "clip": asdict(c), "hints": self.project.d.hints.get(c.id)})
 
     def colorize_photos(self) -> None:
         rows = sorted({self.filmstrip.row(it) for it in self.filmstrip.selectedItems()}) or \
@@ -838,11 +978,20 @@ class MainWindow(QMainWindow):
         for r in rows:
             ph = self.project.d.photos[r]
             self.runner.submit("photo", f"Colorize {Path(ph.path).name}",
-                               {**self._job_payload(), "photo": ph.id, "path": ph.path})
+                               {**self._job_payload(), "photo": ph.id, "path": ph.path, "strokes": ph.strokes})
 
     def fetch_weights(self) -> None:
-        self.runner.submit("fetch", f"Download {self.project.d.settings['model']} weights",
-                           {"model": self.project.d.settings["model"]})
+        from ..models.manager import entry, installed
+
+        mid = self.project.d.settings["model"]
+        e = entry(mid)
+        if mid in installed():
+            self.statusBar().showMessage(f"{mid} is downloaded already", 4000)
+            return
+        if e is None or not e.get("license_ok"):
+            self.open_model_manager()  # shows the license before downloading
+            return
+        self.runner.submit("fetch", f"Download {mid} weights", {"model": mid})
 
     def setup_torch(self, first_run: bool) -> None:
         from .torch_dialog import TorchDialog
@@ -887,6 +1036,8 @@ class MainWindow(QMainWindow):
         ins.cancel_all_btn.setEnabled(self.runner.busy())
 
     def _job_done(self, job, result: dict) -> None:
+        if self._manager is not None:
+            self._manager.reload()
         if job.kind == "import":
             cd = dict(result["clip"])
             cd["audio"] = [AudioInfo(**a) for a in cd.get("audio", [])]
@@ -909,6 +1060,18 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"done: exported {len(result['files'])} photo(s)", 10000)
         elif job.kind == "fetch":
             self.statusBar().showMessage(f"done: weights saved to {result.get('path')}", 10000)
+            self.inspector.set_models(self.project.d.settings["model"])
+        elif job.kind in ("add_model", "refresh_catalog", "move_models"):
+            self.inspector.set_models(self.project.d.settings["model"])
+            msg = {"add_model": f"added {result.get('model')}",
+                   "refresh_catalog": f"catalog: {result.get('good')} models",
+                   "move_models": f"models now in {result.get('dir')}"}[job.kind]
+            self.statusBar().showMessage(f"done: {msg}", 8000)
+            self.runner.shutdown()  # a fresh worker sees the new models folder
+        elif job.kind == "match":
+            self._matches_found(result["suggestions"])
+        elif job.kind == "track_mask":
+            self._track_done(job, result)
         else:
             self.statusBar().showMessage(f"done: {job.label}", 5000)
         self._refresh()
@@ -935,6 +1098,444 @@ class MainWindow(QMainWindow):
         self.media_info[clip.id] = mi
         self.media.add(clip.id, mi)
         return True
+
+    # ------------------------------------------------------- painting
+
+    def _paint_target(self):
+        """("clip", clip_id, clip frame) or ("photo", photo_id, None) for what's in the viewer."""
+        if self.bottom.currentWidget() is self.filmstrip:
+            row = self.filmstrip.currentRow()
+            if 0 <= row < len(self.project.d.photos):
+                return "photo", self.project.d.photos[row].id, None
+            return None
+        hit = self.project.locate(self.playhead)
+        if hit is None:
+            return None
+        return "clip", hit[1].clip, hit[2]
+
+    def _target_strokes(self, t) -> list:
+        if t is None:
+            return []
+        if t[0] == "photo":
+            return list(self.project.photo(t[1]).strokes)
+        return self.project.strokes_at(t[1], t[2])
+
+    def _set_target_strokes(self, t, strokes: list, label: str) -> None:
+        if t[0] == "photo":
+            self.project.set_photo_strokes(t[1], strokes, label)
+        else:
+            self.project.set_strokes(t[1], t[2], strokes, label)
+
+    def _brush_changed(self) -> None:
+        pb = self.paintbar
+        self.viewer.paint_mode = pb.paint.isChecked()
+        self.viewer.erase_mode = pb.erase.isChecked()
+        self.viewer.show_strokes = pb.show.isChecked() or pb.paint.isChecked()
+        self.viewer.brush = {"rgb": list(pb.rgb), "neutral": pb.neutral.isChecked(), "radius": pb.radius()}
+        self.viewer.update()
+
+    def _stroke_added(self, stroke: dict) -> None:
+        t = self._paint_target()
+        if t is None:
+            return
+        self._set_target_strokes(t, self._target_strokes(t) + [stroke], "paint")
+        self._after_paint()
+
+    def _erase_at(self, x: float, y: float) -> None:
+        t = self._paint_target()
+        strokes = self._target_strokes(t)
+        best, dist = None, 1e9
+        for i, st in enumerate(strokes):
+            for px, py in st["points"]:
+                d = ((px - x) ** 2 + (py - y) ** 2) ** 0.5 - st.get("radius", 0.02)
+                if d < dist:
+                    best, dist = i, d
+        if best is not None and dist < 0.03:
+            strokes.pop(best)
+            self._set_target_strokes(t, strokes, "erase stroke")
+            self._after_paint()
+
+    def _after_paint(self) -> None:
+        self._refresh()
+        if self.paintbar.auto.isChecked():
+            self.hint_timer.start()
+
+    def _paint_action(self, name: str) -> None:
+        t = self._paint_target()
+        if name == "apply":
+            self.apply_hints()
+        elif name == "clear" and t and self._target_strokes(t):
+            self._set_target_strokes(t, [], "clear strokes")
+            self._after_paint()
+        elif name == "save_colour":
+            self.save_colour()
+
+    def apply_hints(self) -> None:
+        """Rerun the hint pass for what's in the viewer: the clip's changed
+        shots (the model pass stays cached), or the photo."""
+        self.hint_timer.stop()
+        t = self._paint_target()
+        if t is None:
+            return
+        if t[0] == "photo":
+            ph = self.project.photo(t[1])
+            self.runner.cancel_where(lambda j: j.kind == "photo" and j.payload.get("photo") == ph.id)
+            self.runner.submit("photo", f"Hints on {Path(ph.path).name}",
+                               {**self._job_payload(), "photo": ph.id, "path": ph.path, "strokes": ph.strokes})
+            return
+        c = self.project.d.clips[t[1]]
+        if self.status.get(c.id) == "none":
+            self.statusBar().showMessage(f"{c.name} isn't colorized yet; hints go in with its first colorize pass", 6000)
+        self.runner.cancel_where(lambda j: j.kind == "analyze" and j.payload.get("clip", {}).get("id") == c.id,
+                                 running=False)
+        self.runner.submit("analyze", f"Hints on {c.name}",
+                           {**self._job_payload(), "clip": asdict(c), "hints": self.project.d.hints.get(c.id)})
+
+    def _update_overlays(self) -> None:
+        t = self._paint_target()
+        strokes = self._target_strokes(t)
+        sugs = []
+        if t is not None:
+            cols = {c["id"]: c for c in self.project.d.colors}
+            for m in self.project.d.suggestions:
+                c = cols.get(m["color"])
+                if not c or m["kind"] != t[0] or m["target"] != t[1]:
+                    continue
+                if t[0] == "clip":
+                    shot = self.project.shot_start(t[1], t[2])
+                    if self.project.shot_start(t[1], m["frame"]) != shot:
+                        continue
+                for x, y in m["points"]:
+                    sugs.append((x, y, c["rgb"], c["name"]))
+        mask = None
+        g = self.grade_panel.grade if self.grade_panel.isEnabled() else None
+        if g and g["mask"]["shape"] != "none" and self.grade_dock.isVisible():
+            mask = dict(g["mask"])
+            if t and t[0] == "clip":
+                dx, dy = G.GradeBook(self.project.d.grades,
+                                     {cid: c.shots for cid, c in self.project.d.clips.items()}).mask_offset(t[1], t[2])
+                mask["_dx"], mask["_dy"] = dx, dy
+        self.viewer.set_overlays(strokes, mask, sugs)
+
+    def _picked(self, x: float, y: float, rgb) -> None:
+        mode = self.viewer.pick_mode
+        self.viewer.pick_mode = None
+        if rgb is None:
+            self.statusBar().showMessage("nothing to sample: colorize first", 4000)
+            return
+        if mode == "neutral":
+            t, n = G.wb_from_neutral(rgb)
+            self.grade_panel.set_fields(temperature=round(t, 4), tint=round(n, 4))
+        elif mode == "hue":
+            import colorsys
+
+            h, sat, v = colorsys.rgb_to_hsv(*rgb)
+            self.grade_panel.set_fields(**{"qualifier.hue": round(h, 4), "qualifier.enabled": True})
+        else:  # Ctrl+click while painting: brush colour
+            self.paintbar.set_rgb([int(round(c * 255)) for c in rgb])
+        self.viewer.update()
+
+    # -------------------------------------------------- saved colours
+
+    def save_colour(self) -> None:
+        t = self._paint_target()
+        strokes = [st for st in self._target_strokes(t) if not st.get("neutral")]
+        if not strokes:
+            self.statusBar().showMessage("paint a stroke first; its colour is what gets saved", 5000)
+            return
+        st = strokes[-1]
+        name, ok = QInputDialog.getText(self, "Save colour", "Name (\"Anna's coat, navy\"):")
+        if not ok or not name.strip():
+            return
+        source = {"kind": t[0], "target": t[1], "frame": t[2], "stroke": st}
+        self.project.add_color(name.strip(), st["rgb"], source)
+        self.colours_dock.raise_()
+        self._refresh()
+
+    def _use_colour(self, rgb) -> None:
+        self.paintbar.set_rgb(rgb)
+        if not self.paintbar.paint.isChecked():
+            self.paintbar.paint.setChecked(True)
+
+    def _names(self) -> dict:
+        out = {("clip", cid): c.name for cid, c in self.project.d.clips.items()}
+        out.update({("photo", ph.id): Path(ph.path).name for ph in self.project.d.photos})
+        return out
+
+    def _refresh_colours(self) -> None:
+        self.colours.show_data(self.project.d.colors, self.project.d.suggestions, self._names(),
+                               self.project.d.settings)
+
+    def _colour_request(self, action: str, ident: str) -> None:
+        p = self.project
+        if action == "rename":
+            c = next((c for c in p.d.colors if c["id"] == ident), None)
+            if c:
+                name, ok = QInputDialog.getText(self, "Rename colour", "Name:", text=c["name"])
+                if ok and name.strip():
+                    p.rename_color(ident, name.strip())
+        elif action == "delete":
+            p.remove_color(ident)
+        elif action == "find":
+            if not p.d.colors:
+                self.statusBar().showMessage("save a colour first (paint a stroke, then Save colour)", 5000)
+                return
+            clips = {cid: {"path": c.path, "fps_num": c.fps_num, "fps_den": c.fps_den, "shots": c.shots}
+                     for cid, c in p.d.clips.items()}
+            photos = {ph.id: ph.path for ph in p.d.photos}
+            self.runner.submit("match", "Find saved colours",
+                               {**self._job_payload(), "colors": p.d.colors, "clips": clips, "photos": photos})
+            return
+        elif action == "goto":
+            self._goto_match(ident)
+            return
+        elif action == "apply":
+            p.apply_suggestion(ident)
+            self._after_paint()
+            return
+        elif action == "dismiss":
+            p.dismiss_suggestion(ident)
+        elif action == "apply_all":
+            for m in list(p.d.suggestions):
+                p.apply_suggestion(m["id"])
+            self._after_paint()
+            return
+        self._refresh()
+
+    def _matches_found(self, items: list) -> None:
+        if self.project.d.settings.get("match_mode") == "auto" and items:
+            self.project.set_suggestions(items)
+            for m in items:
+                self.project.apply_suggestion(m["id"])
+            self.statusBar().showMessage(f"painted {len(items)} match(es); Apply hints to see them", 8000)
+            self._refresh()
+            return
+        self.project.set_suggestions(items)
+        self.statusBar().showMessage(f"{len(items)} match(es) found, see the Colours panel", 8000)
+        self._refresh()
+
+    def _goto_match(self, ident: str) -> None:
+        m = next((x for x in self.project.d.suggestions if x["id"] == ident), None)
+        if not m:
+            return
+        if m["kind"] == "photo":
+            self.bottom.setCurrentWidget(self.filmstrip)
+            for i, ph in enumerate(self.project.d.photos):
+                if ph.id == m["target"]:
+                    self.filmstrip.setCurrentRow(i)
+            return
+        self.bottom.setCurrentWidget(self.timeline)
+        for start, seg in zip(self.project.seg_starts(), self.project.d.timeline):
+            if seg.clip == m["target"] and seg.src_in <= m["frame"] < seg.src_out:
+                self.seek(start + m["frame"] - seg.src_in)
+                return
+        self.statusBar().showMessage("that frame isn't on the timeline", 4000)
+
+    # ------------------------------------------------------- grading
+
+    def _grade_target(self):
+        """(kind, id, clip frame, track) for the grade panel."""
+        t = self._paint_target()
+        if t is None:
+            return None
+        if t[0] == "photo":
+            return "photo", t[1], None, None
+        return "clip", t[1], t[2], self.project.grade_track(t[1], t[2])
+
+    def _load_grade_panel(self) -> None:
+        if self._grade_before is not None:
+            return  # mid-edit: don't fight the user's drag
+        gt = self._grade_target()
+        if gt is None:
+            self.grade_panel.disable("Nothing to grade: put the playhead on a clip, or pick a photo.")
+            return
+        kind, ident, frame, track = gt
+        if kind == "photo":
+            ph = self.project.photo(ident)
+            self.grade_panel.load(ph.grade, f"Grading photo {Path(ph.path).name}", "Photos have one grade",
+                                  keys_enabled=False)
+            return
+        c = self.project.d.clips[ident]
+        start = self.project.shot_start(ident, frame)
+        shot_no = next((i + 1 for i, (a, b) in enumerate(c.shots) if a == start), "?")
+        g = G.evaluate(track, frame) if track else G.default_grade()
+        keys = (track or {}).get("keys", [])
+        k = G.key_at(track, frame) if track else None
+        if len(keys) <= 1:
+            info = "Static grade: one setting for the whole shot. Add key to animate it."
+        else:
+            info = f"{len(keys)} keyframes. " + (f"On the key at frame {frame}." if k else
+                                                 "Between keys: an edit here adds a key.")
+        before = [kk for kk in sorted(keys, key=lambda x: x["frame"]) if kk["frame"] <= frame]
+        ease = bool(before and before[-1].get("ease") == "ease")
+        self.grade_panel.load(g, f"Grading {c.name}, shot {shot_no} (frames {start} on), frame {frame}",
+                              info, ease, keys_enabled=True)
+
+    def _grade_edited(self, g: dict) -> None:
+        gt = self._grade_target()
+        if gt is None:
+            return
+        if self._grade_before is None:
+            self._grade_before = self.project._dump()
+        kind, ident, frame, track = gt
+        if kind == "photo":
+            self.project.set_photo_grade(ident, None if G.is_identity(g) else g, checkpoint=False)
+            self._show_photo(self.filmstrip.currentRow())
+        else:
+            track = G.copy.deepcopy(track) if track else G.new_track(None, frame)
+            G.set_value(track, frame, g)
+            self.project.set_grade_track(ident, frame, track, checkpoint=False)
+            self._push_layout()
+            self._request()
+        self._update_overlays()
+        self.grade_timer.start()
+
+    def _commit_grade(self) -> None:
+        if self._grade_before is not None:
+            before, self._grade_before = self._grade_before, None
+            self.project.commit("grade", before)
+            self._refresh()
+
+    def _grade_key(self, action: str) -> None:
+        self._commit_grade()
+        gt = self._grade_target()
+        if gt is None or gt[0] != "clip":
+            return
+        _, cid, frame, track = gt
+        track = G.copy.deepcopy(track) if track else G.new_track(None, frame)
+        keys = track["keys"]
+        if action == "add":
+            if G.key_at(track, frame) is None:
+                keys.append({"frame": frame, "ease": "linear", "grade": G.evaluate(track, frame)})
+                keys.sort(key=lambda k: k["frame"])
+                self.project.set_grade_track(cid, frame, track, "add grade key")
+        elif action == "delete":
+            k = G.key_at(track, frame)
+            if k is not None and len(keys) > 1:
+                keys.remove(k)
+                self.project.set_grade_track(cid, frame, track, "delete grade key")
+        elif action == "ease":
+            before = [k for k in sorted(keys, key=lambda x: x["frame"]) if k["frame"] <= frame]
+            if before:
+                before[-1]["ease"] = "ease" if self.grade_panel.ease.isChecked() else "linear"
+                self.project.set_grade_track(cid, frame, track, "ease")
+        elif action in ("prev", "next"):
+            frames = sorted(k["frame"] for k in keys)
+            tgt = [f for f in frames if (f < frame if action == "prev" else f > frame)]
+            if tgt:
+                f = tgt[-1] if action == "prev" else tgt[0]
+                self.seek(self.playhead + (f - frame))
+            return
+        self._refresh()
+
+    def _grade_action(self, action: str) -> None:
+        gt = self._grade_target()
+        if action == "matte":
+            self._show_matte = self.grade_panel.show_matte.isChecked()
+            self._push_layout()
+            self._refresh()
+            return
+        if gt is None:
+            return
+        kind, ident, frame, track = gt
+        if action == "pick_neutral":
+            self.viewer.pick_mode = "neutral"
+            self.viewer.update()
+        elif action == "pick_hue":
+            self.viewer.pick_mode = "hue"
+            self.viewer.update()
+        elif action == "reset":
+            self._commit_grade()
+            if kind == "photo":
+                self.project.set_photo_grade(ident, None, "reset grade")
+            else:
+                self.project.set_grade_track(ident, frame, None, "reset grade")
+            self._refresh()
+        elif action == "load_lut":
+            f, _ = QFileDialog.getOpenFileName(self, "Load LUT", self.qs.value("dir_lut", ""), "LUT (*.cube)")
+            if f:
+                self.qs.setValue("dir_lut", str(Path(f).parent))
+                try:
+                    G.load_cube(f)
+                except (OSError, ValueError) as e:
+                    QMessageBox.warning(self, "LUT", str(e))
+                    return
+                self.grade_panel.set_fields(lut=f)
+                self.grade_panel.lut_label.setText(f)
+        elif action == "clear_lut":
+            self.grade_panel.set_fields(lut=None)
+        elif action == "export_lut":
+            f, _ = QFileDialog.getSaveFileName(self, "Export grade as LUT", self.qs.value("dir_lut", ""), "LUT (*.cube)")
+            if f:
+                if not f.endswith(".cube"):
+                    f += ".cube"
+                left = G.export_cube(self.grade_panel.read(), f)
+                msg = f"saved {f}"
+                if left:
+                    msg += "; a LUT can't hold " + ", ".join(left)
+                self.statusBar().showMessage(msg, 10000)
+        elif action == "track":
+            if kind != "clip":
+                return
+            c = self.project.d.clips[ident]
+            if self.status.get(ident) not in ("ready", "update"):
+                self.statusBar().showMessage("colorize the clip first; tracking uses its analysis", 6000)
+                return
+            g = self.grade_panel.read()
+            if g["mask"]["shape"] == "none":
+                self.statusBar().showMessage("pick a mask shape first", 4000)
+                return
+            s = VideoSettings.from_project(self.project.d.settings)
+            start = self.project.shot_start(ident, frame)
+            end = next(b for a, b in c.shots if a == start)
+            self.runner.submit("track_mask", f"Track mask in {c.name}",
+                               {"analysis": str(analysis_dir(Path(c.path), s, self.project.d.settings["model"])),
+                                "a": start, "b": end, "frame": frame, "mask": g["mask"], "clip": ident})
+        elif action == "clear_track":
+            if kind == "clip" and track and track.get("track"):
+                t2 = G.copy.deepcopy(track)
+                t2.pop("track", None)
+                self.project.set_grade_track(ident, frame, t2, "clear mask track")
+                self._refresh()
+
+    def _track_done(self, job, result: dict) -> None:
+        cid, frame = job.payload["clip"], job.payload["frame"]
+        track = G.copy.deepcopy(self.project.grade_track(cid, frame)) or G.new_track(self.grade_panel.read(), frame)
+        track["track"] = result["track"]
+        self.project.set_grade_track(cid, frame, track, "track mask")
+        self.statusBar().showMessage(f"mask tracked over {len(result['track'])} frames", 5000)
+
+    def copy_grade(self) -> None:
+        self._grade_clip = self.grade_panel.read() if self.grade_panel.isEnabled() else None
+        if self._grade_clip:
+            self.statusBar().showMessage("grade copied", 3000)
+
+    def paste_grade(self) -> None:
+        gt = self._grade_target()
+        if gt is None or self._grade_clip is None:
+            return
+        self._commit_grade()
+        kind, ident, frame, _ = gt
+        if kind == "photo":
+            self.project.set_photo_grade(ident, self._grade_clip, "paste grade")
+        else:
+            start = self.project.shot_start(ident, frame)
+            self.project.set_grade_track(ident, frame, G.new_track(self._grade_clip, start), "paste grade")
+        self._refresh()
+
+    # ------------------------------------------------------ models
+
+    def open_model_manager(self) -> None:
+        from .model_manager import ModelManager
+
+        dlg = ModelManager(self.project.d.settings["model"], self)
+        dlg.submit.connect(lambda kind, label, payload: self.runner.submit(kind, label, payload))
+        self._manager = dlg
+        dlg.exec()
+        self._manager = None
+        self.inspector.set_models(self.project.d.settings["model"])
+        if dlg.chosen and dlg.chosen != self.project.d.settings["model"]:
+            self._setting_changed("model", dlg.chosen)
 
     # ---------------------------------------------------------- export
 
@@ -982,7 +1583,8 @@ class MainWindow(QMainWindow):
             return
         v = dlg.values()
         v["dir"].mkdir(parents=True, exist_ok=True)
-        items = [(ph.path, str(v["dir"] / f"{Path(ph.path).stem}.{v['ext']}")) for ph in photos]
+        items = [{"src": ph.path, "dst": str(v["dir"] / f"{Path(ph.path).stem}.{v['ext']}"),
+                  "strokes": ph.strokes, "grade": ph.grade} for ph in photos]
         self.runner.submit("export_photos", f"Export {len(items)} photo(s)",
                            {**self._job_payload(), "items": items, "bits": v["bits"], "quality": v["quality"]})
 

@@ -103,6 +103,11 @@ def cache_key(path: Path, s: VideoSettings, model_name: str, weights: str | None
 
 
 def analysis_dir(path: Path, s: VideoSettings, model_name: str, weights: str | None = None) -> Path:
+    """weights: the model's cache id; None looks up the installed model's."""
+    if weights is None:
+        from ..models import cache_id_for
+
+        weights = cache_id_for(model_name)
     return cache_root() / "clips" / cache_key(Path(path), s, model_name, weights)
 
 
@@ -161,11 +166,26 @@ def working_size(w: int, h: int, short: int) -> tuple[int, int]:
 # ------------------------------------------------------------- analysis
 
 
+def wanted_stab(shots, strength: float, hints: dict | None) -> dict[str, str]:
+    """What each shot's stabilized chroma has to have been made from: the
+    stabilizer strength and the hints painted in that shot. A shot whose id
+    changes is redone; the rest stay as they are."""
+    from ..hintpaint import hints_in, strokes_key
+
+    out = {}
+    for a, b in shots:
+        h = hints_in(hints, a, b)
+        out[f"{a}-{b}"] = f"{strength}:{strokes_key(h) if h else '-'}"
+    return out
+
+
 def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
             shots: list[tuple[int, int]] | None = None, use_cache: bool = True,
-            quiet: bool = False, progress: ProgressFn | None = None) -> Analysis:
+            quiet: bool = False, progress: ProgressFn | None = None,
+            hints: dict | None = None) -> Analysis:
     """Run passes 1 to 4 on a clip. shots, when given, replace detection
-    (the GUI passes the shots the user sees and may have edited).
+    (the GUI passes the shots the user sees and may have edited). hints:
+    painted strokes, {clip frame: [stroke, ...]}.
 
     What stays on disk is kept small, since a feature has ~130,000 frames:
     chroma at chroma_size (256 px short side by default, which is the
@@ -178,7 +198,7 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
     W, H = info.width, info.height
     ww, wh = working_size(W, H, s.working_size)
     cw, ch = working_size(W, H, min(s.working_size, s.chroma_size))
-    cdir = analysis_dir(info.path, s, model.info.name, getattr(model, "weights", None))
+    cdir = analysis_dir(info.path, s, model.info.name, getattr(model, "cache_id", None))
     cdir.mkdir(parents=True, exist_ok=True)
     rep = Analysis(cdir, working=(ww, wh))
     if info.interlaced:
@@ -285,34 +305,78 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
     if all(tuple(sh) in done for sh in shots) and L_path.exists():
         L_path.unlink()  # biggest file; only needed again if shots change
 
-    # ------------------------------------------------- 4. stabilize chroma
-    stab_id = {"strength": s.stabilize, "shots": [list(x) for x in shots]}
+    # ------------------------------------- 4. hints, then stabilize chroma
+    want = wanted_stab(shots, s.stabilize, hints)
+    have = meta.get("stab") if isinstance(meta.get("stab"), dict) else {}
     ab_path = cdir / "ab.npy"
-    if meta.get("stab") == stab_id and ab_path.exists():
+    redo = [(a, b) for a, b in shots if have.get(f"{a}-{b}") != want[f"{a}-{b}"] or not ab_path.exists()]
+    if not redo:
         return rep
-    ab = _memmap(ab_path, (n, ch, cw, 2), np.int8)
-    prog = _Progress("stabilize", n, quiet, progress)
+    if ab_path.exists():
+        ab = np.load(ab_path, mmap_mode="r+")
+        if ab.shape != (n, ch, cw, 2):
+            del ab
+            ab = _memmap(ab_path, (n, ch, cw, 2), np.int8)
+            redo = list(shots)
+    else:
+        ab = _memmap(ab_path, (n, ch, cw, 2), np.int8)
+        redo = list(shots)
+    from ..hintpaint import hints_in, strokes_key
+    from .hints_pass import carry, keyframe_fix
+
+    tol = max(2.0, 3.0 * sigma)
+    total = sum(b - a for a, b in redo)
+    prog = _Progress("stabilize", total, quiet, progress)
     count = 0
-    for a, b in shots:
+    scratch = out = None
+    for a, b in redo:
+        src = _Slice(ab_raw, a, b)
+        shot_hints = hints_in(hints, a, b)
+        if shot_hints:
+            key = strokes_key(shot_hints)
+            hpath = cdir / f"hint_{a}_{b}_{key}.npy"
+            for old in cdir.glob(f"hint_{a}_{b}_*.npy"):
+                if old != hpath:
+                    old.unlink()
+            if not hpath.exists():
+                if progress:
+                    progress("hints", count, max(1, total))
+                keys = {}
+                for f, strokes in shot_hints.items():
+                    keys[f] = keyframe_fix(model, info.path, info.fps, f, strokes, (ww, wh), (cw, ch),
+                                           np.asarray(ab_raw[f], np.float32), s.denoise)
+                hinted = _memmap(hpath.with_suffix(".tmp.npy"), (b - a, ch, cw, 2), np.int8)
+                buf = np.empty((b - a, ch, cw, 2), np.float32) if (b - a) * ch * cw * 8 < 5e8 else \
+                    _memmap(cdir / "hbuf.npy", (b - a, ch, cw, 2))
+                carry(Ldn, ab_raw, a, b, keys, flow, tol, buf)
+                hinted[:] = _to_i8(np.asarray(buf))
+                hinted.flush()
+                del hinted, buf
+                (cdir / "hbuf.npy").unlink(missing_ok=True)
+                hpath.with_suffix(".tmp.npy").rename(hpath)
+            src = _Slice(np.load(hpath, mmap_mode="r"), 0, b - a)
+        else:
+            for old in cdir.glob(f"hint_{a}_{b}_*.npy"):
+                old.unlink()
         if (b - a) * ch * cw * 2 * 4 < 5e8:
             scratch = np.empty((b - a, ch, cw, 2), np.float32)
             out = np.empty((b - a, ch, cw, 2), np.float32)
         else:  # a very long shot: keep the working arrays on disk, not in RAM
             scratch = _memmap(cdir / "fwd.npy", (b - a, ch, cw, 2))
             out = _memmap(cdir / "out.npy", (b - a, ch, cw, 2))
-        stabilize_chroma(_Slice(Ldn, a, b), _Slice(ab_raw, a, b), out,
-                         strength=s.stabilize, tol=max(2.0, 3.0 * sigma), flow=flow,
+        stabilize_chroma(_Slice(Ldn, a, b), src, out, strength=s.stabilize, tol=tol, flow=flow,
                          scratch=scratch)
         ab[a:b] = _to_i8(out)
         count += b - a
         prog(count)
-    ab.flush()
+        have[f"{a}-{b}"] = want[f"{a}-{b}"]
+        meta["stab"] = {k: v for k, v in have.items() if k in want}
+        ab.flush()
+        meta_path.write_text(json.dumps(meta))  # resume point after each shot
     del ab, scratch, out
     for tmp in ("fwd.npy", "out.npy"):
         (cdir / tmp).unlink(missing_ok=True)
     rep.timings["stabilize"] = prog.done()
-    meta["stab"] = stab_id
-    meta_path.write_text(json.dumps(meta))
     return rep
 
 
@@ -335,6 +399,7 @@ class Piece:
     analysis: Path
     src_in: int
     src_out: int
+    clip_id: str = ""
 
     @property
     def length(self) -> int:
@@ -370,9 +435,10 @@ class FrameRenderer:
 def render(pieces: list[Piece], plan: ExportPlan, out: str | Path, s: VideoSettings,
            audio_source: tuple[Path, float] | None = None,
            audio_timeline: AudioTimeline | None = None, frames_limit: int | None = None,
-           quiet: bool = False, progress: ProgressFn | None = None) -> dict[str, float]:
+           quiet: bool = False, progress: ProgressFn | None = None, grades=None) -> dict[str, float]:
     """Render pieces in order into one file. audio_source passes a single
-    untouched clip's audio through; audio_timeline cuts and joins tracks."""
+    untouched clip's audio through; audio_timeline cuts and joins tracks.
+    grades: a grade.GradeBook, applied per frame after colorizing."""
     from ..media import iter_range
 
     if not pieces:
@@ -392,7 +458,15 @@ def render(pieces: list[Piece], plan: ExportPlan, out: str | Path, s: VideoSetti
             ab = np.load(p.analysis / "ab.npy", mmap_mode="r")
             for i, g16 in enumerate(iter_range(p.path, p.fps, p.src_in, p.src_out)):
                 gray = g16.astype(np.float32) / 65535.0
-                writer.write(quantize(rend(gray, ab[p.src_in + i]), 16))
+                rgb = rend(gray, ab[p.src_in + i])
+                if grades is not None:
+                    from ..grade import apply as grade_apply
+
+                    f = p.src_in + i
+                    g = grades.at(p.clip_id, f)
+                    if g is not None:
+                        rgb = grade_apply(rgb, g, grades.mask_offset(p.clip_id, f))
+                writer.write(quantize(rgb, 16))
                 done += 1
                 prog(done)
             del ab

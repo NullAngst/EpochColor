@@ -1,0 +1,99 @@
+{
+  "version": 1,
+  "models": [
+    {
+      "id": "siggraph17",
+      "name": "Zhang et al. 2017 (interactive)",
+      "architecture": "siggraph17",
+      "mode": "hint",
+      "description": "Automatic, and reads painted hints as input. Small and quick, colours are muted.",
+      "size_mb": 130,
+      "vram_gb": 1,
+      "license": "BSD-2-Clause",
+      "license_url": "https://github.com/richzhang/colorization/blob/master/LICENSE",
+      "license_ok": true,
+      "params": {},
+      "source": {
+        "type": "url",
+        "url": "https://colorizers.s3.us-east-2.amazonaws.com/siggraph17-df00044c.pth",
+        "filename": "siggraph17-df00044c.pth",
+        "sha256_prefix": "df00044c"
+      }
+    },
+    {
+      "id": "eccv16",
+      "name": "Zhang et al. 2016",
+      "architecture": "eccv16",
+      "mode": "automatic",
+      "description": "Automatic only, conservative and muted. Painted hints still apply afterwards.",
+      "size_mb": 125,
+      "vram_gb": 1,
+      "license": "BSD-2-Clause",
+      "license_url": "https://github.com/richzhang/colorization/blob/master/LICENSE",
+      "license_ok": true,
+      "params": {},
+      "source": {
+        "type": "url",
+        "url": "https://colorizers.s3.us-east-2.amazonaws.com/colorization_release_v2-9b330a0b.pth",
+        "filename": "colorization_release_v2-9b330a0b.pth",
+        "sha256_prefix": "9b330a0b"
+      }
+    },
+    {
+      "id": "ddcolor-modelscope",
+      "name": "DDColor (ModelScope weights)",
+      "architecture": "ddcolor",
+      "mode": "automatic",
+      "description": "2023, ConvNeXt-L. Much more saturated and specific than the Zhang models; the authors' all-round pick. Needs the stabilizer on video.",
+      "size_mb": 912,
+      "vram_gb": 4,
+      "license": "unverified: the code is Apache-2.0, check the model card for the weights",
+      "license_url": "https://huggingface.co/piddnad/ddcolor_modelscope",
+      "license_ok": false,
+      "params": {"model_size": "large", "input_size": 512},
+      "source": {"type": "huggingface", "repo": "piddnad/ddcolor_modelscope"}
+    },
+    {
+      "id": "ddcolor-paper",
+      "name": "DDColor (paper weights)",
+      "architecture": "ddcolor",
+      "mode": "automatic",
+      "description": "2023, ConvNeXt-L, the weights from the paper. More conservative than the ModelScope weights.",
+      "size_mb": 912,
+      "vram_gb": 4,
+      "license": "unverified: the code is Apache-2.0, check the model card for the weights",
+      "license_url": "https://huggingface.co/piddnad/ddcolor_paper",
+      "license_ok": false,
+      "params": {"model_size": "large", "input_size": 512},
+      "source": {"type": "huggingface", "repo": "piddnad/ddcolor_paper"}
+    },
+    {
+      "id": "ddcolor-artistic",
+      "name": "DDColor (artistic weights)",
+      "architecture": "ddcolor",
+      "mode": "automatic",
+      "description": "2023, ConvNeXt-L, trained for bolder, more vivid colour. Less faithful, more striking.",
+      "size_mb": 912,
+      "vram_gb": 4,
+      "license": "unverified: the code is Apache-2.0, check the model card for the weights",
+      "license_url": "https://huggingface.co/piddnad/ddcolor_artistic",
+      "license_ok": false,
+      "params": {"model_size": "large", "input_size": 512},
+      "source": {"type": "huggingface", "repo": "piddnad/ddcolor_artistic"}
+    },
+    {
+      "id": "ddcolor-tiny",
+      "name": "DDColor tiny",
+      "architecture": "ddcolor",
+      "mode": "automatic",
+      "description": "2023, ConvNeXt-T. A quarter the size of DDColor-L and much faster, a little less accurate. The one to try on CPU.",
+      "size_mb": 220,
+      "vram_gb": 2,
+      "license": "unverified: the code is Apache-2.0, check the model card for the weights",
+      "license_url": "https://huggingface.co/piddnad/ddcolor_paper_tiny",
+      "license_ok": false,
+      "params": {"model_size": "tiny", "input_size": 512},
+      "source": {"type": "huggingface", "repo": "piddnad/ddcolor_paper_tiny"}
+    }
+  ]
+}

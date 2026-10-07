@@ -12,7 +12,6 @@ import numpy as np
 
 from ..hints import Hints
 from .base import ColorModel, ModelInfo
-from .weights import resolve_weights
 
 L_CENT, L_NORM, AB_NORM = 50.0, 100.0, 110.0
 # The interactive demo (ideepcolor) centres the hint mask on 0.5, so "no
@@ -141,15 +140,21 @@ class _ZhangBase(ColorModel):
     builder = None
     infer_short = 256  # both were trained at 256x256
 
-    def __init__(self, weights: str | None = None):
+    def __init__(self, weights: str | None = None, info: ModelInfo | None = None, params=None):
         self.weights = weights
+        if info is not None:
+            self.info = info
         self.net = None
         self.device = "cpu"
 
     def load(self, device: str) -> None:
+        from pathlib import Path
+
         from .weights import load_state_dict
 
-        path = resolve_weights(self.info.name, self.weights)
+        if not self.weights:
+            raise RuntimeError(f"{self.info.name} has no weights file")
+        path = Path(self.weights)
         net = type(self).builder()
         sd = load_state_dict(path)
         try:
@@ -173,6 +178,20 @@ class _ZhangBase(ColorModel):
         return cv2.resize(arr, (w, h), interpolation=interp)
 
 
+    def features(self, L: np.ndarray):
+        """Mid-level features (conv4, 512 channels at 1/8 size) for matching
+        saved colours. Returns a torch tensor (C, h, w), unit length per pixel."""
+        import torch
+
+        h, w = L.shape
+        nh, nw = _net_size(h, w, self.infer_short)
+        l = torch.from_numpy(self._resize(L, nh, nw)).to(self.device)[None, None]
+        with torch.inference_mode():
+            f = self._encode(l)
+        f = f[0].float()
+        return f / (f.norm(dim=0, keepdim=True) + 1e-6)
+
+
 class ECCV16(_ZhangBase):
     info = ModelInfo(
         name="eccv16",
@@ -184,6 +203,12 @@ class ECCV16(_ZhangBase):
         license="BSD-2-Clause",
     )
     builder = staticmethod(build_eccv16)
+
+    def _encode(self, l):
+        x = self.net.model1((l - L_CENT) / L_NORM)
+        for m in (self.net.model2, self.net.model3, self.net.model4):
+            x = m(x)
+        return x
 
     def predict(self, L, hints=None):
         import torch
@@ -207,6 +232,16 @@ class SIGGRAPH17(_ZhangBase):
         license="BSD-2-Clause",
     )
     builder = staticmethod(build_siggraph17)
+
+    def _encode(self, l):
+        import torch
+
+        z = torch.zeros_like(l)
+        x = torch.cat(((l - L_CENT) / L_NORM, z, z, z - MASK_CENT), dim=1)
+        c1 = self.net.model1(x)
+        c2 = self.net.model2(c1[:, :, ::2, ::2])
+        c3 = self.net.model3(c2[:, :, ::2, ::2])
+        return self.net.model4(c3[:, :, ::2, ::2])
 
     def predict(self, L, hints=None):
         import torch

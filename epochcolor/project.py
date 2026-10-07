@@ -80,6 +80,8 @@ class Photo:
     id: str
     path: str
     negative: bool = False
+    strokes: list = field(default_factory=list)  # painted hints, see hintpaint.py
+    grade: dict | None = None
 
 
 def default_settings() -> dict:
@@ -92,6 +94,8 @@ def default_settings() -> dict:
         "saturation": 1.0,
         "shot_threshold": 6.0,
         "chroma_size": 256,
+        "match_mode": "ask",  # saved colours: "ask" marks matches, "auto" paints them
+        "match_threshold": 0.75,
     }
 
 
@@ -105,6 +109,10 @@ class ProjectData:
     photos: list[Photo] = field(default_factory=list)
     settings: dict = field(default_factory=default_settings)
     export: dict = field(default_factory=dict)
+    hints: dict = field(default_factory=dict)  # clip id -> {str(clip frame): [stroke, ...]}
+    colors: list = field(default_factory=list)  # saved colours
+    suggestions: list = field(default_factory=list)  # saved-colour matches waiting for a click
+    grades: dict = field(default_factory=dict)  # clip id -> {str(shot start): track}
 
 
 class Project:
@@ -215,6 +223,9 @@ class Project:
         self.checkpoint(f"remove {self.d.clips[clip_id].name}")
         self.d.timeline = [s for s in self.d.timeline if s.clip != clip_id]
         del self.d.clips[clip_id]
+        self.d.hints.pop(clip_id, None)
+        self.d.grades.pop(clip_id, None)
+        self.d.suggestions = [x for x in self.d.suggestions if x.get("target") != clip_id]
         self._sync_audio()
         self._clamp_after_edit()
 
@@ -243,6 +254,14 @@ class Project:
             now = True
         starts = sorted(starts)
         clip.shots = [[a, b] for a, b in zip(starts, starts[1:] + [clip.frames])]
+        grades = self.d.grades.get(clip.id, {})
+        if now:
+            # a new cut keeps the look: the new shot starts with the old shot's grade
+            prev = max((a for a in starts if a < src), default=0)
+            if str(prev) in grades:
+                grades[str(src)] = copy.deepcopy(grades[str(prev)])
+        else:
+            grades.pop(str(src), None)  # merged into the shot before it
         return now
 
     def _sync_audio(self) -> None:
@@ -418,6 +437,110 @@ class Project:
         self.checkpoint("remove photo")
         self.d.photos = [p for p in self.d.photos if p.id != photo_id]
 
+    # ---------------------------------------------------- hints, colours
+
+    def strokes_at(self, clip_id: str, frame: int) -> list:
+        return list(self.d.hints.get(clip_id, {}).get(str(frame), []))
+
+    def set_strokes(self, clip_id: str, frame: int, strokes: list, label: str = "paint") -> None:
+        self.checkpoint(label)
+        h = self.d.hints.setdefault(clip_id, {})
+        if strokes:
+            h[str(frame)] = [dict(s) for s in strokes]
+        else:
+            h.pop(str(frame), None)
+            if not h:
+                self.d.hints.pop(clip_id, None)
+
+    def hint_frames(self, clip_id: str) -> list[int]:
+        return sorted(int(k) for k, v in self.d.hints.get(clip_id, {}).items() if v)
+
+    def set_photo_strokes(self, photo_id: str, strokes: list, label: str = "paint") -> None:
+        ph = self.photo(photo_id)
+        self.checkpoint(label)
+        ph.strokes = [dict(s) for s in strokes]
+
+    def photo(self, photo_id: str) -> Photo:
+        for ph in self.d.photos:
+            if ph.id == photo_id:
+                return ph
+        raise ProjectError("no such photo")
+
+    def add_color(self, name: str, rgb, source: dict) -> dict:
+        """source: {"kind": "clip"|"photo", "target": id, "frame": n, "stroke": {...}}"""
+        self.checkpoint(f"save colour {name}")
+        c = {"id": new_id(), "name": name, "rgb": [int(v) for v in rgb], "source": source}
+        self.d.colors.append(c)
+        return c
+
+    def remove_color(self, color_id: str) -> None:
+        self.checkpoint("remove saved colour")
+        self.d.colors = [c for c in self.d.colors if c["id"] != color_id]
+        self.d.suggestions = [x for x in self.d.suggestions if x.get("color") != color_id]
+
+    def rename_color(self, color_id: str, name: str) -> None:
+        self.checkpoint("rename saved colour")
+        for c in self.d.colors:
+            if c["id"] == color_id:
+                c["name"] = name
+
+    def set_suggestions(self, items: list) -> None:
+        self.checkpoint("find saved colours")
+        self.d.suggestions = list(items)
+
+    def apply_suggestion(self, sug_id: str) -> dict | None:
+        from .hintpaint import dabs
+
+        sug = next((x for x in self.d.suggestions if x["id"] == sug_id), None)
+        col = next((c for c in self.d.colors if sug and c["id"] == sug["color"]), None)
+        if not sug or not col:
+            return None
+        self.checkpoint(f"apply {col['name']}")
+        new = dabs(sug["points"], col["rgb"])
+        if sug["kind"] == "clip":
+            h = self.d.hints.setdefault(sug["target"], {})
+            h[str(sug["frame"])] = h.get(str(sug["frame"]), []) + new
+        else:
+            ph = self.photo(sug["target"])
+            ph.strokes = list(ph.strokes) + new
+        self.d.suggestions = [x for x in self.d.suggestions if x["id"] != sug_id]
+        return sug
+
+    def dismiss_suggestion(self, sug_id: str) -> None:
+        self.checkpoint("dismiss match")
+        self.d.suggestions = [x for x in self.d.suggestions if x["id"] != sug_id]
+
+    # ----------------------------------------------------------- grades
+
+    def shot_start(self, clip_id: str, frame: int) -> int:
+        start = 0
+        for a, b in self.d.clips[clip_id].shots:
+            if a <= frame:
+                start = a
+            if a <= frame < b:
+                return a
+        return start
+
+    def grade_track(self, clip_id: str, frame: int) -> dict | None:
+        return self.d.grades.get(clip_id, {}).get(str(self.shot_start(clip_id, frame)))
+
+    def set_grade_track(self, clip_id: str, frame: int, track: dict | None, label: str = "grade",
+                        checkpoint: bool = True) -> None:
+        if checkpoint:
+            self.checkpoint(label)
+        g = self.d.grades.setdefault(clip_id, {})
+        key = str(self.shot_start(clip_id, frame))
+        if track:
+            g[key] = copy.deepcopy(track)
+        else:
+            g.pop(key, None)
+
+    def set_photo_grade(self, photo_id: str, grade: dict | None, label: str = "grade",
+                        checkpoint: bool = True) -> None:
+        if checkpoint:
+            self.checkpoint(label)
+        self.photo(photo_id).grade = copy.deepcopy(grade) if grade else None
+
     def set_setting(self, key: str, value) -> None:
         if self.d.settings.get(key) == value:
             return
@@ -470,4 +593,8 @@ def _data_from_dict(d: dict) -> ProjectData:
         photos=[Photo(**p) for p in d.get("photos", [])],
         settings=settings,
         export=dict(d.get("export", {})),
+        hints=dict(d.get("hints", {})),
+        colors=list(d.get("colors", [])),
+        suggestions=list(d.get("suggestions", [])),
+        grades=dict(d.get("grades", {})),
     )

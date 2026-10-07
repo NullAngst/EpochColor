@@ -1,53 +1,43 @@
-"""Weight files: where they live, how they get fetched, how they load.
-
-This is the bare minimum the CLI needs. The in-app model manager with a
-remote catalog comes in milestone 8.
-"""
+"""Where weight files live and how they load. The catalog, downloads and
+installs are in manager.py."""
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sys
-import urllib.request
-from dataclasses import dataclass
 from pathlib import Path
 
 
-@dataclass(frozen=True)
-class WeightEntry:
-    model: str
-    url: str
-    filename: str
-    sha256_prefix: str  # torch hub style: the filename carries the hash prefix
-    size_mb: int
-    license: str
+def config_dir() -> Path:
+    if sys.platform == "win32":
+        return Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming")) / "EpochColor"
+    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "epochcolor"
 
 
-CATALOG: dict[str, WeightEntry] = {
-    "eccv16": WeightEntry(
-        model="eccv16",
-        url="https://colorizers.s3.us-east-2.amazonaws.com/colorization_release_v2-9b330a0b.pth",
-        filename="colorization_release_v2-9b330a0b.pth",
-        sha256_prefix="9b330a0b",
-        size_mb=130,
-        license="BSD-2-Clause",
-    ),
-    "siggraph17": WeightEntry(
-        model="siggraph17",
-        url="https://colorizers.s3.us-east-2.amazonaws.com/siggraph17-df00044c.pth",
-        filename="siggraph17-df00044c.pth",
-        sha256_prefix="df00044c",
-        size_mb=140,
-        license="BSD-2-Clause",
-    ),
-}
+def settings_path() -> Path:
+    return config_dir() / "settings.json"
 
 
-def models_dir() -> Path:
-    env = os.environ.get("EPOCHCOLOR_MODELS")
-    if env:
-        return Path(env).expanduser()
+def read_settings() -> dict:
+    try:
+        return json.loads(settings_path().read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_setting(key: str, value) -> None:
+    s = read_settings()
+    if value is None:
+        s.pop(key, None)
+    else:
+        s[key] = value
+    settings_path().parent.mkdir(parents=True, exist_ok=True)
+    settings_path().write_text(json.dumps(s, indent=1))
+
+
+def default_models_dir() -> Path:
     if sys.platform == "win32":
         base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
         return base / "EpochColor" / "models"
@@ -55,67 +45,29 @@ def models_dir() -> Path:
     return base / "epochcolor" / "models"
 
 
-def sha256_file(path: Path) -> str:
+def models_dir() -> Path:
+    """EPOCHCOLOR_MODELS wins, then the location chosen in the model
+    manager (shared by the editor and the command line), then the default."""
+    env = os.environ.get("EPOCHCOLOR_MODELS")
+    if env:
+        return Path(env).expanduser()
+    chosen = read_settings().get("models_dir")
+    if chosen:
+        return Path(chosen).expanduser()
+    return default_models_dir()
+
+
+def sha256_file(path: Path, progress=None) -> str:
     h = hashlib.sha256()
+    total = path.stat().st_size
+    done = 0
     with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
+        for chunk in iter(lambda: f.read(1 << 22), b""):
             h.update(chunk)
+            done += len(chunk)
+            if progress:
+                progress("verify", done, total)
     return h.hexdigest()
-
-
-def resolve_weights(model: str, explicit: str | None = None) -> Path:
-    if explicit:
-        p = Path(explicit).expanduser()
-        if not p.is_file():
-            raise FileNotFoundError(f"weights file not found: {p}")
-        return p
-    entry = CATALOG.get(model)
-    if entry is None:
-        raise FileNotFoundError(f"no catalog entry for {model}, pass --weights")
-    p = models_dir() / entry.filename
-    if not p.is_file():
-        raise FileNotFoundError(
-            f"{model} weights are not downloaded. Run: epochcolor fetch {model}"
-        )
-    return p
-
-
-def fetch(model: str, progress=True) -> Path:
-    """Download weights with resume, then check the hash before keeping them."""
-    entry = CATALOG[model]
-    dest_dir = models_dir()
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / entry.filename
-    if dest.is_file():
-        return dest
-    part = dest.with_suffix(dest.suffix + ".part")
-    have = part.stat().st_size if part.exists() else 0
-    req = urllib.request.Request(entry.url, headers={"User-Agent": "EpochColor"})
-    if have:
-        req.add_header("Range", f"bytes={have}-")
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        if have and resp.status != 206:
-            have = 0  # server ignored the range, start over
-        total = resp.headers.get("Content-Length")
-        total = int(total) + have if total else None
-        with open(part, "ab" if have else "wb") as f:
-            done = have
-            while True:
-                chunk = resp.read(1 << 20)
-                if not chunk:
-                    break
-                f.write(chunk)
-                done += len(chunk)
-                if progress and total:
-                    print(f"\r{model}: {done * 100 // total}% of {total >> 20} MB", end="", file=sys.stderr)
-    if progress:
-        print(file=sys.stderr)
-    digest = sha256_file(part)
-    if not digest.startswith(entry.sha256_prefix):
-        part.unlink()
-        raise RuntimeError(f"hash mismatch for {entry.filename}, download deleted")
-    part.rename(dest)
-    return dest
 
 
 def load_state_dict(path: Path):
@@ -123,14 +75,21 @@ def load_state_dict(path: Path):
 
     safetensors when the file is one, otherwise torch.load with
     weights_only=True, which refuses anything but tensors and plain types.
+    A plain PyTorch pickle can run arbitrary code when loaded, and a model
+    from a stranger shouldn't get that chance.
     """
     import torch
 
+    path = Path(path)
     if path.suffix == ".safetensors":
         from safetensors.torch import load_file
 
         return load_file(str(path), device="cpu")
     sd = torch.load(str(path), map_location="cpu", weights_only=True)
-    if isinstance(sd, dict) and "state_dict" in sd and isinstance(sd["state_dict"], dict):
-        sd = sd["state_dict"]
+    for key in ("params_ema", "params", "state_dict", "model"):
+        if isinstance(sd, dict) and key in sd and isinstance(sd[key], dict):
+            sd = sd[key]
+            break
+    if isinstance(sd, dict) and sd and all(k.startswith("module.") for k in sd):
+        sd = {k[len("module."):]: v for k, v in sd.items()}  # saved from DataParallel
     return sd

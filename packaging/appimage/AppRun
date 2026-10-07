@@ -6,7 +6,7 @@ export PATH="$HERE/usr/bin:$PATH"   # the bundled ffmpeg comes first
 unset PYTHONHOME PYTHONPATH PYTHONSTARTUP
 PY="$HERE/usr/python/bin/python3"
 case "$1" in
-    photo|video|fetch|models|device|cache|encoders|presets|gui|setup-torch|-h|--help|--version)
+    photo|video|render|fetch|models|device|cache|encoders|presets|gui|setup-torch|-h|--help|--version)
         exec "$PY" -s -m epochcolor "$@" ;;
     *)
         exec "$PY" -s -m epochcolor gui "$@" ;;
