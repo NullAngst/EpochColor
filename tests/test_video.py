@@ -97,7 +97,8 @@ def test_vfr_is_refused(tmp_path):
 @needs_ffmpeg
 def test_video_end_to_end(tmp_path, monkeypatch):
     from epochcolor.color import srgb_to_l
-    from epochcolor.video.io import EncodeSettings, iter_gray, probe
+    from epochcolor.export.plan import ExportSettings, resolve
+    from epochcolor.video.io import iter_gray, probe
     from epochcolor.video.pipeline import VideoSettings, colorize_video
 
     monkeypatch.setenv("EPOCHCOLOR_CACHE", str(tmp_path / "cache"))
@@ -106,8 +107,8 @@ def test_video_end_to_end(tmp_path, monkeypatch):
     info = probe(clip)
     assert info.fps == 24 and len(info.audio_streams) == 1
     out = tmp_path / "out.mkv"
-    rep = colorize_video(info, JitterModel(), out, VideoSettings(),
-                         EncodeSettings(rf=8, preset="ultrafast"), quiet=True)
+    plan = resolve(ExportSettings(encoder="software", rf=8, speed="ultrafast"), out, info.audio)
+    rep = colorize_video(info, JitterModel(), out, plan, VideoSettings(), quiet=True)
     assert rep.frames == 24 and len(rep.shots) == 1
 
     with av.open(str(out)) as c:
@@ -127,6 +128,7 @@ def test_video_end_to_end(tmp_path, monkeypatch):
     assert abs(float((srgb_to_lab(rgb[0])[..., 0] - src).mean())) < 1.0
 
     # second run reuses the model pass
-    rep2 = colorize_video(info, JitterModel(), tmp_path / "out2.mkv", VideoSettings(),
-                          EncodeSettings(rf=8, preset="ultrafast"), quiet=True)
+    out2 = tmp_path / "out2.mkv"
+    plan2 = resolve(ExportSettings(encoder="software", rf=8, speed="ultrafast"), out2, info.audio)
+    rep2 = colorize_video(info, JitterModel(), out2, plan2, VideoSettings(), quiet=True)
     assert rep2.cached_shots == 1

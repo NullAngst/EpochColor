@@ -30,7 +30,9 @@ from ..denoise import denoise_l, estimate_noise
 from ..imageio import quantize
 from ..models import ColorModel
 from ..pipeline import guided_upsample
-from .io import ClipInfo, EncodeSettings, Encoder, iter_gray
+from ..export.plan import ExportPlan
+from ..export.writer import VideoWriter
+from .io import ClipInfo, iter_gray
 from .temporal import Flow, cut_scores, detect_shots, stabilize_chroma, temporal_denoise, thumb
 
 
@@ -107,11 +109,10 @@ def _memmap(path: Path, shape, mode="w+"):
     return np.lib.format.open_memmap(str(path), mode=mode, dtype=np.float16, shape=shape)
 
 
-def colorize_video(info: ClipInfo, model: ColorModel, out: str | Path,
-                   s: VideoSettings | None = None, enc: EncodeSettings | None = None,
-                   use_cache: bool = True, quiet: bool = False) -> VideoReport:
+def colorize_video(info: ClipInfo, model: ColorModel, out: str | Path, plan: ExportPlan,
+                   s: VideoSettings | None = None, use_cache: bool = True,
+                   quiet: bool = False) -> VideoReport:
     s = s or VideoSettings()
-    enc = enc or EncodeSettings()
     rep = VideoReport()
     W, H = info.width, info.height
     k = min(1.0, s.working_size / min(W, H))
@@ -221,7 +222,8 @@ def colorize_video(info: ClipInfo, model: ColorModel, out: str | Path,
     # ------------------------------------------------------ 4b. render
     eps = None
     g = float(np.clip(s.grain, 0.0, 100.0)) / 100.0
-    encoder = Encoder(out, info, enc, frames=n if s.frames else None)
+    encoder = VideoWriter(plan, out, W, H, info.fps, info.path, info.start_time,
+                          cdir / "export", frames_limit=n if s.frames else None)
     prog = _Progress("render", n, quiet)
     t = 0
     try:
@@ -242,13 +244,18 @@ def colorize_video(info: ClipInfo, model: ColorModel, out: str | Path,
             encoder.write(quantize(lab_to_srgb(Lout, abf), 16))
             t += 1
             prog(t)
-        encoder.close()
+        rep.timings["render"] = prog.done()
+        if plan.two_pass:
+            tp = time.perf_counter()
+            encoder.close(on_pass=lambda k: quiet or print(f"  encode pass {k} of 2", file=sys.stderr))
+            rep.timings["two-pass"] = round(time.perf_counter() - tp, 2)
+        else:
+            encoder.close()
     except BaseException:
         encoder.abort()
         raise
     if t != n:
         raise RuntimeError(f"render decoded {t} frames, analysis saw {n}")
-    rep.timings["render"] = prog.done()
     return rep
 
 

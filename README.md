@@ -2,7 +2,7 @@
 
 EpochColor colorizes black and white photos and film footage while keeping the original grain and detail exactly as they were. It's for one person working through an archive on a Linux desktop, with or without a GPU.
 
-**This is milestone 2: a command line proof for photos and video.** No GUI yet, and video export is H.265 10-bit only. It answers the question everything else depends on: does the output look good when the model only predicts color and the original luma passes through untouched, and does that color hold still from frame to frame?
+**This is milestone 3: the command line pipeline for photos and video, with the full export matrix.** No GUI yet. It answers the question everything else depends on: does the output look good when the model only predicts color and the original luma passes through untouched, and does that color hold still from frame to frame?
 
 ## How it works
 
@@ -18,7 +18,7 @@ The model never touches brightness. A black and white photo already holds all of
 ## Prerequisites
 
 - Python 3.10 or newer
-- FFmpeg with libx265 for video. openSUSE's stock package leaves x265 out, so I use the Packman build. Check with `ffmpeg -encoders | grep x265`.
+- FFmpeg for video, with libx265, libx264 and libsvtav1. openSUSE's stock package leaves x264 and x265 out, so I use the Packman build. `epochcolor encoders` shows what yours has.
 - PyTorch for the network models (`siggraph17`, `eccv16`). The `hints` model runs without it.
 - About 300 MB of disk for both model weights
 
@@ -79,7 +79,7 @@ Both network models are Zhang et al., BSD-2-Clause, from [richzhang/colorization
 epochcolor video reel.mkv --rf 18
 ```
 
-That writes `reel.color.mkv`: H.265 10-bit at RF 18, BT.709 tags, every audio track copied over untouched.
+That writes `reel.color.mkv`: H.265 10-bit at RF 18, BT.709 tags, every audio track copied over untouched. Export options are their own section below.
 
 The clip has to be a constant frame rate, and progressive. A variable frame rate clip gets refused with a message saying so, since every timing calculation would drift. Convert it in HandBrake first (Video tab, Constant Framerate), or whichever tool you prefer.
 
@@ -89,19 +89,71 @@ What happens to it:
 2. Denoise the model's copy over time: each frame is averaged with its neighbors after lining them up along optical flow. Grain changes every frame and the picture mostly doesn't, so this strips grain with far less smearing than a spatial filter.
 3. Run the model on every frame.
 4. Stabilize the color. Per-frame models drift in hue, the same wall going a little redder then a little greener. A running average carried along the motion, forward and backward through each shot, holds it steady. It forgets wherever the motion doesn't line up, so color never gets dragged onto something new, and it never crosses a cut.
-5. Render at full size with the original luma and pipe it to x265.
+5. Render at full size with the original luma and pipe it to the encoder.
 
 Useful switches:
 
 - `--frames 120` does only the first 120 frames. Do this first on a new reel.
 - `--list-shots` prints the shots it found. If it missed a cut, lower `--shot-threshold` (default 6). If it chopped a fast pan, raise it.
 - `--stabilize 0.9` is the default, an average of up to 10 frames each way. `0.95` holds color longer, `0` turns it off so you can see what the model does raw.
-- `--tune-grain` sets x265's grain tuning, which keeps grain from turning to mush above RF 18 or so. Files get bigger.
 - `--probe` checks the clip and lists the audio tracks without doing anything.
 
-The model pass is the slow part, so its output is cached per shot in `~/.cache/epochcolor`. Run again with a different RF, grain, stabilizer or saturation setting and it skips straight to the render. Stop it partway with Ctrl+C and the finished shots stay cached, so the same command picks up where it left off. `epochcolor cache` shows the size, `epochcolor cache clear` empties it. Set `EPOCHCOLOR_CACHE` to move it somewhere with room, since a feature runs to several gigabytes.
+The model pass is the slow part, so its output is cached per shot in `~/.cache/epochcolor`. Run again with a different codec, RF, grain, stabilizer or saturation setting and it skips straight to the render. Stop it partway with Ctrl+C and the finished shots stay cached, so the same command picks up where it left off. `epochcolor cache` shows the size, `epochcolor cache clear` empties it. Set `EPOCHCOLOR_CACHE` to move it somewhere with room, since a feature runs to several gigabytes.
 
 To compare the two models on the same reel, just run it with `-m siggraph17` and then `-m eccv16`. Both stay cached.
+
+### Export
+
+Same model as HandBrake: a codec and bit depth, a container, then either a constant quality RF or a target bitrate. The container comes from the output name.
+
+| Codec | Bit depth | Chroma | Containers | Encoders |
+| --- | --- | --- | --- | --- |
+| `h265` (default) | 8, 10 | 4:2:0, 4:2:2, 4:4:4 | MKV, MP4 | libx265, hevc_nvenc, hevc_vaapi, hevc_qsv, hevc_amf |
+| `h264` | 8, 10 | 4:2:0, 4:2:2, 4:4:4 | MKV, MP4 | libx264, plus the same four hardware ones at 8-bit |
+| `av1` | 8, 10 | 4:2:0 | MKV, MP4 | libsvtav1, av1_nvenc, av1_vaapi, av1_qsv, av1_amf |
+| `prores` | 10 | 4:2:2, 4:4:4 | MOV, MKV | prores_ks |
+| `ffv1` | 8, 10, 12, 16 | all three | MKV | ffv1 |
+
+Hardware encoders do 4:2:0 only. 4:2:2 and 4:4:4 go to software.
+
+Some examples:
+
+```
+epochcolor video reel.mkv --rf 16 --speed slow --tune-grain
+epochcolor video reel.mkv -o reel.mp4 --codec h264 --bits 8 --rf 20
+epochcolor video reel.mkv --codec av1 --rf 30 --film-grain 8
+epochcolor video reel.mkv -o reel.mov --codec prores
+epochcolor video reel.mkv --bitrate 8000 --two-pass
+epochcolor video reel.mkv --rf 0
+```
+
+**RF.** 0 to 51, lower is better and bigger. Each encoder takes it in its own mode: CRF on x264, x265 and SVT-AV1, CQ on NVENC, ICQ on QSV, QP on VAAPI and AMF. The plan printed before the render says which one it became, since the same number gives different sizes on GPU and CPU. SVT-AV1 goes up to 63.
+
+**RF 0** is real lossless wherever the encoder has it: x264 QP 0, x265's lossless flag, NVENC's lossless tune. The tests check that x264 and x265 at RF 0 decode bit-for-bit identical to an FFV1 encode of the same frames. VAAPI, QSV, AMF, AV1 NVENC and SVT-AV1 have no lossless mode, so RF 0 there drops to the lowest QP with a warning that it is NOT lossless. ProRes ignores RF since its quality is set by the profile, and FFV1 is always lossless.
+
+**Bitrate** is `--bitrate` in kbps. `--two-pass` works on x264 and x265. The frames get rendered once into a lossless FFV1 file in the cache, then both passes read it, since rendering is the expensive part. That file is as big as the export is long and gets deleted afterward.
+
+**Encoder.** `--encoder auto` is the default. It takes the first hardware encoder that passes a test encode, in the order NVENC, VAAPI, QSV, AMF, and falls back to software. It also stays on software when the job needs something the hardware can't do: RF 0 lossless, 4:2:2 or 4:4:4, grain tuning, two-pass, or a speed name only the software encoder knows (`--speed slow` means x265). `--encoder software` or `--encoder hardware` forces either side, `--encoder hevc_vaapi` names one.
+
+`epochcolor encoders` runs a two-frame test encode on every hardware encoder and prints what works. An encoder showing up in `ffmpeg -encoders` only means it was compiled in, not that the driver behind it works. Results are cached per ffmpeg binary. `--retest` after a driver update. On my AMD card under Linux that's VAAPI; AMF is mostly a Windows thing.
+
+**Speed** is `--speed`, in the encoder's own names: `ultrafast` to `placebo` for x264 and x265, `p1` to `p7` for NVENC, `0` to `13` for SVT-AV1 (lower is slower and better), `veryfast` to `veryslow` for QSV, `speed`, `balanced` or `quality` for AMF. VAAPI has none.
+
+**Grain.** Grain is the hardest thing to compress. `--tune-grain` keeps x264 and x265 from smearing it at higher RF, for bigger files. `--film-grain 8` on SVT-AV1 strips the grain before encoding and has the player regenerate it, so files get far smaller. But the grain you see then is synthetic, no longer the grain that was filmed.
+
+**Audio.** Every track goes in by default, in order, each as its own track. `--audio-tracks 1,3` picks some, `--audio-tracks none` or `--no-audio` drops them. Tracks are copied as they are wherever the container takes them: MKV takes anything, MP4 takes AAC, MP3, AC3, E-AC3, Opus, ALAC and FLAC, MOV takes AAC, ALAC, PCM and a few others. A track that doesn't fit has to be re-encoded, and you get asked which codec: AAC, Opus or FLAC, filtered to what the container allows. Pass `--audio-fallback aac` (or whichever) to answer up front in scripts, or `--audio-codec` to re-encode every track. `--audio-bitrate` sets AAC or Opus kbps per track, otherwise it's 96 per channel for AAC and 64 per channel for Opus.
+
+**Presets.** `epochcolor presets` lists them. Five are built in:
+
+- `archive-h265`: H.265 10-bit RF 16, slow, grain tuned
+- `share-h264`: H.264 8-bit RF 20, MP4, AAC
+- `small-av1`: SVT-AV1 10-bit RF 30, Opus
+- `edit-prores`: ProRes 422 HQ, MOV
+- `master-ffv1`: FFV1 10-bit 4:4:4, lossless
+
+`--preset archive-h265` loads one, and any flag after it overrides that one setting. `--save-preset mine` saves the current export settings as JSON in `~/.config/epochcolor/presets/mine.json`, which you can edit by hand, tinker as you see fit. A path to a `.json` file works as a preset too. `--dry-run` prints the plan without rendering anything, which is the quick way to check a preset.
+
+Why 10-bit by default? Colorized footage is mostly smooth gradients: skies, skin, painted walls. 8-bit bands on those. 10-bit H.265 at the same RF holds them clean for a small size cost.
 
 ### Options that matter
 
@@ -123,7 +175,10 @@ Honest list, so nobody is surprised.
 - The RAW develop path is written but hasn't been run against a real RAW file yet.
 - Large scans are fine on memory, but a 100 MP file will take a while on the final recombine. That part is CPU-only for now.
 - Video hints don't exist yet. Painting on a frame and having it carry through the shot is milestone 5. Video takes `siggraph17` or `eccv16`, not `hints`.
-- Video export is x265 10-bit into MKV or MP4 only. The full codec, bitrate and hardware encoder matrix is milestone 3. Audio is copied as is, so a codec MP4 can't hold (FLAC in older players, PCM) needs MKV for now.
+- **None of the hardware encoders have run on real hardware yet.** My build machine has no GPU. Their arguments follow FFmpeg's documentation, `epochcolor encoders` proves whether each one starts, and auto falls back to software when a test encode fails. But the quality mappings (CQ, ICQ, QP) haven't been compared against the software encoders on real footage. VAAPI on AMD is what I'll check first, since that's my hardware. NVENC, QSV and AMF reports are welcome.
+- ProRes 4444 is stored as 12-bit inside whatever goes in, that's how the format works. The source is 10-bit anyway.
+- FLAC in MP4 is legal and FFmpeg writes it, but some players still skip the track. Use MKV, or re-encode to AAC, if that matters.
+- Audio passthrough with `--frames` trims at the nearest audio packet, not the exact frame. Fine for a test render. Edits on the timeline will force a re-encode of affected tracks when the timeline arrives in milestone 4.
 - Optical flow runs on the CPU (OpenCV DIS). It's not the bottleneck yet. The model is: on a 2-core CPU with no GPU, `siggraph17` ran at under one frame per second on 640x360. A GPU changes that completely.
 - The grain slider below 100% uses a spatial denoise at full size for video, not the temporal one. The model's copy does get the temporal one.
 - Shot detection catches hard cuts. Dissolves and fades may get split oddly or missed. Check with `--list-shots`.
@@ -136,4 +191,4 @@ Honest list, so nobody is surprised.
 
 GPL-3.0-or-later. Model weights aren't part of this repo and keep their own licenses.
 
-Now photos and reels go in black and white and come out in color with the grain they were shot with, the color holds still across each shot, and re-renders at a new quality setting cost minutes instead of hours.
+Now photos and reels go in black and white and come out in color with the grain they were shot with, the color holds still across each shot, and the export goes to whichever codec, container and quality you pick, lossless included, with every audio track where it should be.

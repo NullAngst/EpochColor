@@ -123,18 +123,89 @@ def cmd_photo(a: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def _export_settings(a: argparse.Namespace):
+    from .export.plan import ExportSettings
+    from .export.presets import load_preset
+
+    warnings: list[str] = []
+    if a.preset:
+        es, warnings = load_preset(a.preset)
+    else:
+        es = ExportSettings()
+    for key in ("codec", "encoder", "bits", "chroma", "speed", "film_grain", "audio_codec",
+                "audio_fallback", "audio_bitrate"):
+        v = getattr(a, key)
+        if v is not None:
+            setattr(es, key, v)
+    if a.rf is not None:
+        es.rf, es.bitrate, es.two_pass = a.rf, None, False
+    if a.bitrate is not None:
+        es.bitrate, es.rf = a.bitrate, None
+    if a.two_pass:
+        es.two_pass = True
+    if a.tune_grain:
+        es.tune_grain = True
+    if a.no_audio:
+        es.audio_tracks = []
+    elif a.audio_tracks is not None:
+        if a.audio_tracks.strip().lower() == "none":
+            es.audio_tracks = []
+        elif a.audio_tracks.strip().lower() == "all":
+            es.audio_tracks = None
+        else:
+            try:
+                es.audio_tracks = [int(x) for x in a.audio_tracks.split(",") if x.strip()]
+            except ValueError:
+                raise ValueError("--audio-tracks takes numbers like 1,3, or all, or none") from None
+    return es, warnings
+
+
+def _ask_audio_fallback(tracks, ext: str) -> str | None:
+    from .export.codecs import AUDIO_ENCODE_OK
+
+    choices = AUDIO_ENCODE_OK[ext]
+    print(f"These audio tracks can't be copied into {ext} as they are:", file=sys.stderr)
+    for t in tracks:
+        print(f"  track {t.index + 1}: {t.codec}, {t.channels}ch {t.title}", file=sys.stderr)
+    names = {"aac": "AAC", "opus": "Opus", "flac": "FLAC"}
+    menu = ", ".join(f"{i}) {names[c]}" for i, c in enumerate(choices, 1))
+    while True:
+        try:
+            ans = input(f"Re-encode them to {menu}? [1] ").strip().lower() or "1"
+        except EOFError:
+            return None
+        if ans.isdigit() and 1 <= int(ans) <= len(choices):
+            return choices[int(ans) - 1]
+        if ans in choices:
+            return ans
+
+
+def _detector(vaapi_device: str | None = None):
+    from .export.detect import Detector
+    from .export.writer import ffmpeg_path
+    from .video.pipeline import cache_root
+
+    return Detector(ffmpeg_path(), cache_root() / "encoders.json", vaapi_device)
+
+
 def cmd_video(a: argparse.Namespace) -> int:
-    from .video.io import EncodeSettings, InputError, probe
+    from .export.plan import ExportError, resolve, tracks_needing_choice
+    from .export.presets import save_preset
+    from .video.io import InputError, probe
     from .video.pipeline import VideoSettings, colorize_video
 
     src = Path(a.source)
     if not src.is_file():
         _err(f"no such file: {src}")
         return 2
-    out = Path(a.output) if a.output else src.with_name(f"{src.stem}.color.mkv")
-    if out.suffix.lower() not in {".mkv", ".mp4"}:
-        _err("output must be .mkv or .mp4 for now")
+    try:
+        es, pwarn = _export_settings(a)
+    except Exception as e:
+        _err(str(e))
         return 2
+    for w in pwarn:
+        print(f"warning: {w}", file=sys.stderr)
+    out = Path(a.output) if a.output else src.with_name(f"{src.stem}.color{es.container}")
     if out.resolve() == src.resolve():
         _err("output would overwrite the source")
         return 2
@@ -144,11 +215,33 @@ def cmd_video(a: argparse.Namespace) -> int:
         _err(str(e))
         return 2
     print(f"{src.name}: {info.width}x{info.height} at {float(info.fps):.3f} fps, "
-          f"{info.codec}, {len(info.audio_streams)} audio track(s)", file=sys.stderr)
+          f"{info.codec}, {len(info.audio)} audio track(s)", file=sys.stderr)
     if a.probe:
         for line in info.audio_streams:
             print(f"  audio {line}")
         return 0
+
+    ext = out.suffix.lower()
+    try:
+        if es.audio_codec is None and not es.audio_fallback and ext in (".mp4", ".mov"):
+            stuck = tracks_needing_choice(es, ext, info.audio)
+            if stuck and sys.stdin.isatty():
+                es.audio_fallback = _ask_audio_fallback(stuck, ext)
+        det = _detector(a.vaapi_device)
+        audio_enc = {e for e in det.encoders() if e in ("aac", "libopus", "flac")}
+        plan = resolve(es, out, info.audio, probe=det.check, ffmpeg_audio_encoders=audio_enc,
+                       vaapi_device=det.vaapi_device)
+    except (ExportError, RuntimeError) as e:
+        _err(str(e))
+        return 2
+    print(plan.describe(), file=sys.stderr)
+    for w in plan.warnings:
+        print(f"warning: {w}", file=sys.stderr)
+    if a.save_preset:
+        print(f"saved preset {a.save_preset}: {save_preset(a.save_preset, es)}", file=sys.stderr)
+    if a.dry_run:
+        return 0
+
     try:
         model = _load_model(a.model, a.weights, a.device)
     except (RuntimeError, FileNotFoundError, ValueError) as e:
@@ -162,9 +255,8 @@ def cmd_video(a: argparse.Namespace) -> int:
         stabilize=a.stabilize, shot_threshold=a.shot_threshold, guided=not a.no_guided,
         saturation=a.saturation, frames=a.frames,
     )
-    es = EncodeSettings(rf=a.rf, preset=a.preset, tune_grain=a.tune_grain, audio=not a.no_audio)
     try:
-        rep = colorize_video(info, model, out, vs, es, use_cache=not a.no_cache)
+        rep = colorize_video(info, model, out, plan, vs, use_cache=not a.no_cache)
     except KeyboardInterrupt:
         _err("stopped. Finished shots are cached, run the same command to pick up.")
         return 130
@@ -176,11 +268,37 @@ def cmd_video(a: argparse.Namespace) -> int:
     for w in rep.warnings:
         print(f"warning: {w}", file=sys.stderr)
     cached = f", {rep.cached_shots} from cache" if rep.cached_shots else ""
-    print(f"{src.name} -> {out}  ({rep.frames} frames, {len(rep.shots)} shots{cached})")
+    shots = f"{len(rep.shots)} shot" + ("" if len(rep.shots) == 1 else "s")
+    print(f"{src.name} -> {out}  ({rep.frames} frames, {shots}{cached})")
     if a.list_shots:
         fps = info.fps_float
         for i, (s0, s1) in enumerate(rep.shots, 1):
             print(f"  shot {i}: frames {s0}-{s1 - 1}  ({s0 / fps:.2f}s - {s1 / fps:.2f}s)")
+    return 0
+
+
+def cmd_encoders(a: argparse.Namespace) -> int:
+    try:
+        det = _detector(a.vaapi_device)
+    except RuntimeError as e:
+        _err(str(e))
+        return 1
+    if a.retest:
+        det.clear()
+    print(f"ffmpeg: {det.ffmpeg}")
+    print(f"VAAPI device: {det.vaapi_device or 'none found'}")
+    print(f"  {'encoder':<12} {'codec':<7} {'8-bit':<13} 10-bit")
+    for name, codec, r8, r10 in det.table():
+        print(f"  {name:<12} {codec:<7} {r8:<13} {r10}")
+    return 0
+
+
+def cmd_presets(a: argparse.Namespace) -> int:
+    from .export.presets import list_presets, presets_dir
+
+    print(f"saved presets folder: {presets_dir()}")
+    for name, src, desc in list_presets():
+        print(f"  {name:<14} {src:<9} {desc}")
     return 0
 
 
@@ -279,32 +397,60 @@ def build_parser() -> argparse.ArgumentParser:
     ph.add_argument("--debug", action="store_true", help="full tracebacks")
     ph.set_defaults(func=cmd_photo)
 
-    vi = sub.add_parser("video", help="colorize a clip, H.265 10-bit out")
+    vi = sub.add_parser("video", help="colorize a clip")
     vi.add_argument("source", help="input clip, constant frame rate")
-    vi.add_argument("-o", "--output", help="output .mkv or .mp4 (default: <name>.color.mkv)")
+    vi.add_argument("-o", "--output", help="output .mkv, .mp4 or .mov (default: <name>.color.mkv)")
     vi.add_argument("-m", "--model", default="siggraph17", help="siggraph17 or eccv16")
     vi.add_argument("--weights", help="weights file, instead of the downloaded one")
-    vi.add_argument("--rf", type=float, default=18.0, help="x265 constant quality, lower is better (default 18)")
-    vi.add_argument("--preset", default="medium", help="x265 speed preset (default medium)")
-    vi.add_argument("--tune-grain", action="store_true", help="x265 tune=grain, keeps grain at higher RF")
-    vi.add_argument("--grain", type=float, default=100.0, help="percent of original luma kept (default 100)")
-    vi.add_argument("--denoise", type=float, default=None,
-                    help="spatial denoise strength after the temporal pass, L* units (0 turns both off)")
-    vi.add_argument("--stabilize", type=float, default=0.9,
-                    help="chroma stabilizer, 0 off, 0.9 averages up to 10 frames each way (default)")
-    vi.add_argument("--shot-threshold", type=float, default=6.0,
-                    help="cut sensitivity in L* units, lower finds more cuts (default 6)")
-    vi.add_argument("--working-size", type=int, default=512, help="short side for chroma work")
-    vi.add_argument("--saturation", type=float, default=1.0, help="chroma multiplier")
-    vi.add_argument("--no-guided", action="store_true", help="plain bicubic chroma upscale")
-    vi.add_argument("--frames", type=int, help="only the first N frames, for quick tests")
-    vi.add_argument("--no-audio", action="store_true", help="leave the audio out")
-    vi.add_argument("--no-cache", action="store_true", help="redo every pass")
-    vi.add_argument("--list-shots", action="store_true", help="print the detected shots")
-    vi.add_argument("--probe", action="store_true", help="check the clip and stop")
-    vi.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:1, xpu")
-    vi.add_argument("--debug", action="store_true", help="full tracebacks")
+    g = vi.add_argument_group("colour")
+    g.add_argument("--grain", type=float, default=100.0, help="percent of original luma kept (default 100)")
+    g.add_argument("--denoise", type=float, default=None,
+                   help="spatial denoise strength after the temporal pass, L* units (0 turns both off)")
+    g.add_argument("--stabilize", type=float, default=0.9,
+                   help="chroma stabilizer, 0 off, 0.9 averages up to 10 frames each way (default)")
+    g.add_argument("--shot-threshold", type=float, default=6.0,
+                   help="cut sensitivity in L* units, lower finds more cuts (default 6)")
+    g.add_argument("--working-size", type=int, default=512, help="short side for chroma work")
+    g.add_argument("--saturation", type=float, default=1.0, help="chroma multiplier")
+    g.add_argument("--no-guided", action="store_true", help="plain bicubic chroma upscale")
+    e = vi.add_argument_group("export")
+    e.add_argument("--preset", help="export preset name or .json path (see `epochcolor presets`)")
+    e.add_argument("--save-preset", metavar="NAME", help="save these export settings as a preset")
+    e.add_argument("--codec", choices=["h265", "h264", "av1", "prores", "ffv1"], help="default h265")
+    e.add_argument("--encoder", help="auto (default), software, hardware, or a name from `epochcolor encoders`")
+    e.add_argument("--bits", type=int, choices=[8, 10, 12, 16], help="bit depth (default 10)")
+    e.add_argument("--chroma", choices=["420", "422", "444"], help="chroma subsampling (default 420)")
+    e.add_argument("--rf", type=float, help="constant quality 0 to 51, lower is better (default 18), 0 = lossless")
+    e.add_argument("--bitrate", type=int, help="average bitrate in kbps instead of RF")
+    e.add_argument("--two-pass", action="store_true", help="two-pass bitrate, x264 and x265 only")
+    e.add_argument("--speed", help="encoder speed preset: medium, slow, p5, 6 and so on")
+    e.add_argument("--tune-grain", action="store_true", help="x264/x265 grain tuning")
+    e.add_argument("--film-grain", type=int, help="SVT-AV1 grain synthesis level (replaces real grain)")
+    e.add_argument("--audio-tracks", help="1-based list like 1,3, or all (default), or none")
+    e.add_argument("--audio-codec", choices=["copy", "aac", "opus", "flac"],
+                   help="for every track; default copies where the container allows")
+    e.add_argument("--audio-fallback", choices=["aac", "opus", "flac"],
+                   help="codec for tracks that can't be copied (asked for if not given)")
+    e.add_argument("--audio-bitrate", type=int, help="AAC/Opus kbps per track (default by channel count)")
+    e.add_argument("--no-audio", action="store_true", help="leave the audio out")
+    e.add_argument("--vaapi-device", help="VAAPI render node (default: first /dev/dri/renderD*)")
+    e.add_argument("--dry-run", action="store_true", help="show the export plan and stop")
+    r = vi.add_argument_group("run")
+    r.add_argument("--frames", type=int, help="only the first N frames, for quick tests")
+    r.add_argument("--no-cache", action="store_true", help="redo every pass")
+    r.add_argument("--list-shots", action="store_true", help="print the detected shots")
+    r.add_argument("--probe", action="store_true", help="check the clip and stop")
+    r.add_argument("--device", default="auto", help="model device: auto, cpu, cuda, cuda:1, xpu")
+    r.add_argument("--debug", action="store_true", help="full tracebacks")
     vi.set_defaults(func=cmd_video)
+
+    en = sub.add_parser("encoders", help="test which video encoders work here")
+    en.add_argument("--retest", action="store_true", help="forget cached results and test again")
+    en.add_argument("--vaapi-device", help="VAAPI render node")
+    en.set_defaults(func=cmd_encoders)
+
+    pr = sub.add_parser("presets", help="list export presets")
+    pr.set_defaults(func=cmd_presets)
 
     ca = sub.add_parser("cache", help="show or clear the video cache")
     ca.add_argument("action", nargs="?", default="show", choices=["show", "clear"])

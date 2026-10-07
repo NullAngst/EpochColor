@@ -4,20 +4,19 @@ Decoding goes through PyAV, frame by frame, as 16-bit grey. Taking only the
 luma plane sidesteps the YUV matrix question: a black and white source has
 neutral chroma, so R=G=B=Y' whatever matrix it was tagged with.
 
-Encoding pipes 16-bit RGB into an ffmpeg subprocess, which converts to YUV
-with BT.709 and writes the tags explicitly. Audio is copied from the source.
+Encoding lives in epochcolor.export.
 """
 
 from __future__ import annotations
 
-import shutil
-import subprocess
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 from typing import Iterator
 
 import numpy as np
+
+from ..export.plan import AudioStream
 
 
 class InputError(RuntimeError):
@@ -40,8 +39,13 @@ class ClipInfo:
     duration: float
     start_time: float
     codec: str
-    audio_streams: list[str] = field(default_factory=list)
+    audio: list[AudioStream] = field(default_factory=list)
     interlaced: bool = False
+
+    @property
+    def audio_streams(self) -> list[str]:
+        return [f"{a.index + 1}: {a.codec} {a.channels}ch" + (f" {a.title}" if a.title else "")
+                for a in self.audio]
 
     @property
     def fps_float(self) -> float:
@@ -64,8 +68,12 @@ def probe(path: str | Path, scan_frames: int = 240) -> ClipInfo:
         if not rate:
             raise InputError(f"{path.name}: no frame rate in the stream. {CONVERT_HINT}")
         tb = vs.time_base
-        audio = [f"{a.index}: {a.codec_context.name} {a.channels}ch {a.rate} Hz"
-                 for a in c.streams.audio]
+        audio = []
+        for i, a in enumerate(c.streams.audio):
+            md = dict(a.metadata or {})
+            title = md.get("title") or md.get("language") or ""
+            ch = getattr(a.codec_context, "channels", 0) or getattr(a, "channels", 0) or 2
+            audio.append(AudioStream(i, a.codec_context.name, int(ch), title))
 
         # Look at real timestamps instead of trusting the header.
         pts, interlaced = [], False
@@ -94,7 +102,7 @@ def probe(path: str | Path, scan_frames: int = 240) -> ClipInfo:
         return ClipInfo(
             path=path, width=vs.codec_context.width, height=vs.codec_context.height,
             fps=Fraction(rate), frames_estimate=frames, duration=duration,
-            start_time=start, codec=vs.codec_context.name, audio_streams=audio,
+            start_time=start, codec=vs.codec_context.name, audio=audio,
             interlaced=interlaced,
         )
 
@@ -123,81 +131,3 @@ def iter_gray(path: str | Path, size: tuple[int, int] | None = None,
             n += 1
             if limit and n >= limit:
                 return
-
-
-def ffmpeg_path() -> str:
-    exe = shutil.which("ffmpeg")
-    if not exe:
-        raise RuntimeError("ffmpeg not found in PATH")
-    return exe
-
-
-@dataclass
-class EncodeSettings:
-    rf: float = 18.0
-    preset: str = "medium"
-    tune_grain: bool = False
-    audio: bool = True
-
-
-class Encoder:
-    """x265 10-bit at a constant RF. The full codec matrix is milestone 3."""
-
-    def __init__(self, out: str | Path, info: ClipInfo, s: EncodeSettings,
-                 frames: int | None = None):
-        out = Path(out)
-        w, h = info.width, info.height
-        cmd = [
-            ffmpeg_path(), "-hide_banner", "-loglevel", "error", "-nostats", "-y",
-            "-f", "rawvideo", "-pix_fmt", "rgb48le", "-s", f"{w}x{h}",
-            "-framerate", f"{info.fps.numerator}/{info.fps.denominator}", "-i", "-",
-        ]
-        map_audio = s.audio and info.audio_streams
-        if map_audio:
-            # shift audio so the first video frame lands at zero, same as ours
-            cmd += ["-itsoffset", f"{-info.start_time:.6f}", "-i", str(info.path),
-                    "-map", "0:v:0", "-map", "1:a?", "-c:a", "copy"]
-            if frames:
-                cmd += ["-t", f"{frames / info.fps_float:.6f}"]
-        x265 = "colorprim=bt709:transfer=bt709:colormatrix=bt709:range=limited:log-level=error"
-        if s.tune_grain:
-            x265 += ":tune=grain"
-        cmd += [
-            "-vf", "scale=out_color_matrix=bt709:out_range=tv:flags=accurate_rnd+full_chroma_int,"
-                   "format=yuv420p10le",
-            "-c:v", "libx265", "-crf", f"{s.rf:g}", "-preset", s.preset, "-x265-params", x265,
-            "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
-            "-color_range", "tv",
-        ]
-        if out.suffix.lower() == ".mp4":
-            cmd += ["-tag:v", "hvc1", "-movflags", "+faststart"]
-        cmd.append(str(out))
-        self.cmd = cmd
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-        self.count = 0
-
-    def write(self, rgb16: np.ndarray) -> None:
-        try:
-            self.proc.stdin.write(np.ascontiguousarray(rgb16, dtype="<u2").tobytes())
-        except BrokenPipeError:
-            raise RuntimeError(f"ffmpeg stopped: {self._err()}") from None
-        self.count += 1
-
-    def _err(self) -> str:
-        try:
-            return self.proc.stderr.read().decode(errors="replace").strip()
-        except Exception:
-            return ""
-
-    def close(self) -> None:
-        if self.proc.stdin and not self.proc.stdin.closed:
-            self.proc.stdin.close()
-        rc = self.proc.wait()
-        if rc != 0:
-            raise RuntimeError(f"ffmpeg failed ({rc}): {self._err()}")
-
-    def abort(self) -> None:
-        try:
-            self.proc.kill()
-        finally:
-            self.proc.wait()
