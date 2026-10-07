@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "epochcolor"
+dynamic = ["version"]
+description = "Colorize black and white film and photos, keeping the original grain"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.10"
+authors = [{ name = "NullAngst" }]
+dependencies = [
+    "numpy",
+    "scipy",
+    "opencv-python-headless",
+    "pillow",
+    "tifffile",
+]
+
+[project.optional-dependencies]
+# torch is left out on purpose: the right wheel depends on your GPU (ROCm,
+# CUDA, XPU or CPU) and comes from PyTorch's own index. See the README.
+raw = ["rawpy"]
+heic = ["pillow-heif"]
+safetensors = ["safetensors"]
+test = ["pytest"]
+
+[project.scripts]
+epochcolor = "epochcolor.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "epochcolor.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["epochcolor*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
