@@ -14,9 +14,30 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import sys
+import time
 import traceback
 from dataclasses import asdict
 from pathlib import Path
+
+_state = {"progress": None, "notice": None, "gpu_env": None}
+
+
+def _gpu_device(pref: str) -> str:
+    """Test the GPU in a child process the first time (gpucheck), then set
+    up this process to use what passed. Has to run before PyTorch touches
+    the GPU, since ROCm reads its variables once."""
+    from . import gpucheck
+
+    dev, env, note, fresh = gpucheck.ensure(pref, progress=_state["progress"])
+    if _state["gpu_env"] is None:
+        os.environ.update(env)
+        _state["gpu_env"] = env
+        print(f"gpu: {dev} {env or ''}", flush=True)
+    if fresh and note:
+        _state["notice"] = note
+    return dev
 
 
 def _model(cache: dict, name: str, weights: str | None, device: str):
@@ -24,11 +45,17 @@ def _model(cache: dict, name: str, weights: str | None, device: str):
     if key not in cache:
         from .models import create
 
+        # settle the GPU before anything imports PyTorch: ROCm reads its
+        # device variables once, when it starts
+        pref = device if name == "hints" else _gpu_device(device)
         m = create(name, weights)
         if m.info.needs_torch:
             from .device import pick_device
+            from .resources import torch_threads
 
-            dev, _ = pick_device(device)
+            dev, desc = pick_device(pref)
+            torch_threads()
+            print(f"model {name} on {desc}", flush=True)
             m.load(dev)
         cache.clear()  # one model in memory at a time
         cache[key] = m
@@ -317,7 +344,21 @@ def _track_mask(job: dict, progress) -> dict:
     return {"track": track}
 
 
-def worker_main(jobs, events) -> None:
+def worker_main(jobs, events, log_name: str | None = "worker.log") -> None:
+    from . import __version__
+    from .resources import apply_limits, capture_output
+
+    if log_name:
+        capture_output(log_name)  # C-level output too: a crash leaves its trace here
+    print(f"--- worker {os.getpid()} started {time.ctime()}, EpochColor {__version__}, "
+          f"Python {sys.version.split()[0]}", flush=True)
+    apply_limits(log=lambda m: print(m, flush=True))
+    try:
+        from .video.pipeline import sweep_stale
+
+        sweep_stale()
+    except Exception:
+        pass
     models: dict = {}
     while True:
         item = jobs.get()
@@ -328,11 +369,18 @@ def worker_main(jobs, events) -> None:
         def progress(stage, done, total, _jid=jid):
             events.put(("progress", _jid, str(stage), int(done), int(total)))
 
+        _state["progress"] = progress
+        print(f"job {jid} {kind} {job.get('path') or job.get('model') or ''}", flush=True)
         try:
             result = run_job(kind, job, progress, models)
+            if _state["notice"]:
+                result = dict(result, notice=_state["notice"])
+                _state["notice"] = None
             events.put(("done", jid, result))
         except BaseException as e:  # noqa: BLE001 - everything goes back to the GUI
             from .diskspace import explain, is_full
 
             msg = explain(e) if is_full(e) else f"{e}"
-            events.put(("error", jid, msg, traceback.format_exc()))
+            tb = traceback.format_exc()
+            print(tb, flush=True)
+            events.put(("error", jid, msg, tb))

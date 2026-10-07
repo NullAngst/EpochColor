@@ -17,15 +17,19 @@ def thumb(L: np.ndarray, width: int = 96) -> np.ndarray:
     return cv2.resize(L, (width, max(1, round(h * width / w))), interpolation=cv2.INTER_AREA)
 
 
+def cut_score(prev: np.ndarray, cur: np.ndarray) -> float:
+    """Difference between a frame's thumbnail and the one before, after
+    removing each one's mean brightness. Old film pulses in exposure;
+    subtracting the mean keeps a flicker from reading as a cut."""
+    a = prev - prev.mean()
+    b = cur - cur.mean()
+    return float(np.float32(np.abs(a - b).mean()))
+
+
 def cut_scores(thumbs: list[np.ndarray]) -> np.ndarray:
-    """Difference between each frame and the one before, after removing each
-    frame's mean brightness. Old film pulses in exposure; subtracting the
-    mean keeps a flicker from reading as a cut."""
     s = np.zeros(len(thumbs), np.float32)
     for i in range(1, len(thumbs)):
-        a = thumbs[i - 1] - thumbs[i - 1].mean()
-        b = thumbs[i] - thumbs[i].mean()
-        s[i] = float(np.abs(a - b).mean())
+        s[i] = cut_score(thumbs[i - 1], thumbs[i])
     return s
 
 

@@ -3,12 +3,17 @@
 Jobs run one at a time in order. Cancel kills the worker outright, since a
 model pass can sit in one GPU call for seconds and has no safe point to
 stop at; whatever finished before the kill stays cached.
+
+The runner also watches the worker's memory twice a second and stops it
+before the system runs out (see resources.over_limit), and when the worker
+dies it says how, with the end of the worker's log.
 """
 
 from __future__ import annotations
 
 import itertools
 import multiprocessing as mp
+import os
 from dataclasses import dataclass
 
 from PySide6.QtCore import QObject, QTimer, Signal
@@ -42,6 +47,7 @@ class JobRunner(QObject):
         self.timer = QTimer(self)
         self.timer.setInterval(60)
         self.timer.timeout.connect(self._poll)
+        self._mem_tick = 0
 
     # ---------------------------------------------------------- public
 
@@ -122,15 +128,23 @@ class JobRunner(QObject):
         self.jobs_q.put((self.current.id, self.current.kind, self.current.payload))
         self.changed.emit()
 
-    def _kill(self, why: str) -> None:
+    def _kill(self, why: str, details: str = "") -> None:
         job = self.current
         self.current = None
         if self.proc is not None:
+            from ..resources import children
+
+            kids = children(self.proc.pid)  # ffmpeg, the GPU test
             self.proc.kill()
+            for k in kids:
+                try:
+                    os.kill(k, 9)
+                except OSError:
+                    pass
             self.proc.join(2.0)
             self.proc = None
         if job:
-            self.failed.emit(job, why, "")
+            self.failed.emit(job, why, details)
 
     def _poll(self) -> None:
         if self.events_q is None:
@@ -157,11 +171,24 @@ class JobRunner(QObject):
                 self.failed.emit(job, ev[2], ev[3])
                 self._next()
         if self.current and self.proc is not None and not self.proc.is_alive():
+            from ..resources import describe_exit, log_dir, tail
+
             code = self.proc.exitcode
             self.proc = None
-            self._kill(f"the worker process died (exit code {code}); finished shots are cached, "
-                       f"run it again to pick up")
+            log = log_dir() / "worker.log"
+            self._kill(f"The worker process died: {describe_exit(code)}. Finished shots are cached.\n\n"
+                       f"Its log is {log}; the end of it is under Show Details.", tail(log, 40))
             self._next()
             got = True
+        self._mem_tick += 1
+        if self.current and self.proc is not None and self._mem_tick % 8 == 0:
+            from ..resources import over_limit
+
+            why = over_limit(self.proc.pid)
+            if why:
+                self._kill(f"Stopped to keep your system usable: {why}. Finished shots are cached. "
+                           "Lower the working size, or close other programs, and run it again.")
+                self._next()
+                got = True
         if got:
             self.changed.emit()

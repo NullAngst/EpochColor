@@ -435,6 +435,8 @@ class MainWindow(QMainWindow):
         act(m, "Export video...", self.export_video, "Ctrl+E")
         act(m, "Export photos...", self.export_photos, "Ctrl+Shift+E")
         m.addSeparator()
+        act(m, "Working folder and limits...", self.open_settings)
+        m.addSeparator()
         act(m, "Quit", self.close, "Ctrl+Q")
 
         m = mb.addMenu("&Edit")
@@ -498,6 +500,7 @@ class MainWindow(QMainWindow):
         act(m, "Install PyTorch...", lambda: self.setup_torch(False))
         act(m, "Download weights for the current model", self.fetch_weights)
         act(m, "Model device...", self.choose_device)
+        act(m, "Test the GPU again", self.retest_gpu)
 
         m = mb.addMenu("&Help")
         act(m, "Keys", self.show_keys, "F1")
@@ -1010,6 +1013,31 @@ class MainWindow(QMainWindow):
         if not have_torch() and not self.qs.value("torch_dont_ask", False, type=bool):
             self.setup_torch(True)
 
+    def open_settings(self) -> None:
+        from .settings_dialog import SettingsDialog
+
+        dlg = SettingsDialog(self)
+        if dlg.exec() != SettingsDialog.Accepted:
+            return
+        self.runner.shutdown()  # the next job starts a worker with the new limits and folder
+        if dlg.changed_root:
+            from ..video.pipeline import cache_root
+
+            self.statusBar().showMessage(f"working folder: {cache_root()}", 8000)
+            for c in self.project.d.clips.values():
+                if Path(c.path).exists() and MediaInfo.load(media_dir(c.path)) is None:
+                    job = self.runner.submit("import", f"Rebuild proxy for {c.name}",
+                                             {"path": c.path, "shot_threshold": self.project.d.settings["shot_threshold"]})
+                    self._importing[job.id] = "rebuild"
+            self._refresh()
+
+    def retest_gpu(self) -> None:
+        from ..gpucheck import forget
+
+        forget()
+        self.runner.shutdown()
+        self.statusBar().showMessage("the GPU gets tested again the next time a model runs", 8000)
+
     def choose_device(self) -> None:
         cur = self.qs.value("device", "auto")
         dev, ok = QInputDialog.getText(self, "Model device",
@@ -1038,6 +1066,10 @@ class MainWindow(QMainWindow):
     def _job_done(self, job, result: dict) -> None:
         if self._manager is not None:
             self._manager.reload()
+        if result.get("notice"):
+            box = QMessageBox(QMessageBox.Information, "GPU", result["notice"], parent=self)
+            box.setModal(False)
+            box.show()  # not exec(): the job's result still gets handled below
         if job.kind == "import":
             cd = dict(result["clip"])
             cd["audio"] = [AudioInfo(**a) for a in cd.get("audio", [])]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -27,12 +28,20 @@ def _load_model(name: str, weights: str | None, device_pref: str):
                 f"{name} needs PyTorch. Run `epochcolor setup-torch` to download the build "
                 "for your GPU, or use --model hints"
             ) from None
+        from . import gpucheck
         from .device import pick_device
+        from .resources import torch_threads
 
-        dev, desc = pick_device(device_pref)
+        dev, env, note, fresh = gpucheck.ensure(device_pref, log=lambda m: print(m, file=sys.stderr))
+        os.environ.update(env)
+        if note and fresh:
+            print(f"note: {note}", file=sys.stderr)
+        dev, desc = pick_device(dev)
+        torch_threads()
         print(f"device: {desc}", file=sys.stderr)
         model.load(dev)
     return model
+
 
 
 def _find_hint(hints_dir: Path, stem: str) -> Path | None:
@@ -354,14 +363,27 @@ def cmd_render(a: argparse.Namespace) -> int:
 
 
 def cmd_cache(a: argparse.Namespace) -> int:
-    from .video.pipeline import cache_root, clear_cache
+    from .diskspace import describe
+    from .video.pipeline import cache_root, cache_size, clear_cache, set_cache_root, sweep_stale
 
     if a.action == "clear":
-        print(f"removed {clear_cache()} cached clip(s) from {cache_root()}")
+        print(f"removed {clear_cache()} cached item(s) from {cache_root()}")
+    elif a.action == "dir":
+        if not a.path:
+            print(cache_root())
+            return 0
+        old = cache_root()
+        new = set_cache_root(None if a.path == "default" else a.path)
+        print(f"working folder: {new}\n{describe(new)}")
+        if old != new and old.exists():
+            print(f"the old one is left as it was: {old} ({cache_size(old) / 2**30:.2f} GB). "
+                  f"`epochcolor cache clear` before switching empties it.")
     else:
         root = cache_root()
-        size = sum(f.stat().st_size for f in root.rglob("*") if f.is_file()) if root.exists() else 0
-        print(f"{root}: {size / 2**30:.2f} GB")
+        freed = sweep_stale(root)
+        if freed:
+            print(f"deleted {freed / 2**30:.1f} GB of luma left by an older version")
+        print(f"{root}: {cache_size(root) / 2**30:.2f} GB\n{describe(root)}")
     return 0
 
 
@@ -459,15 +481,30 @@ def cmd_models(a: argparse.Namespace) -> int:
 
 
 def cmd_device(a: argparse.Namespace) -> int:
-    try:
-        import torch
-    except ImportError:
+    from . import gpucheck
+    from .torch_setup import have_torch
+
+    if not have_torch():
         print("PyTorch is not installed; only --model hints works")
         return 1
+    if a.test:
+        gpucheck.forget()
+        r = gpucheck.run_ladder(log=print)
+        print(f"\nresult: {r['device']} {r.get('name', '')} {r.get('env') or ''}")
+        if r.get("note"):
+            print(r["note"])
+        print(f"saved to {gpucheck.state_path()}")
+        return 0 if r["device"] != "cpu" or not r.get("note") else 2
+    dev, env, note, fresh = gpucheck.ensure(a.device, log=print)
+    os.environ.update(env)
+    import torch
+
     from .device import pick_device
 
-    dev, desc = pick_device(a.device)
-    print(f"torch {torch.__version__}, using {dev}: {desc}")
+    dev, desc = pick_device(dev)
+    print(f"torch {torch.__version__}, using {dev}: {desc}" + (f" with {env}" if env else ""))
+    if note:
+        print(note)
     return 0
 
 
@@ -618,8 +655,9 @@ def build_parser() -> argparse.ArgumentParser:
     re_.add_argument("--debug", action="store_true")
     re_.set_defaults(func=cmd_render)
 
-    ca = sub.add_parser("cache", help="show or clear the video cache")
-    ca.add_argument("action", nargs="?", default="show", choices=["show", "clear"])
+    ca = sub.add_parser("cache", help="show, move or clear the working folder (the cache)")
+    ca.add_argument("action", nargs="?", default="show", choices=["show", "clear", "dir"])
+    ca.add_argument("path", nargs="?", help="with dir: the new working folder, or default")
     ca.set_defaults(func=cmd_cache)
 
     fe = sub.add_parser("fetch", help="download a model from the catalog")
@@ -637,6 +675,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     de = sub.add_parser("device", help="show which device PyTorch would use")
     de.add_argument("--device", default="auto")
+    de.add_argument("--test", action="store_true",
+                    help="test each GPU again in a separate process and print every attempt")
     de.set_defaults(func=cmd_device)
     return p
 
@@ -645,6 +685,11 @@ def main(argv: list[str] | None = None) -> int:
     from .diskspace import explain, is_full
 
     a = build_parser().parse_args(argv)
+    if a.cmd in ("photo", "video", "render"):
+        from .resources import Watchdog, apply_limits
+
+        apply_limits()
+        Watchdog().start()
     try:
         return a.func(a)
     except OSError as e:

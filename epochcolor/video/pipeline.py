@@ -1,12 +1,15 @@
 """The video pipeline.
 
-Analysis, once per clip, streaming so memory stays flat however long the
-clip is. Working-size data lives in float16 memmaps in the cache folder.
+Analysis, once per clip, streaming so memory and disk stay flat however
+long the clip is: nothing at working size is ever written out.
 
-1. Decode at working size -> L, shot detection scores
-2. Temporal denoise -> the model's copy
-3. Model, shot by shot -> raw chroma (resumable, re-renders skip it)
+1. Decode at working size -> shot detection scores (and nothing else kept)
+2+3. Decode again, shot by shot, temporal denoise -> model -> raw chroma
+   at chroma size (resumable, re-renders skip it)
 4. Chroma stabilizer per shot -> ab.npy, the chroma every render reads
+
+Everything lives in the working folder (cache_root), which the user can
+point at another disk.
 
 Render, as often as you like: the timeline's pieces in order, each frame
 decoded at full size, its original luma recombined with the cached chroma
@@ -38,7 +41,7 @@ from ..imageio import quantize
 from ..models import ColorModel
 from ..pipeline import guided_upsample
 from .io import ClipInfo, iter_gray
-from .temporal import Flow, cut_scores, detect_shots, stabilize_chroma, temporal_denoise, thumb
+from .temporal import Flow, detect_shots, stabilize_chroma, temporal_denoise, thumb
 
 ProgressFn = Callable[[str, int, int], None]
 
@@ -82,10 +85,67 @@ class Analysis:
 VideoReport = Analysis  # the CLI's report is the analysis plus render timings
 
 
+CACHE_PARTS = ("clips", "photos", "media", "export", "tmp")  # all cache_root ever holds
+
+
 def cache_root() -> Path:
+    """The working folder: EPOCHCOLOR_CACHE, else the "cache_dir" setting,
+    else ~/.cache/epochcolor."""
     env = os.environ.get("EPOCHCOLOR_CACHE")
     if env:
         return Path(env).expanduser()
+    from ..models.weights import read_settings
+
+    chosen = read_settings().get("cache_dir")
+    if chosen:
+        return Path(chosen).expanduser()
+    return default_cache_root()
+
+
+def set_cache_root(path: str | Path | None) -> Path:
+    """Use another working folder (None: back to the default). Nothing is
+    moved: the cache is rebuilt as needed, and moving it between disks can
+    take longer than that."""
+    from ..models.weights import write_setting
+
+    if path:
+        p = Path(path).expanduser().absolute()
+        p.mkdir(parents=True, exist_ok=True)
+        probe = p / ".epochcolor-write-test"
+        probe.write_text("ok")
+        probe.unlink()
+        write_setting("cache_dir", str(p))
+        return p
+    write_setting("cache_dir", None)
+    return default_cache_root()
+
+
+def cache_size(root: Path | None = None) -> int:
+    root = root or cache_root()
+    total = 0
+    for part in CACHE_PARTS:
+        d = root / part
+        if d.exists():
+            total += sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+    return total
+
+
+def sweep_stale(root: Path | None = None) -> int:
+    """Delete working-size luma left by versions before 0.5.2 (L.raw, L.npy):
+    the biggest files by far, and never read any more."""
+    root = root or cache_root()
+    freed = 0
+    for pat in ("clips/*/L.raw", "clips/*/L.npy"):
+        for f in root.glob(pat):
+            try:
+                freed += f.stat().st_size
+                f.unlink()
+            except OSError:
+                pass
+    return freed
+
+
+def default_cache_root() -> Path:
     if sys.platform == "win32":
         base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
         return base / "EpochColor" / "cache"
@@ -154,7 +214,33 @@ class _Progress:
 
 
 def _memmap(path: Path, shape, dtype=np.float16, mode="w+"):
-    return np.lib.format.open_memmap(str(path), mode=mode, dtype=dtype, shape=shape)
+    m = np.lib.format.open_memmap(str(path), mode=mode, dtype=dtype, shape=shape)
+    if mode == "w+":
+        # reserve the space now: writing into a sparse memmap on a full disk
+        # kills the process with SIGBUS, reserving fails with a plain ENOSPC
+        try:
+            with open(path, "r+b") as f:
+                os.posix_fallocate(f.fileno(), 0, os.path.getsize(path))
+        except AttributeError:
+            pass  # not on this platform
+        except OSError as e:
+            del m
+            path.unlink(missing_ok=True)
+            from ..diskspace import explain, is_full
+
+            if is_full(e):
+                from ..diskspace import DiskFull
+
+                raise DiskFull(explain(e, path), path) from None
+            raise
+    return m
+
+
+def estimate_cache_bytes(frames: int, chroma: tuple[int, int]) -> int:
+    """What a clip's analysis keeps on disk: raw chroma, stabilized chroma
+    (int8 a/b each) and the small denoised luma (float16)."""
+    cw, ch = chroma
+    return int(frames * cw * ch * (2 + 2 + 2) * 1.05)
 
 
 def working_size(w: int, h: int, short: int) -> tuple[int, int]:
@@ -206,37 +292,37 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
     meta_path = cdir / "meta.json"
     meta = json.loads(meta_path.read_text()) if (use_cache and meta_path.exists()) else {}
     flow = Flow(s.flow_preset)
-    L_path = cdir / "L.npy"
+    for stale in ("L.raw", "L.npy"):  # from versions that kept working-size luma
+        (cdir / stale).unlink(missing_ok=True)
 
     def decode() -> int:
-        raw = cdir / "L.raw"
-        thumbs = []
+        """Pass 1: only the cut scores and the noise sample are kept."""
+        from .temporal import cut_score
+
         prog = _Progress("decode", s.frames or info.frames_estimate, quiet, progress)
+        mid = max(0, (s.frames or info.frames_estimate) // 2)
+        scores, prev_t, sample = [], None, None
         n = 0
-        with open(raw, "wb") as f:
-            for g in iter_gray(info.path, (ww, wh), s.frames):
-                Lf = srgb_to_l(g)
-                thumbs.append(thumb(Lf))
-                f.write(Lf.astype(np.float16).tobytes())
-                n += 1
-                prog(n)
+        for g in iter_gray(info.path, (ww, wh), s.frames):
+            Lf = srgb_to_l(g)
+            t = thumb(Lf)
+            scores.append(0.0 if prev_t is None else cut_score(prev_t, t))
+            prev_t = t
+            if n <= mid:
+                sample = Lf  # ends up as the middle frame, or the last if the clip is shorter
+            n += 1
+            prog(n)
         prog.total = max(1, n)
         rep.timings["decode"] = prog.done()
         if n == 0:
             raise RuntimeError("no frames decoded")
-        Lm = _memmap(L_path, (n, wh, ww))
-        Lm[:] = np.fromfile(raw, np.float16).reshape(n, wh, ww)
-        Lm.flush()
-        del Lm
-        raw.unlink()
-        if "scores" not in meta:
-            meta.update({"frames": n, "scores": cut_scores(thumbs).tolist(), "model_done": []})
-        meta["decoded"] = True
+        meta.update({"frames": n, "scores": scores, "model_done": [],
+                     "sigma": float(estimate_noise(sample)), "decoded": True})
         meta_path.write_text(json.dumps(meta))
         return n
 
     # ---------------------------------------------- 1. decode at working size
-    if not meta.get("scores"):
+    if not meta.get("scores") or "sigma" not in meta:
         decode()
     n = meta["frames"]
     scores = np.asarray(meta["scores"], np.float32)
@@ -255,18 +341,16 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
         ab_raw = np.load(ab_raw_path, mmap_mode="r+")
         Ldn = np.load(ldn_path, mmap_mode="r+")
     else:
+        from ..diskspace import need
+
+        need(cdir, estimate_cache_bytes(n, (cw, ch)), f"Colorizing {Path(info.path).name} ({n} frames)")
         done = set()
         ab_raw = _memmap(ab_raw_path, (n, ch, cw, 2), np.int8)
         Ldn = _memmap(ldn_path, (n, ch, cw))
-    todo = [sh for sh in shots if tuple(sh) not in done]
+    todo = sorted(sh for sh in shots if tuple(sh) not in done)
     rep.cached_shots = len(shots) - len(todo)
-    if todo and not L_path.exists():
-        decode()  # the working-size luma was dropped after an earlier pass
     sigma = float(meta.get("sigma", 0.0))
     if todo:
-        L = np.load(L_path, mmap_mode="r")
-        sigma = estimate_noise(np.asarray(L[min(n - 1, n // 2)], np.float32))
-        meta["sigma"] = sigma
         meta["stab"] = None  # chroma is about to change
         meta_path.write_text(json.dumps(meta))
     rep.noise_sigma = round(sigma, 3)
@@ -278,32 +362,34 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
     total = sum(b - a for a, b in todo)
     prog = _Progress("model", total, quiet, progress)
     count = 0
-    for a, b in todo:
-        for t in range(a, b):
-            cur = np.asarray(L[t], np.float32)
-            prev = np.asarray(L[t - 1], np.float32) if t > a else None
-            nxt = np.asarray(L[t + 1], np.float32) if t + 1 < b else None
-            if s.denoise == 0:
-                dn = cur
-            else:
-                dn = temporal_denoise(prev, cur, nxt, flow, sigma)
-                # light spatial pass for whatever the neighbours did not cover
-                dn = denoise_l(dn, None if s.denoise is None else s.denoise * 0.5)
-            ab_w = model.predict(dn, None)
-            Ldn[t] = cv2.resize(dn, (cw, ch), interpolation=cv2.INTER_AREA)
-            ab_raw[t] = _to_i8(cv2.resize(ab_w, (cw, ch), interpolation=cv2.INTER_AREA))
-            count += 1
-            prog(count)
-        ab_raw.flush()
-        Ldn.flush()
-        done.add((a, b))
-        meta["model_done"] = sorted(list(x) for x in done)
-        meta_path.write_text(json.dumps(meta))  # resume point after each shot
+    frames = _LumaStream(info, (ww, wh)) if todo else None
+    try:
+        for a, b in todo:
+            cur = frames.get(a)
+            prev = None
+            for t in range(a, b):
+                nxt = frames.get(t + 1) if t + 1 < b else None
+                if s.denoise == 0:
+                    dn = cur
+                else:
+                    dn = temporal_denoise(prev, cur, nxt, flow, sigma)
+                    # light spatial pass for whatever the neighbours did not cover
+                    dn = denoise_l(dn, None if s.denoise is None else s.denoise * 0.5)
+                ab_w = model.predict(dn, None)
+                Ldn[t] = cv2.resize(dn, (cw, ch), interpolation=cv2.INTER_AREA)
+                ab_raw[t] = _to_i8(cv2.resize(ab_w, (cw, ch), interpolation=cv2.INTER_AREA))
+                prev, cur = cur, nxt
+                count += 1
+                prog(count)
+            ab_raw.flush()
+            Ldn.flush()
+            done.add((a, b))
+            meta["model_done"] = sorted(list(x) for x in done)
+            meta_path.write_text(json.dumps(meta))  # resume point after each shot
+    finally:
+        if frames is not None:
+            frames.close()
     rep.timings["model"] = prog.done() if todo else 0.0
-    if todo:
-        del L
-    if all(tuple(sh) in done for sh in shots) and L_path.exists():
-        L_path.unlink()  # biggest file; only needed again if shots change
 
     # ------------------------------------- 4. hints, then stabilize chroma
     want = wanted_stab(shots, s.stabilize, hints)
@@ -378,6 +464,38 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
         (cdir / tmp).unlink(missing_ok=True)
     rep.timings["stabilize"] = prog.done()
     return rep
+
+
+class _LumaStream:
+    """Frames of a clip at working size as L*, read in order. Jumps (to the
+    next shot still to do) seek; everything else decodes straight on. Only
+    the frames in hand are in memory."""
+
+    def __init__(self, info: ClipInfo, size: tuple[int, int]):
+        from ..media import FrameReader
+
+        self.info, self.size = info, size
+        self.r = FrameReader(info.path, info.fps, "gray16le", size=size, cache=3)
+        self.fallback = None  # counting decoder, for files whose timestamps don't seek
+
+    def get(self, t: int) -> np.ndarray:
+        if self.fallback is None:
+            g = self.r.get(t)
+            if g is not None:
+                return srgb_to_l(g.astype(np.float32) / 65535.0)
+            self.fallback = [iter_gray(self.info.path, self.size), 0]
+        it, pos = self.fallback
+        if t < pos:
+            it, pos = iter_gray(self.info.path, self.size), 0
+        for g in it:
+            pos += 1
+            if pos - 1 == t:
+                self.fallback = [it, pos]
+                return srgb_to_l(g)
+        raise RuntimeError(f"{Path(self.info.path).name}: frame {t} could not be decoded")
+
+    def close(self) -> None:
+        self.r.close()
 
 
 def _to_i8(ab: np.ndarray) -> np.ndarray:
@@ -518,10 +636,14 @@ class _Slice:
         self.arr[self.a + i] = v
 
 
-def clear_cache() -> int:
-    root = cache_root()
-    if not root.exists():
-        return 0
-    n = sum(1 for _ in root.iterdir())
-    shutil.rmtree(root)
+def clear_cache(root: Path | None = None) -> int:
+    """Empty the working folder. Only EpochColor's own subfolders go, so a
+    working folder pointed at a whole disk can't take anything else along."""
+    root = root or cache_root()
+    n = 0
+    for part in CACHE_PARTS:
+        d = root / part
+        if d.is_dir():
+            n += sum(1 for _ in d.iterdir())
+            shutil.rmtree(d, ignore_errors=True)
     return n

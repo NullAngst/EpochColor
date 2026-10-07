@@ -27,6 +27,25 @@ A few notes on that first-run PyTorch download:
 
 The AppImage needs glibc 2.28 or newer and the usual desktop libraries (OpenGL/EGL, fontconfig, xkbcommon). Any current openSUSE, Fedora, Ubuntu or Arch has them.
 
+## Disk, memory and the GPU
+
+**Working folder.** Everything EpochColor makes while it works goes in one folder: proxies, the colour analysis, colorized photos, export scratch files. By default that's `~/.cache/epochcolor`. File > Working folder and limits moves it, or `epochcolor cache dir /mnt/big/epochcolor` from the command line (`epochcolor cache dir default` puts it back). I'd point it at your biggest disk, since the analysis keeps about 0.7 MB per frame, roughly 1 GB per minute of 24 fps footage, and a feature film runs past 100 GB. Before it starts on a clip it checks the room and says so if there isn't enough. Nothing gets moved when you switch: the old folder stays until you empty it, and proxies rebuild in the new one. `epochcolor cache` shows the size and the free space. `epochcolor cache clear` empties it, and only touches EpochColor's own subfolders, so pointing it at a whole disk is safe.
+
+Versions before 0.5.2 wrote the whole clip at working size to `L.raw` first, then read all of it back into RAM. On a long clip that filled the disk and then the memory. That file is gone now: the model pass decodes the source again, shot by shot. Leftover `L.raw` and `L.npy` files from older versions get deleted the next time the worker starts or `epochcolor cache` runs.
+
+**Memory and CPU.** The worker runs at nice 10 and leaves one core free, so the desktop stays usable. A watchdog stops it when it goes over its memory limit (75% of RAM by default) or when free memory drops under 6% of RAM (at most 2 GB), before the system starts swapping. You get a message saying which one, and finished shots stay cached. All three numbers are in File > Working folder and limits, or as `threads`, `memory_limit_gb` and `nice` in `~/.config/epochcolor/settings.json`. The command line has the same watchdog for `photo`, `video` and `render`.
+
+**The GPU check.** The first time a model needs the GPU, each GPU gets a quick test in a throwaway process, checked against the CPU result. The first one that passes gets used, and if none does, the CPU does the work and you're told why. Why bother? Because a GPU build of PyTorch that can't drive a card often crashes outright instead of giving an error, and that crash used to take the worker down with "exit code -11" on every job. The usual AMD causes:
+
+- An integrated GPU. Most Ryzen 7000 and newer desktop chips have one, ROCm lists it next to the real card, and then crashes on it. The check tries the card with the most memory first and pins it with `ROCR_VISIBLE_DEVICES`.
+- A chip that isn't in the PyTorch build. An RX 6700 XT is gfx1031, for example, and needs `HSA_OVERRIDE_GFX_VERSION=10.3.0` to run the gfx1030 kernels. The check tries that when the card fails as is.
+
+The result is saved in `~/.config/epochcolor/gpu-check.json` and reused until PyTorch, the GPUs, the kernel or EpochColor change. If you set any of those ROCm variables yourself, the check leaves them alone. Colour > Test the GPU again redoes it. `epochcolor device --test` does it in a terminal and prints every attempt, which is the thing to paste if your GPU still won't work.
+
+**Logs.** The worker writes everything to `~/.local/state/epochcolor/logs/worker.log`, including output from the C libraries under it and a stack trace if it crashes. When the worker dies, the error says how (crash, out of memory, killed), and Show Details has the end of that log. The GPU check logs to `gpu-check.log` next to it.
+
+Those `(null): No such file or directory` lines in the terminal come from the ROCm build of PyTorch. It bundles its own libdrm, which looks for a table of AMD GPU names relative to where it thinks Python is installed. That doesn't line up with how EpochColor installs PyTorch, so the lookup fails. It's harmless: the only effect is a generic GPU name. They go to the worker log now instead of your terminal.
+
 ## Run from source
 
 For hacking on it, or if you'd rather not use an AppImage. Needs Python 3.10 or newer and an FFmpeg with libx264, libx265 and libsvtav1 in your PATH. openSUSE's stock package leaves x264 and x265 out, so I use the Packman build, it depends on your system. `epochcolor encoders` shows what yours has.
@@ -294,7 +313,10 @@ Honest list, so nobody is surprised.
 - Audio passthrough with `--frames` trims at the nearest audio packet, not the exact frame. Fine for a test render.
 - An edited timeline (any trim, split, cut, join or in/out range) re-encodes every audio track, since compressed audio frames don't line up with video frames. The export dialog says so and asks for the codec. Only a single untouched clip passes audio through as is. Each piece of audio gets padded or cut to its exact video length, so a source whose audio runs short can't pull later pieces out of sync.
 - **Playback in the editor is silent.** Audio shows as waveforms and goes into the export, but the preview doesn't play it yet.
-- The cache is about 1 GB per minute of footage. A feature needs real disk space while you work on it. Compressing it per shot is the obvious next step if that turns out to hurt.
+- The working folder takes about 1 GB per minute of footage, so a feature needs real disk space while you work on it. Point it at a big disk (see Disk, memory and the GPU). Compressing it per shot is the obvious next step.
+- The two-pass export writes a lossless FFV1 intermediate of the whole timeline into the working folder first. At 4K that's very large. The free-space check doesn't cover it yet, so leave room or use single pass.
+- The GPU check hasn't run on real AMD hardware. My build machine has no GPU. The test it runs and the CPU fallback are tested, but which `ROCR_VISIBLE_DEVICES` index lands on which card comes from ROCm's own numbering, which I couldn't check. `epochcolor device --test` prints the name of each card it tries, so a mix-up would show there.
+- The memory watchdog reads `/proc`, so it only works on Linux.
 - Linux only for now. The Flatpak, its repo on GitHub Pages, and Windows builds are still milestone 8 and 9 work.
 - The first-run PyTorch download takes the newest build PyTorch offers for your hardware at that moment. The spec's pinned torch stack with a weekly test-and-bump workflow isn't built yet, so if a brand new PyTorch release breaks something, `epochcolor setup-torch --variant <yours>` after a fix, or report it.
 - The editor draws through OpenGL where it can and falls back to plain painting where it can't (some VMs, remote sessions). My build machine had no GPU, so the GL path is untested. The fallback is what the tests ran on.

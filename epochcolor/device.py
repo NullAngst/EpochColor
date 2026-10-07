@@ -9,7 +9,7 @@ def pick_device(pref: str = "auto") -> tuple[str, str]:
     import torch
 
     if pref == "cpu":
-        return "cpu", "CPU (forced)"
+        return "cpu", "CPU"
     if pref.startswith("cuda") or pref == "auto":
         if torch.cuda.is_available():
             dev = pref if pref.startswith("cuda") else "cuda"

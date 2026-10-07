@@ -132,3 +132,46 @@ def test_video_end_to_end(tmp_path, monkeypatch):
     plan2 = resolve(ExportSettings(encoder="software", rf=8, speed="ultrafast"), out2, info.audio)
     rep2 = colorize_video(info, JitterModel(), out2, plan2, VideoSettings(), quiet=True)
     assert rep2.cached_shots == 1
+
+
+@needs_ffmpeg
+def test_shot_reads_match_the_first_pass(tmp_path, monkeypatch):
+    """The model pass decodes shot by shot (with seeks) instead of keeping
+    working-size luma on disk; it has to see the same frames as pass 1."""
+    from epochcolor.color import srgb_to_l
+    from epochcolor.video.io import iter_gray, probe
+    from epochcolor.video.pipeline import _LumaStream
+
+    clip = tmp_path / "clip.mkv"
+    _make_clip(clip)
+    info = probe(clip)
+    seq = [srgb_to_l(g) for g in iter_gray(clip, (160, 96))]
+    st = _LumaStream(info, (160, 96))
+    try:
+        for t in [3, 4, 5, 20, 21, 2, 23]:  # straight on, a jump, a jump back
+            assert np.array_equal(st.get(t), seq[t]), t
+    finally:
+        st.close()
+
+
+@needs_ffmpeg
+def test_analysis_keeps_no_working_size_luma(tmp_path, monkeypatch):
+    from epochcolor.video.io import probe
+    from epochcolor.video.pipeline import VideoSettings, analyze
+
+    monkeypatch.setenv("EPOCHCOLOR_CACHE", str(tmp_path / "cache"))
+    clip = tmp_path / "clip.mkv"
+    _make_clip(clip)
+    rep = analyze(probe(clip), JitterModel(), VideoSettings(), quiet=True)
+    names = {p.name for p in rep.dir.iterdir()}
+    assert {"ab_raw.npy", "Ldn.npy", "ab.npy", "meta.json"} <= names
+    assert not names & {"L.npy", "L.raw"}
+
+
+def test_analysis_refuses_without_room(tmp_path, monkeypatch):
+    from epochcolor import diskspace
+    from epochcolor.video.pipeline import estimate_cache_bytes
+
+    monkeypatch.setattr(diskspace, "free_bytes", lambda p: 1000)
+    with pytest.raises(diskspace.DiskFull, match="needs about"):
+        diskspace.need(tmp_path, estimate_cache_bytes(1000, (456, 256)), "Colorizing x")
