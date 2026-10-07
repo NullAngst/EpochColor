@@ -16,6 +16,7 @@ dependencies = [
     "opencv-python-headless",
     "pillow",
     "tifffile",
+    "av",
 ]
 
 [project.optional-dependencies]
