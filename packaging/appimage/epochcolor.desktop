@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=EpochColor
+GenericName=Film colorizer
+Comment=Colorize black and white film and photos
+Exec=epochcolor %F
+Icon=epochcolor
+Terminal=false
+Categories=AudioVideo;Video;Graphics;
+Keywords=colorize;colorization;film;restoration;black and white;

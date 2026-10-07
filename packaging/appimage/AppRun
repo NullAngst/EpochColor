@@ -1,0 +1,13 @@
+#!/bin/sh
+# EpochColor AppImage launcher. No arguments (a double-click) or files open
+# the editor; a known subcommand runs the command line instead.
+HERE="$(dirname "$(readlink -f "$0")")"
+export PATH="$HERE/usr/bin:$PATH"   # the bundled ffmpeg comes first
+unset PYTHONHOME PYTHONPATH PYTHONSTARTUP
+PY="$HERE/usr/python/bin/python3"
+case "$1" in
+    photo|video|fetch|models|device|cache|encoders|presets|gui|setup-torch|-h|--help|--version)
+        exec "$PY" -s -m epochcolor "$@" ;;
+    *)
+        exec "$PY" -s -m epochcolor gui "$@" ;;
+esac

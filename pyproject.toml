@@ -25,7 +25,7 @@ dependencies = [
 raw = ["rawpy"]
 heic = ["pillow-heif"]
 safetensors = ["safetensors"]
-gui = ["PySide6"]
+gui = ["PySide6-Essentials"]
 test = ["pytest"]
 
 [project.scripts]

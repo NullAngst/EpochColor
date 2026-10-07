@@ -4,6 +4,53 @@ EpochColor colorizes black and white photos and film footage while keeping the o
 
 **This is milestone 4: the editor.** A viewer with before/after, a timeline for multiple clips with trims, splits and audio tracks, a photo filmstrip, and the full export matrix, on top of the command line pipeline from milestones 1 to 3. Painting hints in the editor, grading and the model manager come in later milestones.
 
+## Download and run
+
+Grab `EpochColor-<version>-x86_64.AppImage` from the [Releases page](https://github.com/NullAngst/EpochColor/releases).
+
+1. `chmod +x EpochColor-*-x86_64.AppImage`
+2. `./EpochColor-*-x86_64.AppImage`, or double-click it.
+3. On first start it offers to download PyTorch for your GPU: ROCm for AMD, CUDA for NVIDIA, XPU for Intel, CPU otherwise. Say yes, since the colorization models need it. It goes into `~/.local/share/epochcolor/torch`, separate from the AppImage, so app updates don't download it again. Colour > Install PyTorch brings this back later.
+4. Colour > Download weights for the current model. About 140 MB, once.
+
+That's it. FFmpeg (with x264, x265, SVT-AV1, NVENC, VAAPI, QSV and AMF) and Python are inside the AppImage, so nothing else needs installing. openSUSE's own FFmpeg doesn't matter here.
+
+The same AppImage runs the command line, too: `./EpochColor-*-x86_64.AppImage video reel.mkv --rf 18`. Any of the commands below work that way. With no command, or with files, it opens the editor.
+
+A few notes on that first-run PyTorch download:
+
+- It checks PyTorch's index live and takes the newest build that fits: for NVIDIA, the newest CUDA build your driver can run, read from `/proc/driver/nvidia/version`. AMD needs `/dev/kfd`, which means the amdgpu kernel driver, standard on any current distro.
+- Sizes: CPU about 200 MB, CUDA about 3 GB, ROCm 4 to 6 GB.
+- `epochcolor setup-torch --check` shows what it would pick. `--variant cpu` (or rocm, cuda, xpu) overrides it. `--remove` deletes it.
+- A PyTorch you installed yourself always wins over the downloaded one.
+
+The AppImage needs glibc 2.28 or newer and the usual desktop libraries (OpenGL/EGL, fontconfig, xkbcommon). Any current openSUSE, Fedora, Ubuntu or Arch has them.
+
+## Run from source
+
+For hacking on it. Needs Python 3.10 or newer and an FFmpeg with libx264, libx265 and libsvtav1 in your PATH. openSUSE's stock package leaves x264 and x265 out, so I use the Packman build, it depends on your system. `epochcolor encoders` shows what yours has.
+
+1. `git clone https://github.com/NullAngst/EpochColor && cd EpochColor`
+2. `python3 -m venv .venv && source .venv/bin/activate`
+3. `pip install -e ".[gui,raw,heic]"`, since that pulls in the editor, camera RAW and HEIC support. Drop any of them you don't need.
+4. `epochcolor setup-torch` downloads PyTorch for your GPU, same as the AppImage. Or install it into the venv yourself from [pytorch.org](https://pytorch.org/get-started/locally/).
+5. `epochcolor device` to check what PyTorch found. ROCm shows up as a CUDA device, that's normal.
+6. `epochcolor fetch all` to download the weights to `~/.local/share/epochcolor/models`. Set `EPOCHCOLOR_MODELS` to put them elsewhere.
+7. `epochcolor gui` for the editor.
+
+## Making a release
+
+The build workflow (`.github/workflows/build.yml`) runs the tests, builds the AppImage, checks it actually starts (CLI, a photo, the editor and its worker process, all headless), and attaches it to a GitHub release. It runs when a version tag is pushed:
+
+```
+git tag v0.4.0
+git push origin v0.4.0
+```
+
+The version in the app comes from the tag, so there's nothing to bump by hand. To try a build without making a release, open the Actions tab, pick "build", and hit Run workflow; the AppImage shows up as a download at the bottom of the run's page.
+
+To build one on your own machine, `bash packaging/appimage/build.sh`. It needs curl, python3 with venv, tar and xz, and puts the AppImage in `dist/`. The Python series and the FFmpeg release branch are the two variables at the top of the script; each picks up the newest patch release of its series on every build.
+
 ## How it works
 
 The model never touches brightness. A black and white photo already holds all of it, so EpochColor predicts only the two color channels (Lab a/b) at a reduced size, scales them up snapped to the edges of the full-size image, and recombines them with the original L.
@@ -15,32 +62,13 @@ The model never touches brightness. A black and white photo already holds all of
 5. Color is scaled to full size with a guided filter, so it follows real edges and ignores grain.
 6. Color meets the original luma. Out-of-gamut pixels lose chroma instead of having channels clipped, so brightness stays put. In testing the output L matches the source to within 0.001 L*.
 
-## Prerequisites
-
-- Python 3.10 or newer
-- FFmpeg for video, with libx265, libx264 and libsvtav1. openSUSE's stock package leaves x264 and x265 out, so I use the Packman build. `epochcolor encoders` shows what yours has.
-- PyTorch for the network models (`siggraph17`, `eccv16`). The `hints` model runs without it.
-- PySide6 for the editor. The command line works without it.
-- About 300 MB of disk for both model weights
-
-## Install
-
-I run openSUSE with an AMD card, so in my case it's the ROCm wheel. It depends on your system.
-
-1. `git clone https://github.com/NullAngst/EpochColor && cd EpochColor`
-2. `python3 -m venv .venv && source .venv/bin/activate`
-3. Install the PyTorch wheel for your hardware from [pytorch.org](https://pytorch.org/get-started/locally/). For me that's `pip install torch --index-url https://download.pytorch.org/whl/rocmX.Y`, with X.Y being whichever ROCm version the site lists right now. NVIDIA wants the CUDA index, Intel the XPU index, no GPU the CPU index.
-4. `pip install -e ".[gui,raw,heic]"`, since that pulls in the editor, camera RAW and HEIC support. Drop any of them you don't need.
-5. `epochcolor device` to check what PyTorch found. ROCm shows up as a CUDA device, that's normal.
-6. `epochcolor fetch all` to download the weights to `~/.local/share/epochcolor/models`. Set `EPOCHCOLOR_MODELS` to put them elsewhere.
-
 ## The editor
 
 ```
 epochcolor gui
 ```
 
-Or `epochcolor-gui`, or `epochcolor gui reel1.mkv reel2.mkv` to open with clips already in, or `epochcolor gui film.epochcolor` for a saved project.
+Or run the AppImage, or `epochcolor-gui`. `epochcolor gui reel1.mkv reel2.mkv` opens with clips already in, `epochcolor gui film.epochcolor` opens a saved project.
 
 1. File > Add clips (Ctrl+I). Each clip gets probed, a small proxy built for scrubbing, and its shots detected, in the background. The first clip sets the project's frame rate and resolution, and a clip that doesn't match is refused, same rule as the command line.
 2. Colour > Colorize all clips (Ctrl+Shift+R). This is the slow part. Progress shows in the Inspector, and Cancel stops it. Finished shots stay cached either way.
@@ -212,6 +240,8 @@ Honest list, so nobody is surprised.
 - **Playback in the editor is silent.** Audio shows as waveforms and goes into the export, but the preview doesn't play it yet.
 - Hints can't be painted in the editor yet (milestone 5), and there's no grading beyond saturation (milestone 7). For photos, hint files from the command line still work.
 - The cache is about 1 GB per minute of footage. A feature needs real disk space while you work on it. Compressing it per shot is the obvious next step if that turns out to hurt.
+- Linux only for now. The Flatpak, its repo on GitHub Pages, and Windows builds are still milestone 8 and 9 work.
+- The first-run PyTorch download takes the newest build PyTorch offers for your hardware at that moment. The spec's pinned torch stack with a weekly test-and-bump workflow isn't built yet, so if a brand new PyTorch release breaks something, `epochcolor setup-torch --variant <yours>` after a fix, or report it.
 - The editor draws through OpenGL where it can and falls back to plain painting where it can't (some VMs, remote sessions). My build machine had no GPU, so the GL path is untested. The fallback is what the tests ran on.
 - Optical flow runs on the CPU (OpenCV DIS). It's not the bottleneck yet. The model is: on a 2-core CPU with no GPU, `siggraph17` ran at under one frame per second on 640x360. A GPU changes that completely.
 - The grain slider below 100% uses a spatial denoise at full size for video, not the temporal one. The model's copy does get the temporal one.

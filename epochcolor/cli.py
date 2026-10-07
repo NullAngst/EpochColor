@@ -24,8 +24,8 @@ def _load_model(name: str, weights: str | None, device_pref: str):
             import torch  # noqa: F401
         except ImportError:
             raise RuntimeError(
-                f"{name} needs PyTorch. Install the wheel for your GPU (see README), "
-                "or use --model hints"
+                f"{name} needs PyTorch. Run `epochcolor setup-torch` to download the build "
+                "for your GPU, or use --model hints"
             ) from None
         from .device import pick_device
 
@@ -364,6 +364,25 @@ def cmd_device(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_setup_torch(a: argparse.Namespace) -> int:
+    from . import torch_setup as ts
+
+    if a.remove:
+        print("removed" if ts.remove() else "nothing to remove", ts.torch_dir())
+        return 0
+    if a.check:
+        fam, why = ts.detect()
+        print(f"detected: {why}; would install {fam}")
+        print(f"installed: {ts.installed_variant() or 'none'} in {ts.torch_dir()}")
+        return 0
+    try:
+        ts.install(a.variant, log=print)
+    except Exception as e:
+        _err(str(e))
+        return 1
+    return 0
+
+
 def cmd_gui(a: argparse.Namespace) -> int:
     try:
         from .gui.main import main as gui_main
@@ -459,6 +478,13 @@ def build_parser() -> argparse.ArgumentParser:
     en.add_argument("--retest", action="store_true", help="forget cached results and test again")
     en.add_argument("--vaapi-device", help="VAAPI render node")
     en.set_defaults(func=cmd_encoders)
+
+    ts = sub.add_parser("setup-torch", help="download PyTorch for this machine's GPU")
+    ts.add_argument("--variant", default="auto", choices=["auto", "rocm", "cuda", "xpu", "cpu"],
+                    help="auto picks from the GPU and driver (default)")
+    ts.add_argument("--check", action="store_true", help="show what would be installed and stop")
+    ts.add_argument("--remove", action="store_true", help="delete the downloaded PyTorch")
+    ts.set_defaults(func=cmd_setup_torch)
 
     gu = sub.add_parser("gui", help="open the editor")
     gu.add_argument("files", nargs="*", help="a project, clips or photos to open")

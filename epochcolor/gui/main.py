@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import time
 from dataclasses import asdict
@@ -399,6 +400,7 @@ class MainWindow(QMainWindow):
         act(m, "Colorize all clips", self.colorize_all, "Ctrl+Shift+R")
         act(m, "Colorize selected photos", self.colorize_photos, "Ctrl+Alt+R")
         m.addSeparator()
+        act(m, "Install PyTorch...", lambda: self.setup_torch(False))
         act(m, "Download weights for the current model", self.fetch_weights)
         act(m, "Model device...", self.choose_device)
 
@@ -842,6 +844,23 @@ class MainWindow(QMainWindow):
         self.runner.submit("fetch", f"Download {self.project.d.settings['model']} weights",
                            {"model": self.project.d.settings["model"]})
 
+    def setup_torch(self, first_run: bool) -> None:
+        from .torch_dialog import TorchDialog
+
+        dlg = TorchDialog(first_run, self)
+        dlg.exec()
+        if first_run and dlg.dont_ask.isChecked():
+            self.qs.setValue("torch_dont_ask", True)
+        if dlg.ok:
+            self.runner.shutdown()  # the next job starts a worker that sees the new PyTorch
+            self.statusBar().showMessage("PyTorch installed", 6000)
+
+    def first_run_checks(self) -> None:
+        from ..torch_setup import have_torch
+
+        if not have_torch() and not self.qs.value("torch_dont_ask", False, type=bool):
+            self.setup_torch(True)
+
     def choose_device(self) -> None:
         cur = self.qs.value("device", "auto")
         dev, ok = QInputDialog.getText(self, "Model device",
@@ -1091,6 +1110,18 @@ def main(argv=None) -> int:
         if photos:
             w.add_photos(photos)
     w.show()
+    # Ctrl+C in a terminal or a SIGTERM from the session closes cleanly, so
+    # the worker process and its queues go with it
+    import signal
+
+    signal.signal(signal.SIGINT, lambda *_: app.quit())
+    signal.signal(signal.SIGTERM, lambda *_: app.quit())
+    ticker = QTimer()
+    ticker.start(300)
+    ticker.timeout.connect(lambda: None)  # lets Python run its signal handlers
+    app.aboutToQuit.connect(w.shutdown)
+    if not os.environ.get("EPOCHCOLOR_NO_FIRST_RUN"):
+        QTimer.singleShot(400, w.first_run_checks)
     return app.exec()
 
 
