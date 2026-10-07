@@ -15,9 +15,11 @@ jobs:
           python-version: "3.12"
       - name: Install
         run: |
-          sudo apt-get update && sudo apt-get install -y ffmpeg
+          sudo apt-get update && sudo apt-get install -y ffmpeg libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -e ".[test,raw]"
+          pip install -e ".[test,raw,gui]"
       - name: Test
+        env:
+          QT_QPA_PLATFORM: offscreen
         run: pytest -q
