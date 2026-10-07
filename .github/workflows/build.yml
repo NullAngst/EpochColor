@@ -27,8 +27,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           v="${GITHUB_REF_NAME#v}"
-          sed -i "s/^__version__ = .*/__version__ = \"$v\"/" epochcolor/__init__.py
-          grep __version__ epochcolor/__init__.py
+          sed -i "s/^__version__ = .*/__version__ = \"$v\"/" epochcolor/_version.py
+          grep __version__ epochcolor/_version.py
 
       - name: Build
         run: bash packaging/appimage/build.sh
