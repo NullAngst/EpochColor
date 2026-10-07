@@ -215,6 +215,20 @@ def attempts_for(gpus: list[dict]) -> list[dict]:
     return tries
 
 
+def describe_gpu(name: str, env: dict, gpus: list[dict]) -> str:
+    """PyTorch's name plus the chip and memory from sysfs. The ROCm build often
+    can't read the marketing names (that's the "(null)" lines), so all it
+    says is "AMD Radeon Graphics"."""
+    g = None
+    if "ROCR_VISIBLE_DEVICES" in env:
+        g = next((x for x in gpus if str(x["index"]) == env["ROCR_VISIBLE_DEVICES"]), None)
+    elif len(gpus) == 1:
+        g = gpus[0]
+    if g is None:
+        return name
+    return f"{name or 'AMD GPU'} ({g['gfx']}, {g['mem'] / 2**30:.0f} GB)"
+
+
 def run_ladder(log=print, progress=None) -> dict:
     gpus = kfd_gpus()
     if gpus:
@@ -239,11 +253,15 @@ def run_ladder(log=print, progress=None) -> dict:
         progress("testing the GPU (first run only)", len(tries), len(tries))
     result = {"fingerprint": fingerprint(), "time": time.time(), "attempts": attempts}
     if chosen:
+        name = describe_gpu(chosen.get("name", ""), chosen["env"], gpus)
         result.update(device="cuda" if chosen.get("backend") in ("rocm", "cuda") else "xpu",
-                      env=chosen["env"], name=chosen.get("name", ""), backend=chosen.get("backend"))
-        if chosen["env"].get("HSA_OVERRIDE_GFX_VERSION"):
-            result["note"] = (f"{chosen.get('name')} needed HSA_OVERRIDE_GFX_VERSION="
-                              f"{chosen['env']['HSA_OVERRIDE_GFX_VERSION']} to run.")
+                      env=chosen["env"], name=name, backend=chosen.get("backend"))
+        ov = chosen["env"].get("HSA_OVERRIDE_GFX_VERSION")
+        if ov:
+            result["note"] = (f"Colorizing runs on your GPU, {name}. PyTorch has no kernels built for "
+                              f"this exact chip, so EpochColor runs it with HSA_OVERRIDE_GFX_VERSION={ov} "
+                              f"(the kernels of its closest sibling). That passed a check against the CPU "
+                              f"and is saved, so there's nothing to do.")
     elif attempts and all(a.get("cpu_build") for a in attempts):
         result.update(device="cpu", env={}, name="CPU")  # a CPU-only PyTorch: nothing to report
     else:

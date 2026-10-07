@@ -95,3 +95,21 @@ def test_probe_child_runs():
     """The real child process, whatever PyTorch this machine has."""
     r = gpucheck.run_probe({}, timeout=120)
     assert "rc" in r and (r.get("ok") or r.get("error"))
+
+
+def test_override_success_is_reported_as_working(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    for v in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "HSA_OVERRIDE_GFX_VERSION"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setattr(gpucheck, "kfd_gpus", lambda root=None: [{"index": 0, "gfx": "gfx1032", "mem": 8 << 30}])
+
+    def probe(env, timeout=240, log=None):
+        if "HSA_OVERRIDE_GFX_VERSION" in env:
+            return {"ok": True, "env": env, "name": "AMD Radeon Graphics", "backend": "rocm"}
+        return {"ok": False, "env": env, "error": "it aborted inside native code (SIGABRT)"}
+
+    monkeypatch.setattr(gpucheck, "run_probe", probe)
+    r = gpucheck.run_ladder(log=lambda m: None)
+    assert r["device"] == "cuda" and r["env"] == {"HSA_OVERRIDE_GFX_VERSION": "10.3.0"}
+    assert r["name"] == "AMD Radeon Graphics (gfx1032, 8 GB)"
+    assert "runs on your GPU" in r["note"] and "nothing to do" in r["note"]

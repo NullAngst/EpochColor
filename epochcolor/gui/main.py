@@ -1067,9 +1067,12 @@ class MainWindow(QMainWindow):
         if self._manager is not None:
             self._manager.reload()
         if result.get("notice"):
-            box = QMessageBox(QMessageBox.Information, "GPU", result["notice"], parent=self)
-            box.setModal(False)
-            box.show()  # not exec(): the job's result still gets handled below
+            if result.get("notice_kind") == "warning":  # fell back to the CPU: worth a box
+                box = QMessageBox(QMessageBox.Warning, "GPU", result["notice"], parent=self)
+                box.setModal(False)
+                box.show()  # not exec(): the job's result still gets handled below
+            else:  # all is well, just say what got picked
+                self.statusBar().showMessage(result["notice"], 20000)
         if job.kind == "import":
             cd = dict(result["clip"])
             cd["audio"] = [AudioInfo(**a) for a in cd.get("audio", [])]

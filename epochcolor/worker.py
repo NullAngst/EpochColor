@@ -21,7 +21,7 @@ import traceback
 from dataclasses import asdict
 from pathlib import Path
 
-_state = {"progress": None, "notice": None, "gpu_env": None}
+_state = {"progress": None, "notice": None, "notice_kind": "info", "gpu_env": None}
 
 
 def _gpu_device(pref: str) -> str:
@@ -37,6 +37,7 @@ def _gpu_device(pref: str) -> str:
         print(f"gpu: {dev} {env or ''}", flush=True)
     if fresh and note:
         _state["notice"] = note
+        _state["notice_kind"] = "warning" if dev == "cpu" else "info"
     return dev
 
 
@@ -374,7 +375,7 @@ def worker_main(jobs, events, log_name: str | None = "worker.log") -> None:
         try:
             result = run_job(kind, job, progress, models)
             if _state["notice"]:
-                result = dict(result, notice=_state["notice"])
+                result = dict(result, notice=_state["notice"], notice_kind=_state["notice_kind"])
                 _state["notice"] = None
             events.put(("done", jid, result))
         except BaseException as e:  # noqa: BLE001 - everything goes back to the GUI
