@@ -109,7 +109,10 @@ class Viewer(_base()):
     def zoom_at(self, factor: float, at: QPointF | None = None) -> None:
         """Zoom by factor, keeping the picture point under `at` (default the centre) still."""
         base = self.gray or self.color
-        if base is None:
+        if base is None:  # no picture yet: take the zoom, there's nothing to keep still
+            self.zoom = float(min(16.0, max(1.0, self.zoom * factor)))
+            self.pan = QPointF(0, 0)
+            self.update()
             return
         at = at or QPointF(self.width() / 2, self.height() / 2)
         before = self._target(base)

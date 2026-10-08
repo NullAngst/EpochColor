@@ -513,7 +513,11 @@ def test_items_shot_states_and_this_frame(tmp_path, window):
     assert w.shot_status[c.id][key]["state"] == "none"
     assert "not coloured" in w.inspector.shot_info.text()
 
-    # zoom and fit
+    # zoom and fit, once the viewer has a picture (the preview arrives from another thread)
+    t = time.time()
+    while w.viewer.gray is None and w.viewer.color is None and time.time() - t < 30:
+        pump(app, 0.05)
+    assert w.viewer.gray is not None or w.viewer.color is not None, "no preview frame arrived"
     w.viewer.zoom_at(2.0)
     assert w.viewer.zoom == pytest.approx(2.0)
     w.viewer.fit()
