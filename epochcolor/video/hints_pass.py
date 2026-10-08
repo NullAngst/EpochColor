@@ -49,7 +49,7 @@ def guided(p: np.ndarray, I: np.ndarray, r: int = 4, eps: float = 4.0) -> np.nda
 
 def keyframe_fix(model: ColorModel, source: Path, fps: Fraction, frame: int, strokes: list,
                  working: tuple[int, int], chroma: tuple[int, int], ab_model_k: np.ndarray | None = None,
-                 denoise=None, spread: float = 0.15) -> tuple[np.ndarray, np.ndarray]:
+                 denoise=None, spread: float = 0.15, negative: dict | None = None) -> tuple[np.ndarray, np.ndarray]:
     """Target a/b and weight (both at chroma size) for one painted frame."""
     import cv2
 
@@ -67,7 +67,9 @@ def keyframe_fix(model: ColorModel, source: Path, fps: Fraction, frame: int, str
         r.close()
     if g16 is None:
         raise RuntimeError(f"{Path(source).name}: frame {frame} could not be decoded for its hints")
-    L = srgb_to_l(g16.astype(np.float32) / 65535.0)
+    from ..film import invert
+
+    L = srgb_to_l(invert(g16, negative))
     Lw = cv2.resize(L, (ww, wh), interpolation=cv2.INTER_AREA)
     Lw = denoise_l(Lw, denoise)
     hints = rasterize(strokes, ww, wh)

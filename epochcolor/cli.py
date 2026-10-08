@@ -103,7 +103,16 @@ def cmd_photo(a: argparse.Namespace) -> int:
             )
             if hint_path:
                 hints = load_hints(hint_path, h, w)
-            rgb, rep = colorize_photo(img, model, settings, hints)
+            if a.negative:
+                from .film import invert_rgb, measure_negative
+
+                img = invert_rgb(img, measure_negative([img]))
+            ref = {"path": a.reference, "strength": a.reference_strength / 100.0} if a.reference else None
+            rgb, rep = colorize_photo(img, model, settings, hints, reference=ref)
+            if a.regrain:
+                from .film import regrain
+
+                rgb = regrain(rgb, a.regrain, a.grain_size, a.grain_colour / 100.0, seed=1)
 
             if a.output:
                 out = Path(a.output)
@@ -263,9 +272,21 @@ def cmd_video(a: argparse.Namespace) -> int:
         working_size=a.working_size, grain=a.grain, denoise=a.denoise,
         stabilize=a.stabilize, shot_threshold=a.shot_threshold, guided=not a.no_guided,
         saturation=a.saturation, cast=a.cast / 100.0, frames=a.frames, chroma_size=a.chroma_size,
+        deflicker=0.0 if a.deflicker == "off" else 1.0, dust=a.dust != "off",
+        deflicker_out=a.deflicker == "output", dust_out=a.dust == "output",
+        regrain=a.regrain, regrain_size=a.grain_size, regrain_chroma=a.grain_colour / 100.0,
     )
+    if a.negative:
+        from .worker import _measure_negative
+
+        info.negative = _measure_negative({"kind": "clip", "path": str(src), "fps_num": info.fps.numerator,
+                                           "fps_den": info.fps.denominator, "frames": info.frames_estimate},
+                                          lambda *x: None)
+        print(f"negative: film base {info.negative['base']:.3f}, density {info.negative['dmin']:.2f} to "
+              f"{info.negative['dmax']:.2f}", file=sys.stderr)
+    ref = {"path": a.reference, "strength": a.reference_strength / 100.0} if a.reference else None
     try:
-        rep = colorize_video(info, model, out, plan, vs, use_cache=not a.no_cache)
+        rep = colorize_video(info, model, out, plan, vs, use_cache=not a.no_cache, reference=ref)
     except KeyboardInterrupt:
         _err("stopped. Finished shots are cached, run the same command to pick up.")
         return 130
@@ -542,6 +563,28 @@ def cmd_gui(a: argparse.Namespace) -> int:
     return gui_main([sys.argv[0]] + a.files)
 
 
+def _film_args(p, video: bool) -> None:
+    p.add_argument("--negative", action="store_true",
+                   help="the source is a black and white negative: measure its film base and invert it first")
+    p.add_argument("--reference", metavar="IMAGE",
+                   help="a colour photo of the same place, scene or era whose colours guide the result"
+                        + (" (used for every shot)" if video else ""))
+    p.add_argument("--reference-strength", type=float, default=100.0, metavar="PCT",
+                   help="how strongly the reference wins over the model, 0 to 100 (default 100)")
+    if video:
+        p.add_argument("--deflicker", choices=["off", "model", "output"], default="model",
+                       help="steady flickering brightness: for the model's copy only (default), "
+                            "the output too, or off")
+        p.add_argument("--dust", choices=["off", "model", "output"], default="model",
+                       help="remove dirt specks: from the model's copy only (default), the output too, or off")
+    p.add_argument("--regrain", type=float, default=0.0, metavar="PCT",
+                   help="add synthetic grain after colour, strength in percent at mid grey (default off)")
+    p.add_argument("--grain-size", type=float, default=1.0, metavar="PX",
+                   help="regrain size in pixels at 1080 lines (default 1.0)")
+    p.add_argument("--grain-colour", type=float, default=0.0, metavar="PCT",
+                   help="faint colour grain on top of the mono grain, 0 to 100 (default 0)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="epochcolor", description="Colorize black and white photos and film.")
     p.add_argument("--version", action="version", version=f"epochcolor {__version__}")
@@ -567,6 +610,7 @@ def build_parser() -> argparse.ArgumentParser:
     ph.add_argument("--working-size", type=int, default=512,
                     help="short side in pixels for chroma work (default 512)")
     ph.add_argument("--saturation", type=float, default=1.0, help="chroma multiplier (default 1.0)")
+    _film_args(ph, video=False)
     ph.add_argument("--cast", type=float, default=0.0,
                     help="remove the model's all-over colour cast, 0 to 100 percent (default 0)")
     ph.add_argument("--no-guided", action="store_true", help="plain bicubic chroma upscale")
@@ -595,6 +639,7 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--chroma-size", type=int, default=256,
                    help="short side of the stored colour (default 256); higher is crisper and bigger")
     g.add_argument("--saturation", type=float, default=1.0, help="chroma multiplier")
+    _film_args(g, video=True)
     g.add_argument("--cast", type=float, default=0.0,
                    help="remove the model's all-over colour cast per shot, 0 to 100 percent (default 0)")
     g.add_argument("--no-guided", action="store_true", help="plain bicubic chroma upscale")

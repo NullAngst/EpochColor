@@ -56,6 +56,15 @@ class VideoSettings:
     guided: bool = True
     saturation: float = 1.0
     cast: float = 0.0  # 0..1, how much of the measured colour cast to take out (chroma.py)
+    # film restoration (film.py). deflicker and dust clean the model's copy;
+    # the _out switches apply them to the output picture too
+    deflicker: float = 0.0  # 0..1 strength
+    dust: bool = False
+    deflicker_out: bool = False
+    dust_out: bool = False
+    regrain: float = 0.0  # grain strength in percent at mid grey, 0 = off
+    regrain_size: float = 1.0  # grain size in pixels at 1080 lines
+    regrain_chroma: float = 0.0  # 0..1 colour grain on top of the mono grain
     frames: int | None = None  # process only the first N frames
     flow_preset: str = "medium"
     chroma_size: int = 256  # short side of the stored chroma
@@ -63,7 +72,8 @@ class VideoSettings:
     @classmethod
     def from_project(cls, d: dict) -> "VideoSettings":
         keys = {"working_size", "grain", "denoise", "stabilize", "shot_threshold", "saturation",
-                "chroma_size", "cast"}
+                "chroma_size", "cast", "deflicker", "dust", "deflicker_out", "dust_out", "regrain",
+                "regrain_size", "regrain_chroma"}
         return cls(**{k: v for k, v in d.items() if k in keys})
 
 
@@ -86,7 +96,7 @@ class Analysis:
 VideoReport = Analysis  # the CLI's report is the analysis plus render timings
 
 
-CACHE_PARTS = ("clips", "photos", "media", "export", "tmp", "match")  # all cache_root ever holds
+CACHE_PARTS = ("clips", "photos", "media", "export", "tmp", "match", "audio")  # all cache_root ever holds
 
 
 def cache_root() -> Path:
@@ -153,29 +163,39 @@ def default_cache_root() -> Path:
     return Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "epochcolor"
 
 
-def cache_key(path: Path, s: VideoSettings, model_name: str, weights: str | None) -> str:
+def cache_key(path: Path, s: VideoSettings, model_name: str, weights: str | None,
+              negative: dict | None = None) -> str:
     st = path.stat()
     ident = {
         "src": str(path.resolve()), "size": st.st_size, "mtime": st.st_mtime_ns,
         "ws": s.working_size, "dn": s.denoise, "frames": s.frames,
         "model": model_name, "weights": str(weights or ""), "cs": s.chroma_size, "v": 2,
     }
+    # what the model sees; only added when on, so caches from before stay valid
+    if s.deflicker:
+        ident["dfl"] = round(float(s.deflicker), 3)
+    if s.dust:
+        ident["dust"] = True
+    if negative:
+        ident["neg"] = {k: v for k, v in sorted(negative.items())}
     return hashlib.sha256(json.dumps(ident, sort_keys=True).encode()).hexdigest()[:20]
 
 
-def analysis_dir(path: Path, s: VideoSettings, model_name: str, weights: str | None = None) -> Path:
-    """weights: the model's cache id; None looks up the installed model's."""
+def analysis_dir(path: Path, s: VideoSettings, model_name: str, weights: str | None = None,
+                 negative: dict | None = None) -> Path:
+    """weights: the model's cache id; None looks up the installed model's.
+    negative: the clip's negative inversion, when it's a negative."""
     if weights is None:
         from ..models import cache_id_for
 
         weights = cache_id_for(model_name)
-    return cache_root() / "clips" / cache_key(Path(path), s, model_name, weights)
+    return cache_root() / "clips" / cache_key(Path(path), s, model_name, weights, negative)
 
 
 def finished_analysis(path: Path, s: VideoSettings, model_name: str,
-                      weights: str | None = None) -> Path | None:
+                      weights: str | None = None, negative: dict | None = None) -> Path | None:
     """The cache folder if this clip is fully analysed with these settings."""
-    d = analysis_dir(path, s, model_name, weights)
+    d = analysis_dir(path, s, model_name, weights, negative)
     m = d / "meta.json"
     if not m.exists() or not (d / "ab.npy").exists():
         return None
@@ -253,26 +273,37 @@ def working_size(w: int, h: int, short: int) -> tuple[int, int]:
 # ------------------------------------------------------------- analysis
 
 
-def wanted_stab(shots, strength: float, hints: dict | None) -> dict[str, str]:
+def shot_reference(references: dict | None, a: int, b: int) -> dict | None:
+    """The reference image set on the shot starting at a, if any."""
+    if not references:
+        return None
+    r = references.get(str(a)) or references.get(a) or references.get("*")  # "*": every shot
+    return r if r and r.get("path") else None
+
+
+def wanted_stab(shots, strength: float, hints: dict | None, references: dict | None = None) -> dict[str, str]:
     """What each shot's stabilized chroma has to have been made from: the
-    stabilizer strength and the hints painted in that shot. A shot whose id
-    changes is redone; the rest stay as they are."""
+    stabilizer strength, the hints painted in that shot and its reference
+    image. A shot whose id changes is redone; the rest stay as they are."""
     from ..hintpaint import hints_in, strokes_key
+    from ..reference import reference_id
 
     out = {}
     for a, b in shots:
         h = hints_in(hints, a, b)
-        out[f"{a}-{b}"] = f"{strength}:{strokes_key(h) if h else '-'}"
+        rid = reference_id(shot_reference(references, a, b))
+        out[f"{a}-{b}"] = f"{strength}:{strokes_key(h) if h else '-'}" + (f":ref{rid}" if rid else "")
     return out
 
 
 def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
             shots: list[tuple[int, int]] | None = None, use_cache: bool = True,
             quiet: bool = False, progress: ProgressFn | None = None,
-            hints: dict | None = None) -> Analysis:
+            hints: dict | None = None, references: dict | None = None) -> Analysis:
     """Run passes 1 to 4 on a clip. shots, when given, replace detection
     (the GUI passes the shots the user sees and may have edited). hints:
-    painted strokes, {clip frame: [stroke, ...]}.
+    painted strokes, {clip frame: [stroke, ...]}. references: reference
+    images per shot, {str(shot start): {"path", "strength"}}.
 
     What stays on disk is kept small, since a feature has ~130,000 frames:
     chroma at chroma_size (256 px short side by default, which is the
@@ -285,7 +316,8 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
     W, H = info.width, info.height
     ww, wh = working_size(W, H, s.working_size)
     cw, ch = working_size(W, H, min(s.working_size, s.chroma_size))
-    cdir = analysis_dir(info.path, s, model.info.name, getattr(model, "cache_id", None))
+    neg = getattr(info, "negative", None)
+    cdir = analysis_dir(info.path, s, model.info.name, getattr(model, "cache_id", None), neg)
     cdir.mkdir(parents=True, exist_ok=True)
     rep = Analysis(cdir, working=(ww, wh))
     if info.interlaced:
@@ -300,14 +332,17 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
         """Pass 1: only the cut scores and the noise sample are kept."""
         from .temporal import cut_score
 
+        from ..film import frame_stats, invert
+
         prog = _Progress("decode", s.frames or info.frames_estimate, quiet, progress)
         mid = max(0, (s.frames or info.frames_estimate) // 2)
-        scores, prev_t, sample = [], None, None
+        scores, prev_t, sample, lstats = [], None, None, []
         n = 0
         for g in iter_gray(info.path, (ww, wh), s.frames):
-            Lf = srgb_to_l(g)
+            Lf = srgb_to_l(invert(g, neg) if neg else g)
             t = thumb(Lf)
             scores.append(0.0 if prev_t is None else cut_score(prev_t, t))
+            lstats.append([round(v, 3) for v in frame_stats(t)])
             prev_t = t
             if n <= mid:
                 sample = Lf  # ends up as the middle frame, or the last if the clip is shorter
@@ -317,13 +352,13 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
         rep.timings["decode"] = prog.done()
         if n == 0:
             raise RuntimeError("no frames decoded")
-        meta.update({"frames": n, "scores": scores, "model_done": [],
+        meta.update({"frames": n, "scores": scores, "model_done": [], "lstats": lstats,
                      "sigma": float(estimate_noise(sample)), "decoded": True})
         meta_path.write_text(json.dumps(meta))
         return n
 
     # ---------------------------------------------- 1. decode at working size
-    if not meta.get("scores") or "sigma" not in meta:
+    if not meta.get("scores") or "sigma" not in meta or "lstats" not in meta:
         decode()
     n = meta["frames"]
     scores = np.asarray(meta["scores"], np.float32)
@@ -363,17 +398,34 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
     total = sum(b - a for a, b in todo)
     prog = _Progress("model", total, quiet, progress)
     count = 0
-    frames = _LumaStream(info, (ww, wh)) if todo else None
+    frames = _LumaStream(info, (ww, wh), neg) if todo else None
+    if todo and s.deflicker:
+        from ..film import deflicker, deflicker_targets
+
+        lstats = np.asarray(meta["lstats"], np.float32)
+        targets = deflicker_targets(lstats, shots, float(info.fps))
+
+        def fetch(t):  # the model's copy, brightness steadied
+            return deflicker(frames.get(t), lstats[t], targets[t], float(s.deflicker))
+    else:
+        def fetch(t):
+            return frames.get(t)
+    dust_thr = max(8.0, 4.0 * sigma)
     try:
         for a, b in todo:
-            cur = frames.get(a)
+            cur = fetch(a)
             prev = None
             for t in range(a, b):
-                nxt = frames.get(t + 1) if t + 1 < b else None
+                nxt = fetch(t + 1) if t + 1 < b else None
+                src = cur
+                if s.dust:
+                    from ..film import remove_dust
+
+                    src, _ = remove_dust(cur, prev, nxt, flow, dust_thr)
                 if s.denoise == 0:
-                    dn = cur
+                    dn = src
                 else:
-                    dn = temporal_denoise(prev, cur, nxt, flow, sigma)
+                    dn = temporal_denoise(prev, src, nxt, flow, sigma)
                     # light spatial pass for whatever the neighbours did not cover
                     dn = denoise_l(dn, None if s.denoise is None else s.denoise * 0.5)
                 ab_w = model.predict(dn, None)
@@ -393,7 +445,7 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
     rep.timings["model"] = prog.done() if todo else 0.0
 
     # ------------------------------------- 4. hints, then stabilize chroma
-    want = wanted_stab(shots, s.stabilize, hints)
+    want = wanted_stab(shots, s.stabilize, hints, references)
     have = meta.get("stab") if isinstance(meta.get("stab"), dict) else {}
     ab_path = cdir / "ab.npy"
     redo = [(a, b) for a, b in shots if have.get(f"{a}-{b}") != want[f"{a}-{b}"] or not ab_path.exists()]
@@ -412,6 +464,7 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
     from .hints_pass import carry, keyframe_fix
 
     tol = max(2.0, 3.0 * sigma)
+    ref_cache: dict = {}  # a reference's features, kept between its shots and keyframes
     total = sum(b - a for a, b in redo)
     prog = _Progress("stabilize", total, quiet, progress)
     count = 0
@@ -419,8 +472,12 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
     for a, b in redo:
         src = _Slice(ab_raw, a, b)
         shot_hints = hints_in(hints, a, b)
-        if shot_hints:
-            key = strokes_key(shot_hints)
+        ref = shot_reference(references, a, b)
+        if shot_hints or ref:
+            from ..reference import reference_id
+
+            rid = reference_id(ref)
+            key = strokes_key(shot_hints) + (f"r{rid}" if rid else "")
             hpath = cdir / f"hint_{a}_{b}_{key}.npy"
             ppath = cdir / f"protect_{a}_{b}_{key}.npy"  # where frame-limited fixes are, see carry()
             for old in list(cdir.glob(f"hint_{a}_{b}_*.npy")) + list(cdir.glob(f"protect_{a}_{b}_*.npy")):
@@ -442,10 +499,24 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
                                 T, W = z["T"], z["W"]
                         else:
                             T, W = keyframe_fix(model, info.path, info.fps, f, group, (ww, wh), (cw, ch),
-                                                np.asarray(ab_raw[f], np.float32), s.denoise)
+                                                np.asarray(ab_raw[f], np.float32), s.denoise, negative=neg)
                             np.savez(kf, T=T.astype(np.float16), W=W.astype(np.float16))
                         keys.append((f, np.asarray(T, np.float32), np.asarray(W, np.float32), reach))
-                for old_kf in cdir.glob("kf_*.npz"):
+                if ref:
+                    from ..reference import keyframes, reference_fix
+
+                    for f in keyframes(a, b):
+                        kf = cdir / f"kfref_{f}_{rid}.npz"
+                        used.add(kf.name)
+                        if kf.exists():
+                            with np.load(kf) as z:
+                                T, W = z["T"], z["W"]
+                        else:
+                            Lw = _working_frame(info, f, (ww, wh), neg, s.denoise)
+                            T, W = reference_fix(model, Lw, ref, (cw, ch), cache=ref_cache)
+                            np.savez(kf, T=T.astype(np.float16), W=W.astype(np.float16))
+                        keys.append((f, np.asarray(T, np.float32), np.asarray(W, np.float32), -1))
+                for old_kf in list(cdir.glob("kf_*.npz")) + list(cdir.glob("kfref_*.npz")):
                     try:
                         fr = int(old_kf.name.split("_")[1])
                     except (IndexError, ValueError):
@@ -502,15 +573,30 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
     return rep
 
 
+def _working_frame(info: ClipInfo, f: int, size: tuple[int, int], negative, denoise) -> np.ndarray:
+    """One frame's L* at working size, denoised like the model's copy."""
+    from ..film import invert
+    from ..media import FrameReader
+
+    r = FrameReader(info.path, info.fps, "gray16le", size=size, cache=2)
+    try:
+        g = r.get(f)
+    finally:
+        r.close()
+    if g is None:
+        raise RuntimeError(f"{Path(info.path).name}: frame {f} could not be decoded")
+    return denoise_l(srgb_to_l(invert(g, negative)), denoise)
+
+
 class _LumaStream:
     """Frames of a clip at working size as L*, read in order. Jumps (to the
     next shot still to do) seek; everything else decodes straight on. Only
     the frames in hand are in memory."""
 
-    def __init__(self, info: ClipInfo, size: tuple[int, int]):
+    def __init__(self, info: ClipInfo, size: tuple[int, int], negative: dict | None = None):
         from ..media import FrameReader
 
-        self.info, self.size = info, size
+        self.info, self.size, self.negative = info, size, negative
         self.r = FrameReader(info.path, info.fps, "gray16le", size=size, cache=3)
         self.fallback = None  # counting decoder, for files whose timestamps don't seek
 
@@ -518,7 +604,9 @@ class _LumaStream:
         if self.fallback is None:
             g = self.r.get(t)
             if g is not None:
-                return srgb_to_l(g.astype(np.float32) / 65535.0)
+                from ..film import invert
+
+                return srgb_to_l(invert(g, self.negative))
             self.fallback = [iter_gray(self.info.path, self.size), 0]
         it, pos = self.fallback
         if t < pos:
@@ -527,7 +615,9 @@ class _LumaStream:
             pos += 1
             if pos - 1 == t:
                 self.fallback = [it, pos]
-                return srgb_to_l(g)
+                from ..film import invert
+
+                return srgb_to_l(invert(g, self.negative) if self.negative else g)
         raise RuntimeError(f"{Path(self.info.path).name}: frame {t} could not be decoded")
 
     def close(self) -> None:
@@ -554,6 +644,7 @@ class Piece:
     src_in: int
     src_out: int
     clip_id: str = ""
+    negative: dict | None = None  # the clip's negative inversion, when it's a negative
 
     @property
     def length(self) -> int:
@@ -568,12 +659,14 @@ class FrameRenderer:
         self.eps: float | None = None
         self.g = float(np.clip(s.grain, 0.0, 100.0)) / 100.0
 
-    def __call__(self, gray: np.ndarray, ab_small: np.ndarray, bias: np.ndarray | None = None) -> np.ndarray:
+    def __call__(self, gray: np.ndarray, ab_small: np.ndarray, bias: np.ndarray | None = None,
+                 L: np.ndarray | None = None) -> np.ndarray:
         """gray: float 0..1 HxW. bias: the shot's colour cast (chroma.ShotCasts).
+        L: the luma already restored (OutputRestore), used instead of gray's.
         Returns sRGB float HxWx3."""
         from ..chroma import adjust
 
-        Lfull = srgb_to_l(gray)
+        Lfull = srgb_to_l(gray) if L is None else L
         if self.eps is None:
             self.eps = float(np.clip((2.0 * estimate_noise(Lfull)) ** 2, 1.0, 100.0))
         ab = adjust(ab_small, self.s.saturation, self.s.cast, bias)
@@ -582,9 +675,87 @@ class FrameRenderer:
         else:
             import cv2
 
-            abf = cv2.resize(ab, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_CUBIC)
+            abf = cv2.resize(ab, (Lfull.shape[1], Lfull.shape[0]), interpolation=cv2.INTER_CUBIC)
         Lout = Lfull if self.g >= 1.0 else self.g * Lfull + (1 - self.g) * denoise_l(Lfull, self.s.denoise)
         return lab_to_srgb(Lout, abf)
+
+
+class OutputRestore:
+    """Deflicker and dust on the output picture, when switched on. Works on
+    full-size L*, with the frame statistics from the clip's analysis and
+    optical flow at working size scaled up."""
+
+    def __init__(self, analysis: Path, s: VideoSettings, fps, size: tuple[int, int]):
+        self.s = s
+        self.on = bool(s.deflicker_out or s.dust_out)
+        self.stats = self.targets = None
+        self.shots: list[tuple[int, int]] = []
+        try:
+            meta = json.loads((Path(analysis) / "meta.json").read_text())
+        except (OSError, ValueError):
+            meta = {}
+        self.shots = sorted(tuple(int(v) for v in k.split("-")) for k in (meta.get("stab") or {}))
+        self.sigma = float(meta.get("sigma", 0.0))
+        if s.deflicker_out and meta.get("lstats"):
+            from ..film import deflicker_targets
+
+            self.stats = np.asarray(meta["lstats"], np.float32)
+            self.targets = deflicker_targets(self.stats, self.shots or [(0, len(self.stats))], float(fps))
+        self.work = working_size(size[0], size[1], s.working_size)
+        self.flow = Flow(s.flow_preset) if s.dust_out else None
+
+    def same_shot(self, a: int, b: int) -> bool:
+        for x, y in self.shots:
+            if x <= a < y:
+                return x <= b < y
+        return True
+
+    def _deflicker(self, f: int, L: np.ndarray) -> np.ndarray:
+        if self.targets is None or f >= len(self.targets):
+            return L
+        from ..film import deflicker
+
+        return deflicker(L, self.stats[f], self.targets[f], 1.0)
+
+    def __call__(self, f: int, L: np.ndarray, prev: np.ndarray | None = None,
+                 nxt: np.ndarray | None = None) -> np.ndarray:
+        """Restored L for frame f. prev and nxt: neighbours' L (unrestored)."""
+        if not self.on:
+            return L
+        L = self._deflicker(f, L)
+        if self.flow is not None and prev is not None and nxt is not None \
+                and self.same_shot(f, f - 1) and self.same_shot(f, f + 1):
+            import cv2
+
+            from ..film import remove_dust, scaled_flow
+
+            prev, nxt = self._deflicker(f - 1, prev), self._deflicker(f + 1, nxt)
+            small = [cv2.resize(x, self.work, interpolation=cv2.INTER_AREA) for x in (L, prev, nxt)]
+            Fp = scaled_flow(self.flow, small[0], small[1], L.shape)
+            Fn = scaled_flow(self.flow, small[0], small[2], L.shape)
+            L, _ = remove_dust(L, prev, nxt, None, max(8.0, 4.0 * self.sigma), flows=(Fp, Fn))
+        return L
+
+
+def regrain_seed(clip_id: str, frame: int) -> int:
+    import zlib
+
+    return (zlib.crc32(clip_id.encode()) + frame * 7919) & 0x7FFFFFFF
+
+
+def finish(rgb: np.ndarray, s: VideoSettings, grades, clip_id: str, f: int) -> np.ndarray:
+    """After colorizing: the grade, then regrain. Shared by export and the preview's still."""
+    if grades is not None:
+        from ..grade import apply as grade_apply
+
+        g = grades.at(clip_id, f)
+        if g is not None:
+            rgb = grade_apply(rgb, g, grades.mask_offset(clip_id, f))
+    if s.regrain:
+        from ..film import regrain
+
+        rgb = regrain(rgb, s.regrain, s.regrain_size, s.regrain_chroma, regrain_seed(clip_id, f))
+    return rgb
 
 
 def render(pieces: list[Piece], plan: ExportPlan, out: str | Path, s: VideoSettings,
@@ -616,19 +787,34 @@ def render(pieces: list[Piece], plan: ExportPlan, out: str | Path, s: VideoSetti
                 from ..chroma import ShotCasts
 
                 casts = ShotCasts(p.analysis, ab)
-            for i, g16 in enumerate(iter_range(p.path, p.fps, p.src_in, p.src_out)):
-                gray = g16.astype(np.float32) / 65535.0
-                rgb = rend(gray, ab[p.src_in + i], casts.at(p.src_in + i) if casts else None)
-                if grades is not None:
-                    from ..grade import apply as grade_apply
+            from ..film import invert
 
-                    f = p.src_in + i
-                    g = grades.at(p.clip_id, f)
-                    if g is not None:
-                        rgb = grade_apply(rgb, g, grades.mask_offset(p.clip_id, f))
-                writer.write(quantize(rgb, 16))
+            restore = OutputRestore(p.analysis, s, p.fps, (p.width, p.height))
+            ahead = restore.flow is not None  # dust removal needs the frame after too
+            lo = max(0, p.src_in - 1) if ahead else p.src_in
+            hi = min(p.src_out + 1, len(ab)) if ahead else p.src_out
+            frames = ((lo + k, srgb_to_l(invert(g16, p.negative)))
+                      for k, g16 in enumerate(iter_range(p.path, p.fps, lo, hi)))
+
+            def out(f, L, prev, nxt):
+                nonlocal done
+                L = restore(f, L, prev, nxt)
+                rgb = rend(None, ab[f], casts.at(f) if casts else None, L=L)
+                writer.write(quantize(finish(rgb, s, grades, p.clip_id, f), 16))
                 done += 1
                 prog(done)
+
+            if not ahead:
+                for f, L in frames:
+                    out(f, L, None, None)
+            else:
+                before = here = None
+                for f, L in frames:
+                    if here is not None and p.src_in <= here[0] < p.src_out:
+                        out(here[0], here[1], before[1] if before else None, L)
+                    before, here = here, (f, L)
+                if here is not None and p.src_in <= here[0] < p.src_out:
+                    out(here[0], here[1], before[1] if before else None, None)
             del ab
         timings["render"] = prog.done()
         if plan.two_pass:
@@ -652,11 +838,14 @@ def render(pieces: list[Piece], plan: ExportPlan, out: str | Path, s: VideoSetti
 
 def colorize_video(info: ClipInfo, model: ColorModel, out: str | Path, plan: ExportPlan,
                    s: VideoSettings | None = None, use_cache: bool = True,
-                   quiet: bool = False) -> Analysis:
-    """Analyse one clip and render all of it: what the CLI does."""
+                   quiet: bool = False, reference: dict | None = None) -> Analysis:
+    """Analyse one clip and render all of it: what the CLI does. reference:
+    one reference image for every shot."""
     s = s or VideoSettings()
-    rep = analyze(info, model, s, use_cache=use_cache, quiet=quiet)
-    piece = Piece(info.path, info.fps, info.width, info.height, rep.dir, 0, rep.frames)
+    rep = analyze(info, model, s, use_cache=use_cache, quiet=quiet,
+                  references={"*": reference} if reference else None)
+    piece = Piece(info.path, info.fps, info.width, info.height, rep.dir, 0, rep.frames, "clip",
+                  getattr(info, "negative", None))
     rep.timings.update(render([piece], plan, out, s, audio_source=(info.path, info.start_time),
                               frames_limit=rep.frames if s.frames else None, quiet=quiet))
     return rep

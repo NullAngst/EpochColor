@@ -221,3 +221,41 @@ def test_catalog_has_deoldify_with_full_hashes():
         e = ids[mid]
         assert e["architecture"] == "deoldify" and len(e["source"]["sha256"]) == 64
         assert M.validate_entry(e) == []
+
+
+class Boom:
+    """Pickles to a call of os.system: what a hostile weights file does."""
+
+    def __reduce__(self):
+        import os
+
+        return (os.system, ("touch PWNED",))
+
+
+@pytest.mark.parametrize("legacy", [True, False])
+def test_old_checkpoints_with_training_leftovers_load_safely(tmp_path, monkeypatch, legacy):
+    """DeOldify's files hold fastai leftovers (slice, functools.partial, the
+    optimizer class) beside the weights; PyTorch's safe loader refuses them.
+    The fallback keeps the weights and turns everything else inert, so the
+    planted os.system call never runs."""
+    import functools
+
+    from epochcolor.models.weights import Inert, load_state_dict
+
+    monkeypatch.chdir(tmp_path)
+    sd = {"layers.0.weight": torch.randn(3, 3), "layers.0.bias": torch.zeros(3)}
+    blob = {"model": sd, "opt": {"opt_func": functools.partial(torch.optim.Adam, betas=(0.9, 0.99)),
+                                 "lr": slice(1e-3, 1e-2), "evil": Boom()}}
+    f = tmp_path / "gen.pth"
+    torch.save(blob, f, _use_new_zipfile_serialization=not legacy)
+    got = load_state_dict(f)
+    assert set(got) == set(sd) and torch.equal(got["layers.0.weight"], sd["layers.0.weight"])
+    assert not (tmp_path / "PWNED").exists(), "nothing from the pickle ran"
+    # and what came back for the leftovers is inert
+    import pickle
+
+    raw = torch.load(str(f), map_location="cpu", weights_only=False,
+                     pickle_module=__import__("epochcolor.models.weights", fromlist=["x"])._inert_pickle())
+    assert isinstance(raw["opt"]["evil"], Inert) and isinstance(raw["opt"]["opt_func"], Inert)
+    assert raw["opt"]["lr"] == slice(1e-3, 1e-2)
+    assert not (tmp_path / "PWNED").exists()

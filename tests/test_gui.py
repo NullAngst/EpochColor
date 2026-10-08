@@ -403,3 +403,95 @@ def test_frame_by_frame_painting_and_cast(tmp_path, window):
     pump(app, 1.0)
     assert not w.runner.busy()
     assert got["raw"].pixelColor(300, 20) != before
+
+
+def test_negative_reference_frame_export_and_audio(tmp_path, window):
+    import cv2
+
+    from epochcolor.gui.audio import mix_command
+    from epochcolor.timeline_export import clip_info
+    from epochcolor.video.pipeline import VideoSettings, analyze
+
+    app, w = window
+    truth = make_clip(tmp_path / "a.mkv")
+    w.add_clips([str(tmp_path / "a.mkv")])
+    wait(app, w)
+    p = w.project
+    c = next(iter(p.d.clips.values()))
+    s = VideoSettings.from_project(p.d.settings)
+    assert s.deflicker == 1.0 and s.dust, "a new project cleans the model's copy"
+    analyze(clip_info(c), Oracle(truth), s, shots=c.shots, quiet=True)
+    w._refresh()
+    assert w.status[c.id] == "ready"
+
+    # a reference image on the shot goes in through the hint pass
+    w.seek(10)
+    ref = tmp_path / "ref.png"
+    img = np.zeros((90, 160, 3), np.uint8)
+    img[:] = (60, 120, 200)
+    cv2.imwrite(str(ref), img)
+    w._set_reference(w._target_object(), {"path": str(ref), "strength": 0.8})
+    assert p.reference_at(c.id, 10)["strength"] == 0.8
+    assert "ref.png" in w.inspector.ref_label.text()
+    wait(app, w)
+    w._refresh()
+    assert w.status[c.id] == "ready"
+    w.clear_reference()
+    wait(app, w)
+
+    # export the frame under the playhead, as export renders it
+    out = tmp_path / "frame.png"
+    w.runner.submit("export_frame", "frame", {**w._job_payload(), "project": __import__("dataclasses").asdict(p.d),
+                                              "clip": c.id, "frame": 10, "out": str(out)})
+    wait(app, w)
+    got = cv2.imread(str(out), cv2.IMREAD_UNCHANGED)
+    assert got is not None and got.shape[:2] == (180, 320) and got.dtype == np.uint16
+
+    # the timeline's sound mixes to a WAV for playback
+    wav = tmp_path / "mix.wav"
+    import subprocess
+
+    subprocess.run(mix_command(p, wav), check=True)
+    import av
+
+    with av.open(str(wav)) as cont:
+        a = cont.streams.audio[0]
+        assert a.rate == 48000 and a.channels == 2
+        assert abs(float(cont.duration / 1e6) - c.frames / 24) < 0.1
+    p.d.audio_enabled = [False] * len(p.d.audio_enabled)
+    assert mix_command(p, wav) is None, "nothing enabled, nothing to play"
+
+    # marking a negative measures it in the worker and inverts what the model sees
+    w.inspector.negative.setChecked(True)
+    w._negative_toggled(True)
+    wait(app, w)
+    assert c.negative and c.neg and "base" in c.neg
+    w._refresh()
+    assert w.status[c.id] == "none", "a negative is a different picture: colorize again"
+    w._negative_toggled(False)
+    assert not c.negative and c.negative_params, "turning it off keeps the measured numbers"
+
+
+def test_autosave_recovers(tmp_path, monkeypatch):
+    from epochcolor import autosave
+    from epochcolor.project import Project
+
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    proj = Project()
+    proj.path = tmp_path / "film.epochcolor"
+    proj.save()
+    proj.set_setting("cast", 0.5)  # an unsaved change
+    autosave.write(proj)
+    found = autosave.find(proj.path)
+    assert found
+    back = autosave.recover(found[0], proj.path)
+    assert back.d.settings["cast"] == 0.5 and back.dirty and back.path == proj.path
+    proj.save()  # saved afterwards: nothing left to recover
+    import os
+    import time
+
+    later = time.time() + 5
+    os.utime(proj.path, (later, later))
+    assert autosave.find(proj.path) is None
+    autosave.clear(proj.path)
+    assert not autosave.path_for(proj.path).exists()

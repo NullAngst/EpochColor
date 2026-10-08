@@ -48,6 +48,12 @@ class Clip:
     audio: list[AudioInfo] = field(default_factory=list)
     shots: list[list[int]] = field(default_factory=list)  # [start, end) in clip frames
     negative: bool = False
+    negative_params: dict | None = None  # film.measure_negative's numbers, maybe adjusted by hand
+
+    @property
+    def neg(self) -> dict | None:
+        """The inversion to use, or None when this isn't a negative."""
+        return self.negative_params if self.negative and self.negative_params else None
 
     @property
     def fps(self) -> Fraction:
@@ -82,6 +88,12 @@ class Photo:
     negative: bool = False
     strokes: list = field(default_factory=list)  # painted hints, see hintpaint.py
     grade: dict | None = None
+    negative_params: dict | None = None
+    reference: dict | None = None  # {"path": colour photo, "strength": 0..1}, see reference.py
+
+    @property
+    def neg(self) -> dict | None:
+        return self.negative_params if self.negative and self.negative_params else None
 
 
 def default_settings() -> dict:
@@ -97,7 +109,24 @@ def default_settings() -> dict:
         "chroma_size": 256,
         "match_mode": "ask",  # saved colours: "ask" marks matches, "auto" paints them
         "match_threshold": 0.75,
+        # film restoration (film.py). Off here so projects saved before keep
+        # their caches; new projects switch the model-copy cleanup on.
+        "deflicker": 0.0,
+        "dust": False,
+        "deflicker_out": False,
+        "dust_out": False,
+        "regrain": 0.0,
+        "regrain_size": 1.0,
+        "regrain_chroma": 0.0,
     }
+
+
+def new_project_settings() -> dict:
+    """Defaults for a project started now: the model sees a deflickered,
+    dust-free copy. The output stays as filmed unless asked."""
+    s = default_settings()
+    s.update({"deflicker": 1.0, "dust": True})
+    return s
 
 
 @dataclass
@@ -108,12 +137,13 @@ class ProjectData:
     markers: list[Marker] = field(default_factory=list)
     range: list[int] | None = None  # [in, out) on the timeline
     photos: list[Photo] = field(default_factory=list)
-    settings: dict = field(default_factory=default_settings)
+    settings: dict = field(default_factory=new_project_settings)
     export: dict = field(default_factory=dict)
     hints: dict = field(default_factory=dict)  # clip id -> {str(clip frame): [stroke, ...]}
     colors: list = field(default_factory=list)  # saved colours
     suggestions: list = field(default_factory=list)  # saved-colour matches waiting for a click
     grades: dict = field(default_factory=dict)  # clip id -> {str(shot start): track}
+    references: dict = field(default_factory=dict)  # clip id -> {str(shot start): {"path", "strength"}}
 
 
 class Project:
@@ -536,6 +566,35 @@ class Project:
         else:
             g.pop(key, None)
 
+    # ------------------------------------------------- references, negatives
+
+    def reference_at(self, clip_id: str, frame: int) -> dict | None:
+        return self.d.references.get(clip_id, {}).get(str(self.shot_start(clip_id, frame)))
+
+    def set_reference(self, clip_id: str, frame: int, ref: dict | None) -> None:
+        """Set or clear the reference image of the shot that holds frame."""
+        self.checkpoint("reference image" if ref else "clear reference image")
+        r = self.d.references.setdefault(clip_id, {})
+        key = str(self.shot_start(clip_id, frame))
+        if ref:
+            r[key] = dict(ref)
+        else:
+            r.pop(key, None)
+            if not r:
+                self.d.references.pop(clip_id, None)
+
+    def set_photo_reference(self, photo_id: str, ref: dict | None) -> None:
+        self.checkpoint("reference image" if ref else "clear reference image")
+        self.photo(photo_id).reference = dict(ref) if ref else None
+
+    def set_negative(self, kind: str, ident: str, on: bool, params: dict | None = None) -> None:
+        """Mark a clip or photo as a negative (or not), with its inversion numbers."""
+        self.checkpoint("negative" if on else "not a negative")
+        obj = self.d.clips[ident] if kind == "clip" else self.photo(ident)
+        obj.negative = bool(on)
+        if params is not None:
+            obj.negative_params = dict(params)
+
     def set_photo_grade(self, photo_id: str, grade: dict | None, label: str = "grade",
                         checkpoint: bool = True) -> None:
         if checkpoint:
@@ -598,4 +657,5 @@ def _data_from_dict(d: dict) -> ProjectData:
         colors=list(d.get("colors", [])),
         suggestions=list(d.get("suggestions", [])),
         grades=dict(d.get("grades", {})),
+        references=dict(d.get("references", {})),
     )

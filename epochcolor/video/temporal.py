@@ -72,13 +72,19 @@ class Flow:
              "medium": cv2.DISOPTICAL_FLOW_PRESET_MEDIUM,
              "ultrafast": cv2.DISOPTICAL_FLOW_PRESET_ULTRAFAST}[preset]
         self.dis = cv2.DISOpticalFlow_create(p)
+        self._memo: list = []  # the last few (a, b, F): dust removal and the denoise ask for the same pairs
 
     @staticmethod
     def _u8(L: np.ndarray) -> np.ndarray:
         return np.clip(L * 2.55, 0, 255).astype(np.uint8)
 
     def __call__(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        return self.dis.calc(self._u8(a), self._u8(b), None)
+        for ma, mb, F in self._memo:
+            if ma is a and mb is b:  # the very same arrays, held here so they can't be recycled
+                return F
+        F = self.dis.calc(self._u8(a), self._u8(b), None)
+        self._memo = (self._memo + [(a, b, F)])[-4:]
+        return F
 
 
 def warp(img: np.ndarray, flow: np.ndarray) -> np.ndarray:

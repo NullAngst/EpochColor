@@ -2,7 +2,7 @@
 
 EpochColor colorizes black and white photos and film footage while keeping the original grain and detail exactly as they were. It's for one person working through an archive on a Linux desktop, with or without a GPU.
 
-**Where it's at:** the editor with a before/after viewer, a timeline for multiple clips, painted colour hints that follow objects through a shot or stay on one frame, saved colours with picture matches, colour cast removal, per-shot grading with keyframes and scopes, a model manager with newer models, and the full export matrix. Still to come: negative inversion, regrain and deflicker, the Flatpak, and Windows.
+**Where it's at:** the editor with a before/after viewer, a timeline for multiple clips, painted colour hints that follow objects through a shot or stay on one frame, saved colours with picture matches, reference images, colour cast removal, black and white negatives, deflicker, dust removal and regrain, per-shot grading with keyframes and scopes, sound while playing, autosave, a model manager with newer models, and the full export matrix. Still to come: the Flatpak, and Windows.
 
 ## Download and run
 
@@ -144,6 +144,23 @@ Photos work the same way: paint in the viewer with the Photos tab open.
 
 "Use every match straight away" skips the asking, at the cost of sometimes painting the wrong thing. Matching compares what the model's own features say about the stroke's object with every other place, at the moment you ask; nothing gets trained. It needs a network model (any of them; the `hints` model has no features). It finds the same object well and look-alikes too, which is why it asks by default.
 
+**Reference images.** Got a colour photo of the same street, the same kind of uniform, a period postcard, an Autochrome from the era? Put the playhead on the shot, click Reference image in the Inspector and pick it. Every part of the frame gets matched against every part of the photo by what the model's own features say it is (sky, brick, skin, leaves) and how bright it is, and takes the colour of its closest matches. Where nothing in the photo looks like it, the model's own colour stays. Strength sets how much the photo wins. It goes in through the hint pass like a painted stroke, matched every couple of seconds through the shot and carried along the motion between, so painted strokes still win where you put them. Each shot has its own reference; photos take one each too. It needs a network model, since the `hints` model has no features.
+
+**Negatives.** Scanned or camera-copied black and white negatives go straight in. Tick Negative in the Inspector for the clip under the playhead or the photo you picked. EpochColor measures the film base (the clearest part of the film, usually the rebate along the edge; for a tightly cropped scan, the clearest part of the picture) and the density range, then inverts by density, which is how a print would have come out. Levels opens the numbers: film base, shadow and highlight density, contrast, with the picture updating as you drag. It runs before everything else, so the model, the proxy view and the export all see the positive. RAW copies give the best result, since inversion stretches the tones and 8-bit JPEGs band. Colour negatives are out of scope: darktable's negadoctor handles their orange mask far better than this would.
+
+**Film cleanup.** The Film box in the Inspector:
+
+- Deflicker. Old film pulses in brightness frame to frame, and a model reads those pulses as colour changes. Deflicker steadies each frame's brightness range toward a smoothed version over about half a second, per shot, so fades and real lighting changes survive.
+- Remove dust. A speck of dirt sits on one frame only. Where a frame differs sharply from both its motion-compensated neighbours, the same way, while they agree with each other, it's dirt and gets their average. Vertical scratches that run through many frames aren't caught; that needs a different method.
+- Both run on the model's copy by default in a new project, which is the safe use: the output keeps every bit of the original luma, and the model stops getting fooled. Tick them under Output too to clean the picture itself. That changes the luma, so it's off by default, and it shows on the paused full-size frame and in the export.
+- Regrain adds synthetic grain after grading, strongest in the mid tones, for footage cleaned hard (grain kept below 100%) or matched to a look. Size scales with the frame. Colour adds a faint colour grain like a colour film stock. Same frame, same grain, so re-renders match.
+
+**Sound.** Playback plays the enabled audio tracks of the edited timeline, cuts and all. The mix gets built in the background a moment after an edit; until then playback is silent. Shuttling faster than 1x is silent. Playback > Play sound switches it off.
+
+**Autosave.** Every minute and a half, a project with unsaved changes is written to a side file in `~/.local/state/epochcolor/autosave`, never over your project file. If EpochColor or the machine goes down, opening the project (or starting EpochColor, for one that was never saved) offers to bring the changes back.
+
+**Stills.** File > Export current frame (Ctrl+Alt+E) writes the frame under the playhead at full size as 16-bit PNG or TIFF, or JPEG, through exactly what the video export does: inversion, cleanup, colour, grade, regrain.
+
 **Grading.** The Grade panel (a tab next to the Inspector) grades the shot under the playhead, or the photo you picked. In order of how it's applied:
 
 - white balance: temperature and tint, or Pick neutral and click something that should be grey
@@ -161,7 +178,7 @@ A shot's grade is static until you press Add key. With two or more keys the valu
 
 **Models.** Colour > Model manager lists the catalog: three DeOldify generators, four DDColor variants and the two Zhang models. Find more models says where to look for others and which kinds load. It downloads with progress and resume, checks every file's SHA-256 before keeping it, and asks you to accept a license before downloading anything whose terms aren't plainly open. Add from file takes your own weights for an architecture EpochColor knows (DeOldify, DDColor, or either Zhang model) plus a small JSON manifest; it test-loads them before keeping them. Storage folder moves everything somewhere with room. The catalog refreshes from this repo's `catalog.json`, so a new set of weights for a known architecture shows up without an app update.
 
-**Settings.** The Inspector's Colour box holds the project settings. Model, working size and denoise change what the model sees, so they need a new colorize pass, and the clip shows as not colorized until it's done. Stabilize reruns only the quick stabilizer pass. Grain, saturation and Remove colour cast apply straight away.
+**Settings.** The Inspector's Colour box holds the project settings. Model, working size and denoise change what the model sees, so they need a new colorize pass, and the clip shows as not colorized until it's done. Stabilize reruns only the quick stabilizer pass. Grain, saturation and Remove colour cast apply straight away. The Inspector scrolls when the window is short.
 
 **Everything came out orange?** Colorizing models play it safe with warm, brownish tones when they're unsure, and some lay that over whole scenes. Two things to try, and they stack:
 
@@ -313,6 +330,10 @@ Why 10-bit by default? Colorized footage is mostly smooth gradients: skies, skin
 - `--denoise N` sets the strength of the model's denoise in L* units. Auto by default. Raise it if colored blotches show up in grainy areas.
 - `--spread 0.15` is how far a hint travels through flat areas, as a fraction of the short side. Raise it when a stroke doesn't fill its object, lower it when it leaks.
 - `--working-size 512` is the short side for color work. Higher costs time and memory, and rarely looks different, since soft color is the whole trick.
+- `--negative` measures and inverts a black and white negative first.
+- `--reference street-1912.jpg` uses a colour photo to guide the colours (every shot, for `video`). `--reference-strength 60` softens it.
+- `--deflicker model` and `--dust model` (the defaults for `video`) clean the copy the model sees; `output` cleans the output picture too; `off` turns them off. They change what the model sees, so a cache from 0.6 or earlier gets redone the first time.
+- `--regrain 3 --grain-size 1.2 --grain-colour 20` adds synthetic grain after colour.
 - `--cast 70` takes 70% of the model's all-over colour cast out, measured per shot (per photo with `photo`). The fix for an orange wash.
 - `--saturation 1.2` is a plain chroma boost. For real grading, use the editor's Grade panel and `epochcolor render`.
 - `--device cpu` forces CPU. `cuda:1` picks a second GPU.
@@ -328,6 +349,11 @@ Honest list, so nobody is surprised.
 - The RAW develop path is written but hasn't been run against a real RAW file yet.
 - Large scans are fine on memory, but a 100 MP file will take a while on the final recombine. That part is CPU-only for now.
 - Video needs a network model; the `hints` model is for photos only.
+- **Reference images are untuned on real models.** How strongly a match has to resemble the frame before the photo's colour wins (two numbers in `epochcolor/reference.py`) was set on reasoning and a synthetic test, not on DeOldify or DDColor features, since I can't run those here. If references barely change anything, raise Strength; if they paint colour onto things that don't match, lower it, and tell me which model, so those numbers can be set properly.
+- Deflicker evens out each frame's 5th to 95th percentile brightness. Flicker that only hits part of the frame (a light leak, a bright patch) isn't what it's for.
+- Dust removal needs a frame on each side, so the first and last frame of each shot aren't cleaned. A speck bigger than about 0.2% of the frame is taken for motion and left alone.
+- Negative inversion assumes an even film base. A scan with strong light falloff toward the corners will invert with darker corners; flatten it in your scanning software first.
+- DeOldify's files date from 2019 and carry training leftovers (optimizer settings) next to the weights, which PyTorch's safe loader refuses. EpochColor loads them with a stricter loader of its own, which hands out tensors and plain values and turns anything else into an inert placeholder that never runs, then keeps only the weights. A file that tries to slip in code gets the same placeholder treatment.
 - **DeOldify has never run on its real weights either.** The network is ModelScope's port, which ModelScope itself runs on DeOldify's weights, and I rebuilt its ResNet bodies to match torchvision's layer names. The check I could do from here: the rebuilt network's tensors add up to within 0.02% of both published files (874,066,230 and 255,144,681 bytes), and the leftover is the same few hundred bytes per tensor in both, which is file format overhead. One missing or extra layer would be at least 147 KB off. The loader refuses anything that doesn't fit exactly. What's still unchecked is the preprocessing: the grey input, ImageNet normalization and the render sizes follow DeOldify's and ModelScope's code, but I haven't compared a frame against DeOldify's own output.
 - **DDColor has never run on its real weights.** The architecture is the authors' own code, vendored unchanged, and builds with the paper's parameter counts (55.0M tiny, 227.9M large), but my build machine couldn't reach Hugging Face. The loader refuses weights that don't fit exactly, so a mismatch fails loudly instead of producing garbage. Which file each Hugging Face repo holds is looked up at download time, and its SHA-256 comes from Hugging Face's own listing.
 - **DDColor's weight licenses are marked unverified.** The code is Apache-2.0, but I couldn't read the model cards from here, so the manager asks you to accept the terms before downloading. Read the card.
@@ -343,7 +369,7 @@ Honest list, so nobody is surprised.
 - FLAC in MP4 is legal and FFmpeg writes it, but some players still skip the track. Use MKV, or re-encode to AAC, if that matters.
 - Audio passthrough with `--frames` trims at the nearest audio packet, not the exact frame. Fine for a test render.
 - An edited timeline (any trim, split, cut, join or in/out range) re-encodes every audio track, since compressed audio frames don't line up with video frames. The export dialog says so and asks for the codec. Only a single untouched clip passes audio through as is. Each piece of audio gets padded or cut to its exact video length, so a source whose audio runs short can't pull later pieces out of sync.
-- **Playback in the editor is silent.** Audio shows as waveforms and goes into the export, but the preview doesn't play it yet.
+- Playback sound comes from Qt's multimedia, which uses its own FFmpeg inside PySide6. If your system has no working audio output it stays silent and says nothing. The picture keeps time by the clock and the sound gets nudged back whenever it drifts more than 150 ms, so expect small catches on a slow machine.
 - The working folder takes about 1 GB per minute of footage, so a feature needs real disk space while you work on it. Point it at a big disk (see Disk, memory and the GPU). Compressing it per shot is the obvious next step.
 - The two-pass export writes a lossless FFV1 intermediate of the whole timeline into the working folder first. At 4K that's very large. The free-space check doesn't cover it yet, so leave room or use single pass.
 - The GPU check has run on one AMD setup so far: a single RX 6600-series card (gfx1032), where it picked the 10.3.0 override. On a machine with two AMD GPUs, which `ROCR_VISIBLE_DEVICES` index lands on which card comes from ROCm's own numbering, and that's still unchecked. `epochcolor device --test` prints the chip and memory of each card it tries, so a mix-up would show there.

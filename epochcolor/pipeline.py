@@ -89,7 +89,9 @@ def colorize_photo(
     model: ColorModel,
     settings: PhotoSettings | None = None,
     hints: Hints | None = None,
+    reference: dict | None = None,
 ) -> tuple[np.ndarray, Report]:
+    """reference: {"path", "strength"}, a colour photo whose colours guide this one."""
     s = settings or PhotoSettings()
     rep = Report()
     t0 = time.perf_counter()
@@ -130,6 +132,12 @@ def colorize_photo(
 
     ab = model.predict(Lw_dn, hw if model.info.takes_hints else None)
     mark("model")
+    if reference and reference.get("path"):
+        from .reference import reference_fix
+
+        T, W = reference_fix(model, Lw_dn, reference)
+        ab = W[..., None] * T + (1 - W[..., None]) * ab
+        mark("reference")
 
     if hw.count:
         spread = s.spread

@@ -63,19 +63,44 @@ def _model(cache: dict, name: str, weights: str | None, device: str):
     return cache[key]
 
 
-def photo_result_path(src: str, settings: dict, model: str, strokes: list | None = None) -> Path:
-    """Where a colorized photo is cached. Saturation and grading are applied
-    on top when shown or exported, so they don't make a new colorize."""
+def photo_result_path(src: str, settings: dict, model: str, strokes: list | None = None,
+                      negative: dict | None = None, reference: dict | None = None) -> Path:
+    """Where a colorized photo is cached. Saturation, cast removal, grading
+    and regrain are applied on top when shown or exported, so they don't
+    make a new colorize."""
     from .hintpaint import strokes_key
+    from .reference import reference_id
     from .video.pipeline import cache_root
 
     p = Path(src)
     st = p.stat()
     keys = {k: settings.get(k) for k in ("working_size", "grain", "denoise")}
-    ident = json.dumps({"p": str(p.resolve()), "s": st.st_size, "m": st.st_mtime_ns,
-                        "set": keys, "model": model,
-                        "hints": strokes_key(strokes) if strokes else None}, sort_keys=True)
+    d = {"p": str(p.resolve()), "s": st.st_size, "m": st.st_mtime_ns,
+         "set": keys, "model": model, "hints": strokes_key(strokes) if strokes else None}
+    if negative:  # only when set, so earlier results keep their names
+        d["neg"] = dict(sorted(negative.items()))
+    if reference_id(reference):
+        d["ref"] = reference_id(reference)
+    ident = json.dumps(d, sort_keys=True)
     return cache_root() / "photos" / (hashlib.sha256(ident.encode()).hexdigest()[:20] + ".png")
+
+
+def finish_photo(rgb, settings: dict, grade: dict | None):
+    """A colorized photo as shown and exported: cast removal and saturation,
+    the grade, then regrain. One place, so the viewer shows what exports."""
+    from .chroma import adjust_rgb
+
+    rgb = adjust_rgb(rgb, float(settings.get("saturation", 1.0)), float(settings.get("cast", 0.0)))
+    if grade:
+        from .grade import apply as grade_apply
+
+        rgb = grade_apply(rgb, grade)
+    if float(settings.get("regrain", 0.0) or 0.0) > 0:
+        from .film import regrain
+
+        rgb = regrain(rgb, float(settings["regrain"]), float(settings.get("regrain_size", 1.0)),
+                      float(settings.get("regrain_chroma", 0.0)), seed=1)
+    return rgb
 
 
 def _photo_settings(settings: dict):
@@ -90,17 +115,22 @@ def _colorize_photo(job: dict, models: dict) -> Path:
     from .pipeline import colorize_photo
 
     strokes = job.get("strokes") or []
-    out = photo_result_path(job["path"], job["settings"], job["model"], strokes)
+    neg, ref = job.get("negative"), job.get("reference")
+    out = photo_result_path(job["path"], job["settings"], job["model"], strokes, neg, ref)
     if out.exists():
         return out
     model = _model(models, job["model"], job.get("weights"), job.get("device", "auto"))
     img, meta = load_image(job["path"])
+    if neg:
+        from .film import invert_rgb
+
+        img = invert_rgb(img, neg)
     hints = None
     if strokes:
         from .hintpaint import rasterize
 
         hints = rasterize(strokes, img.shape[1], img.shape[0])
-    rgb, _ = colorize_photo(img, model, _photo_settings(job["settings"]), hints)
+    rgb, _ = colorize_photo(img, model, _photo_settings(job["settings"]), hints, reference=ref)
     out.parent.mkdir(parents=True, exist_ok=True)
     save_image(out, rgb, bits=16)
     return out
@@ -124,7 +154,7 @@ def run_job(kind: str, job: dict, progress, models: dict) -> dict:
         model = _model(models, job["model"], job.get("weights"), job.get("device", "auto"))
         s = VideoSettings.from_project(job["settings"])
         rep = analyze(clip_info(clip), model, s, shots=clip.shots, quiet=True, progress=progress,
-                      hints=job.get("hints"))
+                      hints=job.get("hints"), references=job.get("references"))
         return {"clip": clip.id, "dir": str(rep.dir), "timings": rep.timings}
 
     if kind == "photo":
@@ -149,7 +179,8 @@ def run_job(kind: str, job: dict, progress, models: dict) -> dict:
                           probe=det.check, audio_encoders=audio_enc, vaapi_device=det.vaapi_device)
         from .timeline_export import analysis_state
 
-        need = any(analysis_state(c, ej.settings, ej.model_name, ej.weights, ej.hints.get(c.id)) != "ready"
+        need = any(analysis_state(c, ej.settings, ej.model_name, ej.weights, ej.hints.get(c.id),
+                                  ej.references.get(c.id)) != "ready"
                    for c in ej.clips)
         model = _model(models, job["model"], job.get("weights"), job.get("device", "auto")) if need else None
         timings = ej.run(model, progress=progress, quiet=True)
@@ -166,13 +197,10 @@ def run_job(kind: str, job: dict, progress, models: dict) -> dict:
         for i, item in enumerate(items):
             src, dst = item["src"], item["dst"]
             progress("photos", i, len(items))
-            res = _colorize_photo({**job, "path": src, "strokes": item.get("strokes")}, models)
+            res = _colorize_photo({**job, "path": src, "strokes": item.get("strokes"),
+                                   "negative": item.get("negative"), "reference": item.get("reference")}, models)
             rgb, _ = load_image(res)
-            from .chroma import adjust_rgb
-
-            rgb = adjust_rgb(rgb, sat, float(job["settings"].get("cast", 0.0)))
-            if item.get("grade"):
-                rgb = grade_apply(rgb, item["grade"])
+            rgb = finish_photo(rgb, job["settings"], item.get("grade"))
             _, meta = load_image(src)
             save_image(dst, rgb, bits=job.get("bits"), quality=job.get("quality", 95), meta=meta)
             done.append(dst)
@@ -213,25 +241,32 @@ def run_job(kind: str, job: dict, progress, models: dict) -> dict:
     if kind == "match":
         return _match(job, progress, models)
 
+    if kind == "export_frame":
+        return _export_frame(job, progress)
+
+    if kind == "measure_negative":
+        return {"params": _measure_negative(job, progress)}
+
     if kind == "track_mask":
         return _track_mask(job, progress)
 
     raise ValueError(f"unknown job {kind}")
 
 
-def _working_l(path: str, frame: int | None, fps, size: int):
+def _working_l(path: str, frame: int | None, fps, size: int, negative: dict | None = None):
     """L* at the model's working size, from a clip frame or a photo."""
     import cv2
     import numpy as np
 
     from .color import srgb_to_l
     from .denoise import denoise_l
+    from .film import invert, invert_rgb
 
     if frame is None:
         from .imageio import load_image
 
         img, _ = load_image(path)
-        L = srgb_to_l(img)
+        L = srgb_to_l(invert_rgb(img, negative) if negative else img)
     else:
         from .media import FrameReader
 
@@ -242,7 +277,7 @@ def _working_l(path: str, frame: int | None, fps, size: int):
             r.close()
         if g is None:
             raise RuntimeError(f"frame {frame} of {Path(path).name} could not be decoded")
-        L = srgb_to_l(g.astype(np.float32) / 65535.0)
+        L = srgb_to_l(invert(g, negative))
     h, w = L.shape
     k = min(1.0, size / min(h, w))
     Lw = cv2.resize(L, (max(8, round(w * k)), max(8, round(h * k))), interpolation=cv2.INTER_AREA)
@@ -265,17 +300,19 @@ def _match(job: dict, progress, models: dict) -> dict:
     clips = job["clips"]  # id -> {path, fps_num, fps_den, shots}
     photos = job["photos"]  # id -> path
 
+    photo_neg = job.get("photo_neg") or {}
+
     def where(kind, target, frame):
         if kind == "clip":
             c = clips[target]
-            return c["path"], frame, Fraction(c["fps_num"], c["fps_den"])
-        return photos[target], None, None
+            return c["path"], frame, Fraction(c["fps_num"], c["fps_den"]), c.get("negative")
+        return photos[target], None, None, photo_neg.get(target)
 
     colors, ex = [], []
     for col in job["colors"]:
         src = col["source"]
-        path, frame, fps = where(src["kind"], src["target"], src.get("frame"))
-        L = _working_l(path, frame, fps, size)
+        path, frame, fps, neg = where(src["kind"], src["target"], src.get("frame"))
+        L = _working_l(path, frame, fps, size, neg)
         e = exemplar(model, L, [src["stroke"]])
         if e is not None:
             colors.append(col)
@@ -293,8 +330,8 @@ def _match(job: dict, progress, models: dict) -> dict:
     out = []
     for i, (kind, tid, frame, span) in enumerate(targets):
         progress("matching", i, len(targets))
-        path, fr, fps = where(kind, tid, frame)
-        L = _working_l(path, fr, fps, size)
+        path, fr, fps, neg = where(kind, tid, frame)
+        L = _working_l(path, fr, fps, size, neg)
         sims = similarity(model, L, ex)
         for col, S in zip(colors, sims):
             src = col["source"]
@@ -311,6 +348,87 @@ def _match(job: dict, progress, models: dict) -> dict:
     progress("matching", len(targets), len(targets))
     out.sort(key=lambda x: -x["score"])
     return {"suggestions": out, "colors": [c["id"] for c in job["colors"]]}
+
+
+def _export_frame(job: dict, progress) -> dict:
+    """One frame at full size through the export path: inversion, output
+    cleanup, colour, grade, regrain."""
+    from .color import srgb_to_l
+    from .film import invert
+    from .grade import GradeBook
+    from .imageio import save_image
+    from .media import FrameReader
+    from .project import Project, _data_from_dict
+    from .timeline_export import analysis_state
+    from .video.pipeline import FrameRenderer, OutputRestore, VideoSettings, analysis_dir, finish
+    import numpy as np
+
+    p = Project(_data_from_dict(job["project"]))
+    c = p.d.clips[job["clip"]]
+    f = int(job["frame"])
+    s = VideoSettings.from_project(p.d.settings)
+    if analysis_state(c, s, job["model"], job.get("weights"), p.d.hints.get(c.id),
+                      p.d.references.get(c.id)) not in ("ready", "update"):
+        raise RuntimeError(f"{c.name} isn't colorized with the current settings; colorize it first")
+    d = analysis_dir(Path(c.path), s, job["model"], job.get("weights"), c.neg)
+    ab = np.load(d / "ab.npy", mmap_mode="r")
+    progress("rendering", 0, 1)
+    r = FrameReader(c.path, c.fps, "gray16le", cache=4)
+    try:
+        def L_at(i):
+            g = r.get(i) if 0 <= i < len(ab) else None
+            return srgb_to_l(invert(g, c.neg)) if g is not None else None
+
+        L = L_at(f)
+        if L is None:
+            raise RuntimeError(f"frame {f} of {c.name} could not be decoded")
+        rest = OutputRestore(d, s, c.fps, (c.width, c.height))
+        if rest.on:
+            L = rest(f, L, L_at(f - 1) if rest.flow else None, L_at(f + 1) if rest.flow else None)
+    finally:
+        r.close()
+    bias = None
+    if s.cast:
+        from .chroma import ShotCasts
+
+        bias = ShotCasts(d, ab).at(f)
+    rgb = FrameRenderer(s)(None, np.asarray(ab[f], np.float32), bias, L=L)
+    rgb = finish(rgb, s, GradeBook(p.d.grades, {cid: x.shots for cid, x in p.d.clips.items()}), c.id, f)
+    out = Path(job["out"])
+    save_image(out, rgb, bits=8 if out.suffix.lower() in (".jpg", ".jpeg") else 16)
+    progress("rendering", 1, 1)
+    return {"out": str(out)}
+
+
+def _measure_negative(job: dict, progress) -> dict:
+    """Film base and levels of a negative: from the photo, or from frames
+    spread through the clip (one frame can be all sky or all shadow)."""
+    from fractions import Fraction
+
+    from .film import measure_negative
+
+    if job["kind"] == "photo":
+        from .imageio import load_image
+
+        img, _ = load_image(job["path"])
+        return measure_negative([img])
+    from .media import FrameReader
+
+    n = int(job["frames"])
+    picks = sorted({int(n * (i + 0.5) / 7) for i in range(7)})
+    r = FrameReader(job["path"], Fraction(job["fps_num"], job["fps_den"]), "gray16le", size=None, cache=2)
+    samples = []
+    try:
+        for i, f in enumerate(picks):
+            progress("measuring", i, len(picks))
+            g = r.get(f)
+            if g is not None:
+                samples.append(g.astype("float32") / 65535.0)
+    finally:
+        r.close()
+    if not samples:
+        raise RuntimeError("no frames could be read to measure the negative")
+    return measure_negative(samples)
 
 
 def match_thumb_path(ident: str) -> Path:

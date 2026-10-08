@@ -68,6 +68,11 @@ Ctrl+wheel   zoom the timeline, Shift+Z fits it"""
 
 class Inspector(QWidget):
     settingChanged = Signal(str, object)
+    negativeToggled = Signal(bool)
+    negativeLevels = Signal()
+    referencePick = Signal()
+    referenceClear = Signal()
+    referenceStrength = Signal(float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -86,6 +91,39 @@ class Inspector(QWidget):
         row.addWidget(self.colorize_btn)
         row.addWidget(self.colorize_all_btn)
         gl.addLayout(row)
+        row = QHBoxLayout()
+        self.negative = QCheckBox("Negative")
+        self.negative.setToolTip("This clip or photo is a black and white negative: invert it before "
+                                 "anything else. The film base and levels are measured automatically.")
+        self.neg_levels = QPushButton("Levels...")
+        self.neg_levels.setToolTip("Film base, black and white points and contrast of the inversion")
+        row.addWidget(self.negative)
+        row.addStretch(1)
+        row.addWidget(self.neg_levels)
+        gl.addLayout(row)
+        self.ref_label = QLabel("No reference image")
+        self.ref_label.setWordWrap(True)
+        self.ref_label.setStyleSheet(f"color: {theme.DIM};")
+        gl.addWidget(self.ref_label)
+        row = QHBoxLayout()
+        self.ref_btn = QPushButton("Reference image...")
+        self.ref_btn.setToolTip("A colour photo of the same place, scene or era whose colours guide this "
+                                "shot (or this photo)")
+        self.ref_clear = QPushButton("Clear")
+        self.ref_strength = QSpinBox()
+        self.ref_strength.setRange(0, 100)
+        self.ref_strength.setValue(100)
+        self.ref_strength.setSuffix(" %")
+        self.ref_strength.setToolTip("How strongly the reference's colours win over the model's")
+        row.addWidget(self.ref_btn, 1)
+        row.addWidget(self.ref_strength)
+        row.addWidget(self.ref_clear)
+        gl.addLayout(row)
+        self.negative.clicked.connect(lambda on: self.negativeToggled.emit(bool(on)))
+        self.neg_levels.clicked.connect(self.negativeLevels.emit)
+        self.ref_btn.clicked.connect(self.referencePick.emit)
+        self.ref_clear.clicked.connect(self.referenceClear.emit)
+        self.ref_strength.editingFinished.connect(lambda: self.referenceStrength.emit(self.ref_strength.value() / 100))
         lay.addWidget(g)
 
         c = QGroupBox("Colour")
@@ -150,6 +188,60 @@ class Inspector(QWidget):
         f.addRow(note)
         lay.addWidget(c)
 
+        fg = QGroupBox("Film")
+        ff = QFormLayout(fg)
+        self.dfl = QCheckBox("Deflicker")
+        self.dust = QCheckBox("Remove dust")
+        self.dfl_out = QCheckBox("Deflicker")
+        self.dust_out = QCheckBox("Remove dust")
+        for w, tip in ((self.dfl, "Steady the brightness of the copy the model sees, so flicker doesn't turn "
+                                  "into colour flicker. Needs a new colorize pass."),
+                       (self.dust, "Clean dirt specks off the copy the model sees. Needs a new colorize pass."),
+                       (self.dfl_out, "Steady the brightness of the output picture too. Changes the luma."),
+                       (self.dust_out, "Clean dirt specks off the output picture too. Changes the luma; "
+                                       "shows on the paused full-size frame and in export.")):
+            w.setToolTip(tip)
+        r1, r2 = QWidget(), QWidget()
+        for r, a, b in ((r1, self.dfl, self.dust), (r2, self.dfl_out, self.dust_out)):
+            hl = QHBoxLayout(r)
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.addWidget(a)
+            hl.addWidget(b)
+            hl.addStretch(1)
+        ff.addRow("Model's copy", r1)
+        ff.addRow("Output", r2)
+        self.regrain = QDoubleSpinBox()
+        self.regrain.setRange(0, 20)
+        self.regrain.setSingleStep(0.5)
+        self.regrain.setSuffix(" %")
+        self.regrain.setSpecialValueText("off")
+        self.regrain.setToolTip("Synthetic grain after grading, for footage cleaned hard or matched to a look")
+        self.grain_size = QDoubleSpinBox()
+        self.grain_size.setRange(0.3, 4.0)
+        self.grain_size.setSingleStep(0.1)
+        self.grain_size.setSuffix(" px")
+        self.grain_size.setToolTip("Grain size at 1080 lines, scaled to the frame")
+        self.grain_colour = QSpinBox()
+        self.grain_colour.setRange(0, 100)
+        self.grain_colour.setSuffix(" %")
+        self.grain_colour.setToolTip("Faint colour grain on top of the mono grain, like colour film stock")
+        gr = QWidget()
+        gl2 = QHBoxLayout(gr)
+        gl2.setContentsMargins(0, 0, 0, 0)
+        for w in (self.regrain, QLabel("size"), self.grain_size, QLabel("colour"), self.grain_colour):
+            gl2.addWidget(w)
+        ff.addRow("Regrain", gr)
+        fnote = QLabel("Cleaning the model's copy needs a new colorize pass. Output cleaning and regrain show "
+                       "on the paused full-size frame and in export.")
+        fnote.setWordWrap(True)
+        fnote.setStyleSheet(f"color: {theme.DIM}; font-size: 11px;")
+        ff.addRow(fnote)
+        lay.addWidget(fg)
+        self.dfl.toggled.connect(lambda v: self.settingChanged.emit("deflicker", 1.0 if v else 0.0))
+        self.dust.toggled.connect(lambda v: self.settingChanged.emit("dust", bool(v)))
+        self.dfl_out.toggled.connect(lambda v: self.settingChanged.emit("deflicker_out", bool(v)))
+        self.dust_out.toggled.connect(lambda v: self.settingChanged.emit("dust_out", bool(v)))
+
         j = QGroupBox("Jobs")
         jl = QVBoxLayout(j)
         self.job_label = QLabel("Idle")
@@ -187,6 +279,9 @@ class Inspector(QWidget):
         self.grain.valueChanged.connect(lambda v: self._queue("grain", float(v)))
         self.saturation.valueChanged.connect(lambda v: self._queue("saturation", round(v, 3)))
         self.cast.valueChanged.connect(lambda v: self._queue("cast", round(v / 100.0, 2)))
+        self.regrain.valueChanged.connect(lambda v: self._queue("regrain", round(v, 2)))
+        self.grain_size.valueChanged.connect(lambda v: self._queue("regrain_size", round(v, 2)))
+        self.grain_colour.valueChanged.connect(lambda v: self._queue("regrain_chroma", round(v / 100.0, 2)))
         self.denoise.valueChanged.connect(lambda v: self._denoise())
         self.denoise_auto.toggled.connect(self._denoise)
 
@@ -220,7 +315,8 @@ class Inspector(QWidget):
 
     def show_settings(self, s: dict) -> None:
         widgets = (self.model, self.working, self.chroma, self.stabilize, self.grain, self.saturation,
-                   self.cast, self.denoise, self.denoise_auto)
+                   self.cast, self.denoise, self.denoise_auto, self.dfl, self.dust, self.dfl_out, self.dust_out,
+                   self.regrain, self.grain_size, self.grain_colour)
         for w in widgets:
             w.blockSignals(True)
         if self.model.findData(s.get("model")) < 0 or self.model.count() == 0:
@@ -232,6 +328,13 @@ class Inspector(QWidget):
         self.grain.setValue(float(s.get("grain", 100)))
         self.saturation.setValue(float(s.get("saturation", 1.0)))
         self.cast.setValue(int(round(float(s.get("cast", 0.0)) * 100)))
+        self.dfl.setChecked(float(s.get("deflicker", 0.0) or 0.0) > 0)
+        self.dust.setChecked(bool(s.get("dust", False)))
+        self.dfl_out.setChecked(bool(s.get("deflicker_out", False)))
+        self.dust_out.setChecked(bool(s.get("dust_out", False)))
+        self.regrain.setValue(float(s.get("regrain", 0.0) or 0.0))
+        self.grain_size.setValue(float(s.get("regrain_size", 1.0)))
+        self.grain_colour.setValue(int(round(float(s.get("regrain_chroma", 0.0)) * 100)))
         dn = s.get("denoise")
         self.denoise_auto.setChecked(dn is None)
         self.denoise.setEnabled(dn is not None)
@@ -269,10 +372,18 @@ class MainWindow(QMainWindow):
         self._build_actions()
         self._start_preview()
 
+        from .audio import TimelineAudio
+
+        self.audio = TimelineAudio(self)
+        self.autosave_timer = QTimer(self)
+        self.autosave_timer.setInterval(90_000)
+        self.autosave_timer.timeout.connect(self._autosave)
+        self.autosave_timer.start()
         self.play_timer = QTimer(self)
         self.play_timer.setInterval(8)
         self.play_timer.timeout.connect(self._tick)
         self._flow_readers: dict = {}  # proxy readers for carrying strokes, per clip
+        self._measuring: dict = {}  # job id -> what a negative measurement is for
         self.hint_timer = QTimer(self)
         self.hint_timer.setSingleShot(True)
         self.hint_timer.setInterval(900)
@@ -383,6 +494,11 @@ class MainWindow(QMainWindow):
         self.inspector = Inspector()
         self.inspector.settingChanged.connect(self._setting_changed)
         self.inspector.colorize_btn.clicked.connect(self.colorize_selected)
+        self.inspector.negativeToggled.connect(self._negative_toggled)
+        self.inspector.negativeLevels.connect(self.negative_levels)
+        self.inspector.referencePick.connect(self.pick_reference)
+        self.inspector.referenceClear.connect(self.clear_reference)
+        self.inspector.referenceStrength.connect(self._reference_strength)
         self.inspector.colorize_all_btn.clicked.connect(self.colorize_all)
         self.inspector.cancel_btn.clicked.connect(lambda: self.runner.cancel(
             self.runner.current.id if self.runner.current else -1))
@@ -390,7 +506,14 @@ class MainWindow(QMainWindow):
         self.inspector.manager_btn.clicked.connect(self.open_model_manager)
         dock = QDockWidget("Inspector", self)
         dock.setObjectName("inspector")
-        dock.setWidget(self.inspector)
+        from PySide6.QtWidgets import QFrame, QScrollArea
+
+        scroll = QScrollArea()
+        scroll.setWidget(self.inspector)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        dock.setWidget(scroll)  # scrolls on a short screen instead of squashing
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
         self.inspector_dock = dock
 
@@ -451,6 +574,7 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         act(m, "Export video...", self.export_video, "Ctrl+E")
         act(m, "Export photos...", self.export_photos, "Ctrl+Shift+E")
+        act(m, "Export current frame...", self.export_frame, "Ctrl+Alt+E")
         m.addSeparator()
         act(m, "Working folder and limits...", self.open_settings)
         m.addSeparator()
@@ -506,6 +630,10 @@ class MainWindow(QMainWindow):
         act(m, "Next shot", lambda: self.jump(self.project.shot_starts(), 1), "Shift+Right")
         act(m, "Previous edit", lambda: self.jump(self.project.edit_points(), -1), "Up")
         act(m, "Next edit", lambda: self.jump(self.project.edit_points(), 1), "Down")
+        self.sound_act = act(m, "Play sound", self._toggle_sound)
+        self.sound_act.setCheckable(True)
+        self.sound_act.setChecked(True)
+        m.addSeparator()
         act(m, "Go to start", lambda: self.seek(0), "Home")
         act(m, "Go to end", lambda: self.seek(self.project.duration - 1), "End")
 
@@ -549,17 +677,20 @@ class MainWindow(QMainWindow):
             ab = None
             if self.status.get(c.id) in ("ready", "update"):
                 # "update": hints or the stabilizer changed; show the last result until it reruns
-                ab = str(analysis_dir(Path(c.path), s, model) / "ab.npy")
-            out.append(LayoutPiece(start, seg.length, c.id, seg.src_in, str(mi.proxy), c.path, c.fps, ab))
+                ab = str(analysis_dir(Path(c.path), s, model, negative=c.neg) / "ab.npy")
+            out.append(LayoutPiece(start, seg.length, c.id, seg.src_in, str(mi.proxy), c.path, c.fps, ab,
+                                   c.neg))
         return out
 
     def _refresh(self) -> None:
         """Bring every view in line with the project."""
         s = VideoSettings.from_project(self.project.d.settings)
         model = self.project.d.settings["model"]
-        self.status = {cid: analysis_state(c, s, model, hints=self.project.d.hints.get(cid))
+        self.status = {cid: analysis_state(c, s, model, hints=self.project.d.hints.get(cid),
+                                           references=self.project.d.references.get(cid))
                        for cid, c in self.project.d.clips.items()}
         self.timeline.canvas.status = self.status
+        self.audio.project_changed(self.project)
         self.timeline.set_project(self.project) if self.timeline.canvas.project is not self.project \
             else self.timeline.refresh()
         self._push_layout()
@@ -641,8 +772,8 @@ class MainWindow(QMainWindow):
 
                 ph = self.project.d.photos[row]
                 try:
-                    done = photo_result_path(ph.path, self.project.d.settings,
-                                             self.project.d.settings["model"], ph.strokes).exists()
+                    done = photo_result_path(ph.path, self.project.d.settings, self.project.d.settings["model"],
+                                             ph.strokes, ph.neg, ph.reference).exists()
                 except OSError:
                     done = False
                 state = "colorized" if done else ("hints changed, apply them" if ph.strokes else "not colorized yet")
@@ -651,6 +782,7 @@ class MainWindow(QMainWindow):
             else:
                 ins.clip_info.setText("No photo selected")
             ins.show_settings(self.project.d.settings)
+            self._refresh_target_widgets()
             return
         ins.colorize_btn.setText("Colorize clip")
         ins.colorize_all_btn.setText("Colorize all")
@@ -668,6 +800,126 @@ class MainWindow(QMainWindow):
                 f"<b>{c.name}</b><br>{c.width}x{c.height} at {float(c.fps):.3f} fps, {c.codec}<br>"
                 f"{c.frames} frames, {len(c.shots)} shots<br>audio: {audio}<br>{st}")
         self.inspector.show_settings(self.project.d.settings)
+        self._refresh_target_widgets()
+
+    def _target_object(self):
+        """(kind, id, the Clip or Photo, clip frame) under the playhead or picked in the filmstrip."""
+        t = self._paint_target()
+        if t is None:
+            return None
+        obj = self.project.photo(t[1]) if t[0] == "photo" else self.project.d.clips[t[1]]
+        return t[0], t[1], obj, t[2]
+
+    def _target_reference(self, tt) -> dict | None:
+        kind, ident, obj, frame = tt
+        return obj.reference if kind == "photo" else self.project.reference_at(ident, frame)
+
+    def _refresh_target_widgets(self) -> None:
+        ins = self.inspector
+        tt = self._target_object()
+        for w in (ins.negative, ins.neg_levels, ins.ref_btn, ins.ref_clear, ins.ref_strength):
+            w.setEnabled(tt is not None)
+        if tt is None:
+            ins.ref_label.setText("No reference image")
+            return
+        kind, ident, obj, frame = tt
+        ins.negative.blockSignals(True)
+        ins.negative.setChecked(bool(obj.negative))
+        ins.negative.blockSignals(False)
+        ins.neg_levels.setEnabled(bool(obj.negative and obj.negative_params))
+        ref = self._target_reference(tt)
+        where = "this photo" if kind == "photo" else \
+            f"shot {next((i + 1 for i, (a, b) in enumerate(obj.shots) if a <= frame < b), '?')}"
+        if ref:
+            ins.ref_label.setText(f"Reference for {where}: {Path(ref['path']).name}")
+            ins.ref_strength.blockSignals(True)
+            ins.ref_strength.setValue(int(round(float(ref.get("strength", 1.0)) * 100)))
+            ins.ref_strength.blockSignals(False)
+        else:
+            ins.ref_label.setText(f"No reference image for {where}")
+        ins.ref_clear.setEnabled(bool(ref))
+
+    # ------------------------------------------------- negatives, references
+
+    def _negative_toggled(self, on: bool) -> None:
+        tt = self._target_object()
+        if tt is None:
+            return
+        kind, ident, obj, _ = tt
+        if on and not obj.negative_params:
+            payload = {"kind": kind, "path": obj.path}
+            if kind == "clip":
+                payload.update(fps_num=obj.fps_num, fps_den=obj.fps_den, frames=obj.frames)
+            job = self.runner.submit("measure_negative", f"Measure negative {Path(obj.path).name}", payload)
+            self._measuring[job.id] = (kind, ident)
+            self.statusBar().showMessage("measuring the film base and levels...", 4000)
+            return
+        self.project.set_negative(kind, ident, on)
+        self._after_target_change(kind)
+
+    def _after_target_change(self, kind: str) -> None:
+        self._refresh()
+        if kind == "photo":
+            self._show_photo(self.filmstrip.currentRow())
+
+    def negative_levels(self) -> None:
+        from .negative_dialog import NegativeDialog
+
+        tt = self._target_object()
+        if tt is None or not tt[2].negative_params:
+            return
+        kind, ident, obj, _ = tt
+        before = dict(obj.negative_params)
+        self.project.checkpoint("negative levels")
+
+        def live(params):
+            obj.negative_params = dict(params)
+            self._after_target_change(kind)
+
+        dlg = NegativeDialog(before, self)
+        dlg.changed.connect(live)
+        dlg.remeasure.connect(lambda: self._negative_remeasure(kind, ident, obj, dlg))
+        if dlg.exec() != QDialog.Accepted:
+            obj.negative_params = before
+            self._after_target_change(kind)
+
+    def _negative_remeasure(self, kind, ident, obj, dlg) -> None:
+        payload = {"kind": kind, "path": obj.path}
+        if kind == "clip":
+            payload.update(fps_num=obj.fps_num, fps_den=obj.fps_den, frames=obj.frames)
+        job = self.runner.submit("measure_negative", f"Measure negative {Path(obj.path).name}", payload)
+        self._measuring[job.id] = (kind, ident, dlg)
+
+    def pick_reference(self) -> None:
+        tt = self._target_object()
+        if tt is None:
+            return
+        f, _ = QFileDialog.getOpenFileName(self, "Reference image: a colour photo", self.qs.value("dir_ref", ""),
+                                           "Images (*.png *.jpg *.jpeg *.tif *.tiff *.webp *.bmp *.heic)")
+        if not f:
+            return
+        self.qs.setValue("dir_ref", str(Path(f).parent))
+        self._set_reference(tt, {"path": f, "strength": self.inspector.ref_strength.value() / 100.0})
+
+    def _set_reference(self, tt, ref: dict | None) -> None:
+        kind, ident, obj, frame = tt
+        if kind == "photo":
+            self.project.set_photo_reference(ident, ref)
+        else:
+            self.project.set_reference(ident, frame, ref)
+        self._refresh()
+        self.apply_hints()  # the reference goes in through the hint pass
+
+    def clear_reference(self) -> None:
+        tt = self._target_object()
+        if tt is not None and self._target_reference(tt):
+            self._set_reference(tt, None)
+
+    def _reference_strength(self, k: float) -> None:
+        tt = self._target_object()
+        ref = self._target_reference(tt) if tt else None
+        if ref and abs(float(ref.get("strength", 1.0)) - k) > 1e-3:
+            self._set_reference(tt, dict(ref, strength=round(k, 2)))
 
     def _edited(self) -> None:
         self._refresh()
@@ -722,6 +974,13 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------- playback
 
+    def _toggle_sound(self) -> None:
+        self.audio.enabled = self.sound_act.isChecked()
+        if not self.audio.enabled:
+            self.audio.stop()
+        elif self.speed == 1:
+            self.audio.play_from(self.playhead / float(self.project.fps or 24))
+
     def toggle_play(self) -> None:
         self.shuttle(0 if self.speed else 1, absolute=True)
 
@@ -738,11 +997,16 @@ class MainWindow(QMainWindow):
             self._play_t0 = time.monotonic()
             self._play_f0 = self.playhead
             self.play_timer.start()
+            if self.speed == 1:
+                self.audio.play_from(self.playhead / float(self.project.fps or 24))
+            else:
+                self.audio.stop()  # shuttling: silent
             self.btn["play"].setText("Pause")
             self.speed_label.setText("" if self.speed == 1 else f"{self.speed:+g}x")
         else:
             self.speed = 0.0
             self.play_timer.stop()
+            self.audio.stop()
             self.btn["play"].setText("Play")
             self.speed_label.setText("")
             self.seek(self.playhead)  # settle: full-size still
@@ -757,6 +1021,8 @@ class MainWindow(QMainWindow):
             return
         if f != self.playhead:
             self.seek(f, playing=True)
+            if self.speed == 1 and f % 24 == 0:
+                self.audio.keep_in_step(f / fps)
 
     # ------------------------------------------------------------ edits
 
@@ -922,31 +1188,37 @@ class MainWindow(QMainWindow):
         ph = self.project.d.photos[row]
         try:
             src = self._photo_display(ph.path)
+            if ph.neg:  # a negative: show the positive the model gets
+                from ..film import invert_rgb
+
+                pos = invert_rgb(src.astype(np.float32) / 255.0, ph.neg)
+                src = (np.clip(pos[..., 0] if pos.ndim == 3 else pos, 0, 1) * 255 + 0.5).astype(np.uint8)
             if src.ndim == 3:  # show what the model sees: luminance only
                 gray = srgb_to_l(src.astype(np.float32) / 255)
                 src = (lab_to_srgb(gray, np.zeros(gray.shape + (2,), np.float32))[..., 0] * 255 + 0.5).astype(np.uint8)
             gimg = to_qimage(src)
-            res = photo_result_path(ph.path, self.project.d.settings, self.project.d.settings["model"], ph.strokes)
+            st, model = self.project.d.settings, self.project.d.settings["model"]
+            res = photo_result_path(ph.path, st, model, ph.strokes, ph.neg, ph.reference)
             if not res.exists() and ph.strokes:
                 # hints not applied yet: show the last unhinted result meanwhile
-                res = photo_result_path(ph.path, self.project.d.settings, self.project.d.settings["model"])
+                res = photo_result_path(ph.path, st, model, None, ph.neg, ph.reference)
             cimg = raw = None
             if res.exists():
                 rgb = self._photo_display(str(res)).astype(np.float32) / 255.0
                 from ..chroma import adjust_rgb
+                from ..worker import finish_photo
 
-                rgb = adjust_rgb(rgb, float(self.project.d.settings.get("saturation", 1.0)),
-                                 float(self.project.d.settings.get("cast", 0.0)))
-                raw = to_qimage((np.clip(rgb, 0, 1) * 255 + 0.5).astype(np.uint8))
+                adj = adjust_rgb(rgb, float(st.get("saturation", 1.0)), float(st.get("cast", 0.0)))
+                raw = to_qimage((np.clip(adj, 0, 1) * 255 + 0.5).astype(np.uint8))
                 cimg = raw
-                if ph.grade and not G.is_identity(ph.grade):
-                    matte = [] if self._show_matte else None
-                    out = G.apply(rgb, ph.grade, matte_out=matte)
-                    if self._show_matte:
-                        m = matte[0] if matte and matte[0] is not None else np.ones(rgb.shape[:2], np.float32)
-                        cimg = to_qimage((np.clip(m, 0, 1) * 255 + 0.5).astype(np.uint8))
-                    else:
-                        cimg = to_qimage((np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8))
+                if self._show_matte and ph.grade and not G.is_identity(ph.grade):
+                    matte = []
+                    G.apply(adj, ph.grade, matte_out=matte)
+                    m = matte[0] if matte and matte[0] is not None else np.ones(rgb.shape[:2], np.float32)
+                    cimg = to_qimage((np.clip(m, 0, 1) * 255 + 0.5).astype(np.uint8))
+                elif (ph.grade and not G.is_identity(ph.grade)) or float(st.get("regrain", 0) or 0) > 0:
+                    out = finish_photo(rgb, st, ph.grade)  # the same steps as export
+                    cimg = to_qimage((np.clip(out, 0, 1) * 255 + 0.5).astype(np.uint8))
             self.viewer.set_images(gimg, cimg, True, Path(ph.path).name, raw=raw)
             if self.scopes_dock.isVisible():
                 self.scopes.show_image(cimg or gimg)
@@ -993,7 +1265,13 @@ class MainWindow(QMainWindow):
             if c.id in busy:
                 continue
             self.runner.submit("analyze", f"Colorize {c.name}",
-                               {**self._job_payload(), "clip": asdict(c), "hints": self.project.d.hints.get(c.id)})
+                               {**self._job_payload(), "clip": asdict(c), "hints": self.project.d.hints.get(c.id),
+                            "references": self.project.d.references.get(c.id)})
+
+    @staticmethod
+    def _photo_payload(ph) -> dict:
+        return {"photo": ph.id, "path": ph.path, "strokes": ph.strokes, "negative": ph.neg,
+                "reference": ph.reference}
 
     def colorize_photos(self) -> None:
         rows = sorted({self.filmstrip.row(it) for it in self.filmstrip.selectedItems()}) or \
@@ -1001,7 +1279,7 @@ class MainWindow(QMainWindow):
         for r in rows:
             ph = self.project.d.photos[r]
             self.runner.submit("photo", f"Colorize {Path(ph.path).name}",
-                               {**self._job_payload(), "photo": ph.id, "path": ph.path, "strokes": ph.strokes})
+                               {**self._job_payload(), **self._photo_payload(ph)})
 
     def fetch_weights(self) -> None:
         from ..models.manager import entry, installed
@@ -1111,6 +1389,8 @@ class MainWindow(QMainWindow):
                 self._fit()
         elif job.kind == "export":
             self.statusBar().showMessage(f"done: exported {result['out']}", 10000)
+        elif job.kind == "export_frame":
+            self.statusBar().showMessage(f"done: frame saved to {result['out']}", 10000)
         elif job.kind == "export_photos":
             self.statusBar().showMessage(f"done: exported {len(result['files'])} photo(s)", 10000)
         elif job.kind == "fetch":
@@ -1125,6 +1405,16 @@ class MainWindow(QMainWindow):
             self.runner.shutdown()  # a fresh worker sees the new models folder
         elif job.kind == "match":
             self._matches_found(result)
+        elif job.kind == "measure_negative":
+            target = self._measuring.pop(job.id, None)
+            if target:
+                kind, ident = target[0], target[1]
+                if len(target) == 3:  # Auto in the levels dialog
+                    target[2].set_params(result["params"])
+                else:
+                    self.project.set_negative(kind, ident, True, result["params"])
+                    self._after_target_change(kind)
+                    self.statusBar().showMessage("negative: inverted; Levels... adjusts it", 6000)
         elif job.kind == "track_mask":
             self._track_done(job, result)
         else:
@@ -1133,6 +1423,8 @@ class MainWindow(QMainWindow):
 
     def _job_failed(self, job, msg: str, tb: str) -> None:
         self._importing.pop(job.id, None)
+        if self._measuring.pop(job.id, None):
+            self._refresh_target_widgets()
         if msg == "cancelled":
             self.statusBar().showMessage(f"cancelled: {job.label}", 5000)
             self._refresh()
@@ -1306,7 +1598,7 @@ class MainWindow(QMainWindow):
             ph = self.project.photo(t[1])
             self.runner.cancel_where(lambda j: j.kind == "photo" and j.payload.get("photo") == ph.id)
             self.runner.submit("photo", f"Hints on {Path(ph.path).name}",
-                               {**self._job_payload(), "photo": ph.id, "path": ph.path, "strokes": ph.strokes})
+                               {**self._job_payload(), **self._photo_payload(ph)})
             return
         c = self.project.d.clips[t[1]]
         if self.status.get(c.id) == "none":
@@ -1314,7 +1606,8 @@ class MainWindow(QMainWindow):
         self.runner.cancel_where(lambda j: j.kind == "analyze" and j.payload.get("clip", {}).get("id") == c.id,
                                  running=False)
         self.runner.submit("analyze", f"Hints on {c.name}",
-                           {**self._job_payload(), "clip": asdict(c), "hints": self.project.d.hints.get(c.id)})
+                           {**self._job_payload(), "clip": asdict(c), "hints": self.project.d.hints.get(c.id),
+                            "references": self.project.d.references.get(c.id)})
 
     def _update_overlays(self) -> None:
         t = self._paint_target()
@@ -1419,14 +1712,17 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("save a colour first: paint a stroke, then Save last stroke", 5000)
                 return
             cols = [c for c in p.d.colors if c["id"] == ident] if ident else list(p.d.colors)
-            clips = {cid: {"path": c.path, "fps_num": c.fps_num, "fps_den": c.fps_den, "shots": c.shots}
+            clips = {cid: {"path": c.path, "fps_num": c.fps_num, "fps_den": c.fps_den, "shots": c.shots,
+                           "negative": c.neg}
                      for cid, c in p.d.clips.items()}
             photos = {ph.id: ph.path for ph in p.d.photos}
+            photo_neg = {ph.id: ph.neg for ph in p.d.photos if ph.neg}
             label = f"Find {cols[0]['name']}" if ident and cols else "Find saved colours"
             self.colours_dock.show()
             self.colours_dock.raise_()
             self.runner.submit("match", label,
-                               {**self._job_payload(), "colors": cols, "clips": clips, "photos": photos})
+                               {**self._job_payload(), "colors": cols, "clips": clips, "photos": photos,
+                                "photo_neg": photo_neg})
             self.statusBar().showMessage("looking through every shot and photo...", 4000)
             return
         elif action == "goto":
@@ -1654,7 +1950,8 @@ class MainWindow(QMainWindow):
             start = self.project.shot_start(ident, frame)
             end = next(b for a, b in c.shots if a == start)
             self.runner.submit("track_mask", f"Track mask in {c.name}",
-                               {"analysis": str(analysis_dir(Path(c.path), s, self.project.d.settings["model"])),
+                               {"analysis": str(analysis_dir(Path(c.path), s, self.project.d.settings["model"],
+                                                             negative=c.neg)),
                                 "a": start, "b": end, "frame": frame, "mask": g["mask"], "clip": ident})
         elif action == "clear_track":
             if kind == "clip" and track and track.get("track"):
@@ -1737,6 +2034,26 @@ class MainWindow(QMainWindow):
             data["range"] = None
         return P(_data_from_dict(data)).is_simple()
 
+    def export_frame(self) -> None:
+        """The frame under the playhead at full size, as export renders it."""
+        t = self._paint_target()
+        if t is None or t[0] != "clip":
+            self.statusBar().showMessage("put the playhead on a clip first (photos: File > Export photos)", 5000)
+            return
+        if self.status.get(t[1]) not in ("ready", "update"):
+            self.statusBar().showMessage("colorize this clip first", 5000)
+            return
+        c = self.project.d.clips[t[1]]
+        f, _ = QFileDialog.getSaveFileName(self, "Export frame", str(Path(self.qs.value("dir_frame", "")) /
+                                                                    f"{Path(c.path).stem}_{t[2]:06d}.png"),
+                                           "PNG 16-bit (*.png);;TIFF 16-bit (*.tif *.tiff);;JPEG (*.jpg)")
+        if not f:
+            return
+        self.qs.setValue("dir_frame", str(Path(f).parent))
+        self.runner.submit("export_frame", f"Export frame {t[2]} of {c.name}",
+                           {**self._job_payload(), "project": asdict(self.project.d), "clip": c.id,
+                            "frame": t[2], "out": f})
+
     def export_photos(self) -> None:
         photos = [self.project.d.photos[self.filmstrip.row(it)] for it in self.filmstrip.selectedItems()] \
             or list(self.project.d.photos)
@@ -1749,7 +2066,8 @@ class MainWindow(QMainWindow):
         v = dlg.values()
         v["dir"].mkdir(parents=True, exist_ok=True)
         items = [{"src": ph.path, "dst": str(v["dir"] / f"{Path(ph.path).stem}.{v['ext']}"),
-                  "strokes": ph.strokes, "grade": ph.grade} for ph in photos]
+                  "strokes": ph.strokes, "grade": ph.grade, "negative": ph.neg, "reference": ph.reference}
+                 for ph in photos]
         self.runner.submit("export_photos", f"Export {len(items)} photo(s)",
                            {**self._job_payload(), "items": items, "bits": v["bits"], "quality": v["quality"]})
 
@@ -1796,6 +2114,45 @@ class MainWindow(QMainWindow):
         if f:
             self.open_project(f)
 
+    def _autosave(self) -> None:
+        from .. import autosave
+
+        if self.project.dirty and (self.project.d.clips or self.project.d.photos):
+            try:
+                autosave.write(self.project)
+            except OSError:
+                pass  # a full disk shouldn't interrupt the work; the next try may succeed
+
+    def _offer_recovery(self, path) -> Project | None:
+        """The autosaved project, if there is one and the user wants it back."""
+        from .. import autosave
+
+        found = autosave.find(path)
+        if not found:
+            return None
+        side, when = found
+        what = Path(path).name if path else "a project that was never saved"
+        r = QMessageBox.question(
+            self, "Recover changes",
+            f"There are unsaved changes to {what} from {time.strftime('%Y-%m-%d %H:%M', time.localtime(when))}; "
+            "EpochColor didn't close normally. Recover them?",
+            QMessageBox.Yes | QMessageBox.No)
+        if r != QMessageBox.Yes:
+            autosave.clear(path)
+            return None
+        try:
+            return autosave.recover(side, path)
+        except (OSError, ValueError, ProjectError) as e:
+            QMessageBox.warning(self, "Can't recover", str(e))
+            return None
+
+    def check_recovery(self) -> None:
+        """At start, with nothing opened: an unsaved project left by a crash."""
+        if self.project.path is None and not self.project.d.clips and not self.project.d.photos:
+            p = self._offer_recovery(None)
+            if p is not None:
+                self._set_project(p)
+
     def open_project(self, path: str) -> None:
         try:
             p = Project.load(path)
@@ -1803,9 +2160,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Can't open", f"{path}:\n{e}")
             return
         self.qs.setValue("dir_project", str(Path(path).parent))
+        p = self._offer_recovery(path) or p
         self._set_project(p)
 
     def save_project(self) -> bool:
+        from .. import autosave
+
         if self.project.path is None:
             return self.save_project_as()
         try:
@@ -1813,6 +2173,8 @@ class MainWindow(QMainWindow):
         except OSError as e:
             QMessageBox.warning(self, "Can't save", str(e))
             return False
+        autosave.clear(self.project.path)
+        autosave.clear(None)
         self._refresh_title()
         self.statusBar().showMessage(f"saved {self.project.path}", 3000)
         return True
@@ -1841,6 +2203,7 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             ev.ignore()
             return
+        self.project.dirty = False  # saved or discarded: either way nothing to recover
         if self.runner.busy() and QMessageBox.question(
                 self, "Jobs running", "Jobs are still running. Stop them and quit?") != QMessageBox.Yes:
             ev.ignore()
@@ -1851,7 +2214,15 @@ class MainWindow(QMainWindow):
     def shutdown(self) -> None:
         from PySide6.QtCore import QMetaObject
 
+        from .. import autosave
+
         self.play_timer.stop()
+        self.autosave_timer.stop()
+        self.audio.stop()
+        if self.audio.proc is not None:
+            self.audio.proc.kill()
+        if not self.project.dirty:  # saved, or the changes were discarded on purpose
+            autosave.clear(self.project.path)
         self.runner.shutdown()
         if self.preview_thread.isRunning():
             QMetaObject.invokeMethod(self.provider, "stop", Qt.BlockingQueuedConnection)
@@ -1889,6 +2260,7 @@ def main(argv=None) -> int:
     app.aboutToQuit.connect(w.shutdown)
     if not os.environ.get("EPOCHCOLOR_NO_FIRST_RUN"):
         QTimer.singleShot(400, w.first_run_checks)
+        QTimer.singleShot(600, w.check_recovery)
     return app.exec()
 
 

@@ -41,6 +41,7 @@ class ClipInfo:
     codec: str
     audio: list[AudioStream] = field(default_factory=list)
     interlaced: bool = False
+    negative: dict | None = None  # inversion for a black and white negative (film.py)
 
     @property
     def audio_streams(self) -> list[str]:

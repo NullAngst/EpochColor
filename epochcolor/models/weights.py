@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import pickle
 import os
 import sys
 from pathlib import Path
@@ -70,6 +71,83 @@ def sha256_file(path: Path, progress=None) -> str:
     return h.hexdigest()
 
 
+class Inert:
+    """Stands in for any pickled object that isn't a tensor or a plain value.
+    Keeps whatever arguments and state it was given, and does nothing."""
+
+    def __new__(cls, *args, **kwargs):
+        obj = object.__new__(cls)
+        obj.args, obj.kwargs = args, kwargs
+        return obj
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __setstate__(self, state):
+        self.state = state
+
+    def __call__(self, *args, **kwargs):  # a stand-in for a function: calling it gives another stand-in
+        return Inert(*args, **kwargs)
+
+    def __repr__(self):
+        return f"<inert {type(self).__name__}>"
+
+
+_BUILTINS = {"slice", "set", "frozenset", "complex", "int", "float", "bool", "str", "bytes",
+             "bytearray", "list", "tuple", "dict", "range"}
+_PLAIN = {"builtins": _BUILTINS, "__builtin__": _BUILTINS,  # the second is how older pickles spell it
+          "collections": {"OrderedDict"}}
+
+
+def _allowed_torch(module: str, name: str):
+    """PyTorch's own pieces a weights file legitimately needs: tensor and
+    parameter rebuilders, storages, dtypes, sizes and devices. None if not."""
+    import importlib
+
+    import torch
+
+    if not (module == "torch" or module.startswith("torch.")):
+        return None
+    try:
+        obj = getattr(importlib.import_module(module), name)
+    except (ImportError, AttributeError):
+        return None
+    if module == "torch._utils" and name.startswith("_rebuild_"):
+        return obj
+    if module in ("torch.serialization",) and name == "_get_layout":
+        return obj
+    if isinstance(obj, (torch.dtype, torch.layout, torch.memory_format)):
+        return obj
+    if isinstance(obj, type) and (issubclass(obj, (torch.Size, torch.device))
+                                  or name.endswith("Storage") or name in ("Tensor", "TypedStorage",
+                                                                          "UntypedStorage")):
+        return obj
+    if obj is torch.device or obj is torch.Size:
+        return obj
+    return None
+
+
+def _inert_pickle():
+    """A pickle module for torch.load whose unpickler only hands out plain
+    types and PyTorch's own rebuilders; every other global becomes Inert."""
+    import types
+
+    class Unpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            if name in _PLAIN.get(module, ()):
+                return super().find_class(module, name)
+            obj = _allowed_torch(module, name)
+            if obj is not None:
+                return obj
+            return type(f"{module}.{name}", (Inert,), {})
+
+    mod = types.ModuleType("epochcolor_inert_pickle")
+    mod.Unpickler = Unpickler
+    mod.load = lambda f, **kw: Unpickler(f, **kw).load()
+    mod.__name__ = "epochcolor_inert_pickle"
+    return mod
+
+
 def load_state_dict(path: Path):
     """Load weights without running pickled code.
 
@@ -85,7 +163,15 @@ def load_state_dict(path: Path):
         from safetensors.torch import load_file
 
         return load_file(str(path), device="cpu")
-    sd = torch.load(str(path), map_location="cpu", weights_only=True)
+    try:
+        sd = torch.load(str(path), map_location="cpu", weights_only=True)
+    except pickle.UnpicklingError:
+        # Older checkpoints (DeOldify's, from 2019) carry training leftovers
+        # next to the weights: optimizer settings, functools.partial, slice.
+        # PyTorch's safe loader refuses the whole file over them. This loader
+        # is just as strict about what runs, and keeps those leftovers as
+        # inert stand-ins instead; only the weights get used.
+        sd = torch.load(str(path), map_location="cpu", weights_only=False, pickle_module=_inert_pickle())
     for key in ("params_ema", "params", "state_dict", "model"):
         if isinstance(sd, dict) and key in sd and isinstance(sd[key], dict):
             sd = sd[key]

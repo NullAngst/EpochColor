@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 from fractions import Fraction
+from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
@@ -30,6 +31,7 @@ class LayoutPiece:
     source: str
     fps: Fraction
     ab: str | None  # ab.npy of a finished analysis, None if not colorized
+    negative: dict | None = None  # the clip's negative inversion
 
 
 def to_qimage(arr: np.ndarray) -> QImage:
@@ -54,6 +56,7 @@ class PreviewProvider(QObject):
         self.sources: dict[str, object] = {}
         self.ab: dict[str, np.ndarray] = {}
         self.casts: dict = {}
+        self.restores: dict = {}
         self.cache: OrderedDict[int, tuple] = OrderedDict()
         self.want: tuple[int, bool] | None = None
         self.last_shown = -1
@@ -101,6 +104,7 @@ class PreviewProvider(QObject):
                 d.pop(k).close()
         self.ab = {k: v for k, v in self.ab.items() if k in live}
         self.casts = {}  # chroma.ShotCasts per clip, measured again after any change
+        self.restores = {}  # OutputRestore per clip
         for p in self.layout:
             if p.ab is None:
                 self.ab.pop(p.clip_id, None)
@@ -160,6 +164,15 @@ class PreviewProvider(QObject):
         g = r.get(src)
         if g is None:
             return None, None, None
+        if p.negative:
+            from ..film import invert
+
+            g = (np.clip(invert(g, p.negative), 0, 1) * 255 + 0.5).astype(np.uint8)
+        L = gray8_to_l(g)
+        rest = self._restore(p) if self.settings.get("deflicker_out") else None
+        if rest is not None:  # output deflicker is cheap enough for every proxy frame; dust waits for the still
+            L = rest._deflicker(src, L)
+            g = lab_to_srgb8_fast(L, np.zeros(L.shape + (2,), np.float32))[..., 0]
         gray = to_qimage(g)
         ab = self.ab.get(p.clip_id)
         if ab is None or src >= len(ab):
@@ -173,9 +186,23 @@ class PreviewProvider(QObject):
         cast = float(self.settings.get("cast", 0.0))
         abw = adjust(abw, float(self.settings.get("saturation", 1.0)), cast,
                      self._cast(p, ab, src) if cast else None)
-        rgb8 = lab_to_srgb8_fast(gray8_to_l(g), abw)
+        rgb8 = lab_to_srgb8_fast(L, abw)
         raw = to_qimage(rgb8)
         return gray, self._graded(rgb8.astype(np.float32) / 255.0, p.clip_id, src, raw), raw
+
+    def _restore(self, p):
+        """The clip's OutputRestore, kept until the layout or settings change."""
+        if p.ab is None:
+            return None
+        from pathlib import Path
+
+        from ..video.pipeline import OutputRestore, VideoSettings
+
+        r = self.restores.get(p.clip_id)
+        if r is None:
+            r = self.restores[p.clip_id] = OutputRestore(Path(p.ab).parent, VideoSettings.from_project(self.settings),
+                                                         p.fps, (1, 1))
+        return r
 
     def _cast(self, p, ab, src: int):
         from pathlib import Path
@@ -221,16 +248,35 @@ class PreviewProvider(QObject):
             g16 = r.get(src)
             if g16 is None or self.want is not None:
                 return
-            gray = g16.astype(np.float32) / 65535.0
-            gimg = to_qimage((gray * 255.0 + 0.5).astype(np.uint8))
+            from ..color import lab_to_srgb, srgb_to_l
+            from ..film import invert
+            from ..video.pipeline import OutputRestore, finish
+
+            s = VideoSettings.from_project(self.settings)
+            L = srgb_to_l(invert(g16, p.negative))
             ab = self.ab.get(p.clip_id)
+            if ab is not None and (s.deflicker_out or s.dust_out):
+                rest = OutputRestore(Path(p.ab).parent, s, p.fps, (g16.shape[1], g16.shape[0]))
+                nb = {}
+                if rest.flow is not None:  # dust needs the neighbours, as in export
+                    for d in (-1, 1):
+                        gn = r.get(src + d) if 0 <= src + d < len(ab) else None
+                        nb[d] = srgb_to_l(invert(gn, p.negative)) if gn is not None else None
+                L = rest(src, L, nb.get(-1), nb.get(1))
+                if self.want is not None:
+                    return
+            gray = lab_to_srgb(L, np.zeros(L.shape + (2,), np.float32))[..., 0]
+            gimg = to_qimage((np.clip(gray, 0, 1) * 255.0 + 0.5).astype(np.uint8))
             cimg = raw = None
             if ab is not None and src < len(ab):
-                s = VideoSettings.from_project(self.settings)
-                rgb = FrameRenderer(s)(gray, np.asarray(ab[src], np.float32),
-                                       self._cast(p, ab, src) if s.cast else None)
+                rgb = FrameRenderer(s)(None, np.asarray(ab[src], np.float32),
+                                       self._cast(p, ab, src) if s.cast else None, L=L)
                 raw = to_qimage((np.clip(rgb, 0, 1) * 255.0 + 0.5).astype(np.uint8))
-                cimg = self._graded(rgb, p.clip_id, src, raw)
+                if self.show_matte:
+                    cimg = self._graded(rgb, p.clip_id, src, raw)
+                else:  # grade and regrain: the same finish as export
+                    out = finish(rgb, s, self.book, p.clip_id, src)
+                    cimg = to_qimage((np.clip(out, 0, 1) * 255.0 + 0.5).astype(np.uint8))
             if self.want is None and self.last_shown == frame:
                 self.ready.emit(frame, gimg, cimg, True, raw)
         except Exception:  # a still is a nicety; the proxy frame stays up

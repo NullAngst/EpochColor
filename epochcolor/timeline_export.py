@@ -16,17 +16,19 @@ from .video.pipeline import Piece, VideoSettings, analysis_dir, analyze, render
 
 
 def clip_info(c: Clip) -> ClipInfo:
-    return ClipInfo(path=Path(c.path), width=c.width, height=c.height, fps=c.fps,
+    info = ClipInfo(path=Path(c.path), width=c.width, height=c.height, fps=c.fps,
                     frames_estimate=c.frames, duration=c.frames / float(c.fps),
                     start_time=c.start_time, codec=c.codec)
+    info.negative = c.neg
+    return info
 
 
 def analysis_state(c: Clip, s: VideoSettings, model_name: str, weights: str | None = None,
-                   hints: dict | None = None) -> str:
+                   hints: dict | None = None, references: dict | None = None) -> str:
     """"ready" when the cached chroma matches the clip's current shots and
     the stabilizer setting, "partial" when some of the model pass is done,
     "none" otherwise."""
-    d = analysis_dir(Path(c.path), s, model_name, weights)
+    d = analysis_dir(Path(c.path), s, model_name, weights, c.neg)
     m = d / "meta.json"
     if not m.exists():
         return "none"
@@ -37,7 +39,7 @@ def analysis_state(c: Clip, s: VideoSettings, model_name: str, weights: str | No
     from .video.pipeline import wanted_stab
 
     stab = meta.get("stab")
-    want = wanted_stab([tuple(x) for x in c.shots], s.stabilize, hints)
+    want = wanted_stab([tuple(x) for x in c.shots], s.stabilize, hints, references)
     if isinstance(stab, dict) and all(stab.get(k) == v for k, v in want.items()) and (d / "ab.npy").exists():
         return "ready"
     done = {tuple(x) for x in meta.get("model_done", [])}
@@ -72,22 +74,23 @@ class ExportJob:
 
     hints: dict = field(default_factory=dict)
     grades: object = None
+    references: dict = field(default_factory=dict)  # clip id -> {str(shot start): reference}
 
     def run(self, model: ColorModel | None = None, progress=None, quiet: bool = True) -> dict:
         timings = {}
         dirs = {}
         for c in self.clips:
             if analysis_state(c, self.settings, self.model_name, self.weights,
-                              self.hints.get(c.id)) != "ready":
+                              self.hints.get(c.id), self.references.get(c.id)) != "ready":
                 if model is None:
                     raise RuntimeError(f"{c.name} is not colorized yet")
             if model is None:
-                dirs[c.id] = analysis_dir(Path(c.path), self.settings, self.model_name, self.weights)
+                dirs[c.id] = analysis_dir(Path(c.path), self.settings, self.model_name, self.weights, c.neg)
                 continue
             rep = analyze(clip_info(c), model, self.settings, shots=c.shots, quiet=quiet,
-                          progress=progress, hints=self.hints.get(c.id))
+                          progress=progress, hints=self.hints.get(c.id), references=self.references.get(c.id))
             dirs[c.id] = rep.dir
-        pieces = [Piece(Path(c.path), c.fps, c.width, c.height, dirs[c.id], a, b, c.id)
+        pieces = [Piece(Path(c.path), c.fps, c.width, c.height, dirs[c.id], a, b, c.id, c.neg)
                   for c, a, b in self.project_pieces]
         timings.update(render(pieces, self.plan, self.out, self.settings,
                               audio_source=self.audio_source, audio_timeline=self.audio_timeline,
@@ -117,7 +120,8 @@ def build_export(p: Project, model: ColorModel | None, es: ExportSettings, out: 
     from .grade import GradeBook
 
     job = ExportJob(pieces, plan, out, s, name, weights, clips=clips, hints=dict(p.d.hints),
-                    grades=GradeBook(p.d.grades, {cid: c.shots for cid, c in p.d.clips.items()}))
+                    grades=GradeBook(p.d.grades, {cid: c.shots for cid, c in p.d.clips.items()}),
+                    references=dict(p.d.references))
     if plan.audio_maps:
         if edited:
             inputs, index = [], {}
