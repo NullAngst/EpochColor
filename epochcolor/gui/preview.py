@@ -53,6 +53,7 @@ class PreviewProvider(QObject):
         self.readers: dict[str, object] = {}
         self.sources: dict[str, object] = {}
         self.ab: dict[str, np.ndarray] = {}
+        self.casts: dict = {}
         self.cache: OrderedDict[int, tuple] = OrderedDict()
         self.want: tuple[int, bool] | None = None
         self.last_shown = -1
@@ -99,6 +100,7 @@ class PreviewProvider(QObject):
             for k in [k for k in d if k not in live]:
                 d.pop(k).close()
         self.ab = {k: v for k, v in self.ab.items() if k in live}
+        self.casts = {}  # chroma.ShotCasts per clip, measured again after any change
         for p in self.layout:
             if p.ab is None:
                 self.ab.pop(p.clip_id, None)
@@ -165,13 +167,25 @@ class PreviewProvider(QObject):
         import cv2
 
         h, w = g.shape
+        from ..chroma import adjust
+
         abw = cv2.resize(np.asarray(ab[src], np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
-        sat = float(self.settings.get("saturation", 1.0))
-        if sat != 1.0:
-            abw *= sat
+        cast = float(self.settings.get("cast", 0.0))
+        abw = adjust(abw, float(self.settings.get("saturation", 1.0)), cast,
+                     self._cast(p, ab, src) if cast else None)
         rgb8 = lab_to_srgb8_fast(gray8_to_l(g), abw)
         raw = to_qimage(rgb8)
         return gray, self._graded(rgb8.astype(np.float32) / 255.0, p.clip_id, src, raw), raw
+
+    def _cast(self, p, ab, src: int):
+        from pathlib import Path
+
+        from ..chroma import ShotCasts
+
+        c = self.casts.get(p.clip_id)
+        if c is None:
+            c = self.casts[p.clip_id] = ShotCasts(Path(p.ab).parent, ab)
+        return c.at(src)
 
     def _graded(self, rgb: np.ndarray, clip_id: str, src: int, raw):
         """The grade on top, or the qualifier matte when asked to show it."""
@@ -213,7 +227,8 @@ class PreviewProvider(QObject):
             cimg = raw = None
             if ab is not None and src < len(ab):
                 s = VideoSettings.from_project(self.settings)
-                rgb = FrameRenderer(s)(gray, np.asarray(ab[src], np.float32))
+                rgb = FrameRenderer(s)(gray, np.asarray(ab[src], np.float32),
+                                       self._cast(p, ab, src) if s.cast else None)
                 raw = to_qimage((np.clip(rgb, 0, 1) * 255.0 + 0.5).astype(np.uint8))
                 cimg = self._graded(rgb, p.clip_id, src, raw)
             if self.want is None and self.last_shown == frame:

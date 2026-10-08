@@ -87,13 +87,19 @@ def keyframe_fix(model: ColorModel, source: Path, fps: Fraction, frame: int, str
     return T.astype(np.float32), np.clip(W, 0, 1).astype(np.float32)
 
 
-def carry(Ldn, ab_raw, a: int, b: int, keys: dict[int, tuple[np.ndarray, np.ndarray]],
-          flow: Flow, tol: float, out) -> None:
+def carry(Ldn, ab_raw, a: int, b: int, keys, flow: Flow, tol: float, out, protect=None) -> None:
     """Fill out[0 : b-a] with the hinted chroma for frames [a, b).
 
-    Ldn, ab_raw: whole-clip arrays (chroma size). keys: clip frame ->
-    (target, weight). out: array-like of the shot's length.
+    Ldn, ab_raw: whole-clip arrays (chroma size). keys: either a dict of
+    clip frame -> (target, weight), carried through the whole shot, or a
+    list of (frame, target, weight, reach) where reach is how many frames
+    either side the fix may travel: -1 for the whole shot, 0 for its own
+    frame only. out: array-like of the shot's length. protect, when given
+    ((b-a, h, w) floats), gets the weight of the frame-limited fixes, so
+    the stabilizer that runs next can be kept from averaging them away.
     """
+    if isinstance(keys, dict):
+        keys = [(k, T, W, -1) for k, (T, W) in keys.items()]
     n = b - a
     ch, cw = Ldn[a].shape
     accT = np.zeros((n, ch, cw, 2), np.float32) if n * ch * cw * 12 < 6e8 else None
@@ -115,19 +121,23 @@ def carry(Ldn, ab_raw, a: int, b: int, keys: dict[int, tuple[np.ndarray, np.ndar
     def L(t):
         return np.asarray(Ldn[t], np.float32)
 
-    for k, (T0, W0) in keys.items():
-        for step in (1, -1):
+    for k, T0, W0, reach in keys:
+        for step in ((1,) if reach == 0 else (1, -1)):
             T, W = T0, W0
             t = k
             while True:
                 i = t - a
                 near = 1.0 / (1.0 + abs(t - k) / 24.0)  # a fix one second away counts half
                 wa = W * near
+                if protect is not None and reach >= 0:
+                    protect[i] = np.maximum(protect[i], W)
                 accT[i] += T * wa[..., None]
                 accA[i] += wa
                 accW[i] = np.maximum(accW[i], W)
                 t2 = t + step
                 if not (a <= t2 < b) or (step == -1 and t2 < a):
+                    break
+                if reach >= 0 and abs(t2 - k) > reach:
                     break
                 F = flow(L(t2), L(t))
                 Tw = warp(T, F)

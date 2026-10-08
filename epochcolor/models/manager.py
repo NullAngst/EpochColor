@@ -29,7 +29,7 @@ from .. import diskspace
 from .weights import models_dir, sha256_file
 
 CATALOG_URL = "https://raw.githubusercontent.com/NullAngst/EpochColor/HEAD/catalog.json"
-ARCHITECTURES = ("eccv16", "siggraph17", "ddcolor")
+ARCHITECTURES = ("eccv16", "siggraph17", "ddcolor", "deoldify")
 MODES = ("automatic", "hint", "exemplar")
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
@@ -245,7 +245,7 @@ A manifest is a small JSON file next to the weights:
   {
     "id": "my-model",                 lowercase, digits, dot, dash, underscore
     "name": "My fine-tuned DDColor",
-    "architecture": "ddcolor",        one of: eccv16, siggraph17, ddcolor
+    "architecture": "ddcolor",        one of: eccv16, siggraph17, ddcolor, deoldify
     "mode": "automatic",              automatic or hint
     "license": "CC-BY-NC-4.0",
     "params": {"model_size": "large", "input_size": 512},

@@ -294,6 +294,30 @@ def test_paint_grade_colours_and_models(tmp_path, window):
     w._colour_request("find", "")
     wait(app, w)
     assert isinstance(p.d.suggestions, list)  # random features: count means nothing, plumbing does
+    from epochcolor.worker import match_thumb_path
+
+    col = p.d.colors[0]
+    assert match_thumb_path(col["id"]).exists(), "the saved colour got its picture"
+    assert "red block" in w.colours.colours.item(0).text()
+
+    # matches merge per colour, show up in the panel, and a marker click uses one
+    w.seek(12)
+    sug = {"id": "s1", "color": col["id"], "kind": "clip", "target": c.id, "frame": 12,
+           "points": [[0.6, 0.5]], "score": 0.9}
+    other = {"id": "s2", "color": "someone-else", "kind": "clip", "target": c.id, "frame": 3,
+             "points": [[0.2, 0.2]], "score": 0.8}
+    p.d.suggestions = [other]
+    w._matches_found({"suggestions": [sug], "colors": [col["id"]]})
+    assert {m["id"] for m in p.d.suggestions} == {"s1", "s2"}, "a one-colour search keeps the others"
+    assert any("strong match" in w.colours.matches.item(i).text() for i in range(w.colours.matches.count()))
+    assert any(x[4] == "s1" for x in w.viewer.suggestions), "the marker is on the picture"
+    before = len(p.strokes_at(c.id, 12))
+    w.viewer.suggestionClicked.emit("s1", True)
+    assert len(p.strokes_at(c.id, 12)) == before + 1
+    assert [m["id"] for m in p.d.suggestions] == ["s2"]
+    w._colour_request("dismiss_all", "")
+    assert p.d.suggestions == []
+    wait(app, w)
 
     # ---- photo: paint, colorize with hints, grade on display
     import cv2
@@ -324,3 +348,58 @@ def test_paint_grade_colours_and_models(tmp_path, window):
     states = [mm.table.item(i, 5).text() for i in range(mm.table.rowCount())]
     assert any("installed" in s_ for s_ in states)
     mm.close()
+
+
+def test_frame_by_frame_painting_and_cast(tmp_path, window):
+    from epochcolor.timeline_export import clip_info
+    from epochcolor.video.pipeline import VideoSettings, analysis_dir, analyze
+
+    app, w = window
+    truth = make_clip(tmp_path / "a.mkv")
+    w.add_clips([str(tmp_path / "a.mkv")])
+    wait(app, w)
+    p = w.project
+    c = next(iter(p.d.clips.values()))
+    analyze(clip_info(c), Oracle(truth), VideoSettings.from_project(p.d.settings), shots=c.shots, quiet=True)
+    w._refresh()
+
+    # frame by frame: new strokes get reach 0 (this frame only)
+    w.seek(5)
+    w.toggle_frame_mode()
+    assert w.paintbar.paint.isChecked() and w.viewer.brush.get("reach") == 0
+    # the red box's centre on frame 5 is at x = 90 + 2*5 = 100 of 320
+    w.viewer.strokeFinished.emit({**w.viewer.brush, "points": [[100 / 320, 0.55]]})
+    assert p.strokes_at(c.id, 5)[0]["reach"] == 0
+
+    # carry: the stroke lands on frame 6, moved with the box, and the playhead follows
+    w.carry_strokes(1)
+    moved = p.strokes_at(c.id, 6)
+    assert len(moved) == 1 and moved[0]["from"] == 5
+    assert moved[0]["points"][0][0] == pytest.approx(102 / 320, abs=1.5 / 320)
+    assert w._paint_target() == ("clip", c.id, 6)
+    # onion skin on frame 6 shows frame 5's stroke
+    assert w.viewer.ghosts and w.viewer.ghosts[0]["points"] == [[100 / 320, 0.55]]
+    # carrying from 5 again replaces what it put on 6 instead of stacking copies
+    w.seek(5)
+    w.carry_strokes(1)
+    assert len(p.strokes_at(c.id, 6)) == 1
+
+    # the hint pass runs through the worker with frame-limited strokes
+    w.apply_hints()
+    wait(app, w)
+    d = analysis_dir(c.path, VideoSettings.from_project(p.d.settings), p.d.settings["model"])
+    assert list(d.glob("protect_*.npy")), "frame-limited fixes are kept apart from the stabilizer"
+
+    # cast removal is a live setting: the preview changes without a new pass
+    got = {}
+    w.provider.ready.connect(lambda f, gi, col, full, raw: got.update(raw=raw))
+    w.seek(15)
+    pump(app, 1.0)
+    before = got["raw"].pixelColor(300, 20)
+    w._setting_changed("cast", 1.0)
+    got.clear()
+    w.seek(16)
+    w.seek(15)
+    pump(app, 1.0)
+    assert not w.runner.busy()
+    assert got["raw"].pixelColor(300, 20) != before

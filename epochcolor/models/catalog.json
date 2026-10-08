@@ -50,8 +50,14 @@
       "license": "unverified: the code is Apache-2.0, check the model card for the weights",
       "license_url": "https://huggingface.co/piddnad/ddcolor_modelscope",
       "license_ok": false,
-      "params": {"model_size": "large", "input_size": 512},
-      "source": {"type": "huggingface", "repo": "piddnad/ddcolor_modelscope"}
+      "params": {
+        "model_size": "large",
+        "input_size": 512
+      },
+      "source": {
+        "type": "huggingface",
+        "repo": "piddnad/ddcolor_modelscope"
+      }
     },
     {
       "id": "ddcolor-paper",
@@ -64,8 +70,14 @@
       "license": "unverified: the code is Apache-2.0, check the model card for the weights",
       "license_url": "https://huggingface.co/piddnad/ddcolor_paper",
       "license_ok": false,
-      "params": {"model_size": "large", "input_size": 512},
-      "source": {"type": "huggingface", "repo": "piddnad/ddcolor_paper"}
+      "params": {
+        "model_size": "large",
+        "input_size": 512
+      },
+      "source": {
+        "type": "huggingface",
+        "repo": "piddnad/ddcolor_paper"
+      }
     },
     {
       "id": "ddcolor-artistic",
@@ -78,8 +90,14 @@
       "license": "unverified: the code is Apache-2.0, check the model card for the weights",
       "license_url": "https://huggingface.co/piddnad/ddcolor_artistic",
       "license_ok": false,
-      "params": {"model_size": "large", "input_size": 512},
-      "source": {"type": "huggingface", "repo": "piddnad/ddcolor_artistic"}
+      "params": {
+        "model_size": "large",
+        "input_size": 512
+      },
+      "source": {
+        "type": "huggingface",
+        "repo": "piddnad/ddcolor_artistic"
+      }
     },
     {
       "id": "ddcolor-tiny",
@@ -92,8 +110,80 @@
       "license": "unverified: the code is Apache-2.0, check the model card for the weights",
       "license_url": "https://huggingface.co/piddnad/ddcolor_paper_tiny",
       "license_ok": false,
-      "params": {"model_size": "tiny", "input_size": 512},
-      "source": {"type": "huggingface", "repo": "piddnad/ddcolor_paper_tiny"}
+      "params": {
+        "model_size": "tiny",
+        "input_size": 512
+      },
+      "source": {
+        "type": "huggingface",
+        "repo": "piddnad/ddcolor_paper_tiny"
+      }
+    },
+    {
+      "id": "deoldify-video",
+      "name": "DeOldify Video",
+      "architecture": "deoldify",
+      "mode": "automatic",
+      "description": "2019, ResNet-101 U-Net trained by DeOldify's author for film: calm, natural colour that holds steady from frame to frame. Less saturated than DDColor. The first one to try on footage.",
+      "size_mb": 834,
+      "vram_gb": 3,
+      "license": "MIT",
+      "license_url": "https://github.com/jantic/DeOldify/blob/master/LICENSE",
+      "license_ok": true,
+      "params": {
+        "variant": "wide",
+        "render_size": 336
+      },
+      "source": {
+        "type": "url",
+        "url": "https://huggingface.co/spensercai/DeOldify/resolve/main/ColorizeVideo_gen.pth",
+        "filename": "ColorizeVideo_gen.pth",
+        "sha256": "e3d98bb6a222354c79f95485c2f078a89dc724e9183662506d9e0f5aafac83ad"
+      }
+    },
+    {
+      "id": "deoldify-stable",
+      "name": "DeOldify Stable",
+      "architecture": "deoldify",
+      "mode": "automatic",
+      "description": "2019, the same network trained for photos: faces, landscapes and nature, with fewer stray colour blotches. Muted but believable.",
+      "size_mb": 834,
+      "vram_gb": 3,
+      "license": "MIT",
+      "license_url": "https://github.com/jantic/DeOldify/blob/master/LICENSE",
+      "license_ok": true,
+      "params": {
+        "variant": "wide",
+        "render_size": 560
+      },
+      "source": {
+        "type": "url",
+        "url": "https://huggingface.co/spensercai/DeOldify/resolve/main/ColorizeStable_gen.pth",
+        "filename": "ColorizeStable_gen.pth",
+        "sha256": "ca9cd7f43fb8b222c9a70f7b292e305a000694b0ff9d2ae4a6747b1a2e1ee5af"
+      }
+    },
+    {
+      "id": "deoldify-artistic",
+      "name": "DeOldify Artistic",
+      "architecture": "deoldify",
+      "mode": "automatic",
+      "description": "2019, ResNet-34 U-Net with bolder, more varied colour. Often the most interesting result and the most often wrong; good for stills you'll touch up.",
+      "size_mb": 244,
+      "vram_gb": 2,
+      "license": "MIT",
+      "license_url": "https://github.com/jantic/DeOldify/blob/master/LICENSE",
+      "license_ok": true,
+      "params": {
+        "variant": "deep",
+        "render_size": 560
+      },
+      "source": {
+        "type": "url",
+        "url": "https://huggingface.co/spensercai/DeOldify/resolve/main/ColorizeArtistic_gen.pth",
+        "filename": "ColorizeArtistic_gen.pth",
+        "sha256": "3f750246fa220529323b85a8905f9b49c0e5d427099185334d048fb5b5e22477"
+      }
     }
   ]
 }

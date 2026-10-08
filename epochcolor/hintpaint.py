@@ -2,7 +2,11 @@
 
 A stroke is a dict: {"rgb": [r, g, b] 0..255, "neutral": bool, "radius": r,
 "points": [[x, y], ...]} with x, y and the radius as fractions of the frame
-(the radius of the short side). Vector strokes stay small in the project
+(the radius of the short side). On video a stroke may also carry "reach":
+how many frames either side its fix travels, 0 for its own frame only.
+Without it a stroke reaches through its whole shot. "from" marks a stroke
+carried over from another frame (paint by frame), so carrying again
+replaces it instead of piling up copies. Vector strokes stay small in the project
 file, survive any resize, and rasterize to whatever size a pass works at.
 A neutral stroke asks for no colour at all: a grey wall, a white shirt.
 """
@@ -59,14 +63,53 @@ def strokes_key(strokes) -> str:
     """Changes whenever the strokes do, rounded so float noise doesn't.
     Takes a list of strokes or a {frame: strokes} dict."""
     def norm(st):
-        return {"rgb": [int(v) for v in st.get("rgb", [])], "n": bool(st.get("neutral")),
-                "r": round(float(st.get("radius", 0)), 5),
-                "p": [[round(x, 5), round(y, 5)] for x, y in st.get("points", [])]}
+        d = {"rgb": [int(v) for v in st.get("rgb", [])], "n": bool(st.get("neutral")),
+             "r": round(float(st.get("radius", 0)), 5),
+             "p": [[round(x, 5), round(y, 5)] for x, y in st.get("points", [])]}
+        if reach_of(st) >= 0:
+            d["reach"] = reach_of(st)  # only when set, so older projects keep their keys
+        return d
     if isinstance(strokes, dict):
         data = {str(k): [norm(s) for s in v] for k, v in sorted(strokes.items(), key=lambda kv: int(kv[0])) if v}
     else:
         data = [norm(s) for s in strokes or []]
     return hashlib.sha1(json.dumps(data, sort_keys=True).encode()).hexdigest()[:16]
+
+
+def reach_of(stroke: dict) -> int:
+    """Frames either side a stroke's fix travels; -1 is the whole shot."""
+    r = stroke.get("reach")
+    try:
+        return -1 if r is None else max(-1, int(r))
+    except (TypeError, ValueError):
+        return -1
+
+
+def group_by_reach(strokes: list) -> dict[int, list]:
+    out: dict[int, list] = {}
+    for st in strokes or []:
+        out.setdefault(reach_of(st), []).append(st)
+    return out
+
+
+def move_strokes(strokes: list, flow: np.ndarray) -> list:
+    """Strokes moved by optical flow F (from Flow(a, b): a(x) ~ b(x + F(x))),
+    so they land on the same things in frame b. Each point moves by the
+    median flow under the brush, which keeps a stroke whole when the flow is
+    noisy at its edge."""
+    h, w = flow.shape[:2]
+    short = min(w, h)
+    out = []
+    for st in strokes:
+        r = max(1, int(round(float(st.get("radius", 0.01)) * short)))
+        pts = []
+        for x, y in st.get("points") or []:
+            px, py = int(round(x * (w - 1))), int(round(y * (h - 1)))
+            win = flow[max(0, py - r):py + r + 1, max(0, px - r):px + r + 1].reshape(-1, 2)
+            dx, dy = (np.median(win, axis=0) if len(win) else (0.0, 0.0))
+            pts.append([float(np.clip(x + dx / max(1, w - 1), 0, 1)), float(np.clip(y + dy / max(1, h - 1), 0, 1))])
+        out.append({**st, "points": pts})
+    return out
 
 
 def hints_in(hints: dict | None, a: int, b: int) -> dict[int, list]:

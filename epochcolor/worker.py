@@ -168,11 +168,9 @@ def run_job(kind: str, job: dict, progress, models: dict) -> dict:
             progress("photos", i, len(items))
             res = _colorize_photo({**job, "path": src, "strokes": item.get("strokes")}, models)
             rgb, _ = load_image(res)
-            if sat != 1.0:
-                from .color import lab_to_srgb, srgb_to_lab
+            from .chroma import adjust_rgb
 
-                lab = srgb_to_lab(rgb)
-                rgb = lab_to_srgb(lab[..., 0], lab[..., 1:] * sat)
+            rgb = adjust_rgb(rgb, sat, float(job["settings"].get("cast", 0.0)))
             if item.get("grade"):
                 rgb = grade_apply(rgb, item["grade"])
             _, meta = load_image(src)
@@ -277,12 +275,14 @@ def _match(job: dict, progress, models: dict) -> dict:
     for col in job["colors"]:
         src = col["source"]
         path, frame, fps = where(src["kind"], src["target"], src.get("frame"))
-        e = exemplar(model, _working_l(path, frame, fps, size), [src["stroke"]])
+        L = _working_l(path, frame, fps, size)
+        e = exemplar(model, L, [src["stroke"]])
         if e is not None:
             colors.append(col)
             ex.append(e)
+            _thumb(L, None, src["stroke"], col["rgb"], match_thumb_path(col["id"]))
     if not ex:
-        return {"suggestions": []}
+        return {"suggestions": [], "colors": [c["id"] for c in job["colors"]]}
 
     targets = []
     for cid, c in clips.items():
@@ -294,7 +294,8 @@ def _match(job: dict, progress, models: dict) -> dict:
     for i, (kind, tid, frame, span) in enumerate(targets):
         progress("matching", i, len(targets))
         path, fr, fps = where(kind, tid, frame)
-        sims = similarity(model, _working_l(path, fr, fps, size), ex)
+        L = _working_l(path, fr, fps, size)
+        sims = similarity(model, L, ex)
         for col, S in zip(colors, sims):
             src = col["source"]
             # skip where the colour came from
@@ -303,11 +304,53 @@ def _match(job: dict, progress, models: dict) -> dict:
                 continue
             score, pts = peaks(S, thr)
             if pts:
-                out.append({"id": new_id(), "color": col["id"], "kind": kind, "target": tid,
+                sid = new_id()
+                out.append({"id": sid, "color": col["id"], "kind": kind, "target": tid,
                             "frame": frame, "points": pts, "score": round(score, 3)})
+                _thumb(L, pts, None, col["rgb"], match_thumb_path(sid))
     progress("matching", len(targets), len(targets))
     out.sort(key=lambda x: -x["score"])
-    return {"suggestions": out}
+    return {"suggestions": out, "colors": [c["id"] for c in job["colors"]]}
+
+
+def match_thumb_path(ident: str) -> Path:
+    """A small picture for a saved colour (where it came from) or a match
+    (the frame, the found places ringed). Kept out of the project file."""
+    from .video.pipeline import cache_root
+
+    return cache_root() / "match" / f"{ident}.png"
+
+
+def _thumb(L, points, stroke, rgb, out: Path, width: int = 192) -> None:
+    """The grey frame with the match points ringed, or the saved stroke drawn,
+    in the colour's own colour."""
+    import cv2
+    import numpy as np
+
+    from .color import lab_to_srgb
+
+    try:
+        h, w = L.shape
+        k = width / w
+        g = lab_to_srgb(cv2.resize(L, (width, max(8, round(h * k))), interpolation=cv2.INTER_AREA),
+                        np.zeros((max(8, round(h * k)), width, 2), np.float32))
+        img = np.ascontiguousarray((np.clip(g, 0, 1) * 255).astype(np.uint8)[..., ::-1])  # BGR for cv2
+        th, tw = img.shape[:2]
+        col = (int(rgb[2]), int(rgb[1]), int(rgb[0]))
+        if stroke is not None:
+            from .hintpaint import rasterize
+
+            m = rasterize([stroke], tw, th).mask > 0
+            img[m] = (0.45 * img[m] + 0.55 * np.array(col)).astype(np.uint8)
+        for x, y in points or []:
+            c = (int(round(x * (tw - 1))), int(round(y * (th - 1))))
+            r = max(6, int(0.09 * min(tw, th)))
+            cv2.circle(img, c, r + 2, (255, 255, 255), 3, cv2.LINE_AA)
+            cv2.circle(img, c, r, col, 2, cv2.LINE_AA)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(out), img)
+    except Exception:  # a picture is a nicety; the match stands without it
+        pass
 
 
 def _track_mask(job: dict, progress) -> dict:

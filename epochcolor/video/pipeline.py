@@ -55,6 +55,7 @@ class VideoSettings:
     shot_threshold: float = 6.0
     guided: bool = True
     saturation: float = 1.0
+    cast: float = 0.0  # 0..1, how much of the measured colour cast to take out (chroma.py)
     frames: int | None = None  # process only the first N frames
     flow_preset: str = "medium"
     chroma_size: int = 256  # short side of the stored chroma
@@ -62,7 +63,7 @@ class VideoSettings:
     @classmethod
     def from_project(cls, d: dict) -> "VideoSettings":
         keys = {"working_size", "grain", "denoise", "stabilize", "shot_threshold", "saturation",
-                "chroma_size"}
+                "chroma_size", "cast"}
         return cls(**{k: v for k, v in d.items() if k in keys})
 
 
@@ -85,7 +86,7 @@ class Analysis:
 VideoReport = Analysis  # the CLI's report is the analysis plus render timings
 
 
-CACHE_PARTS = ("clips", "photos", "media", "export", "tmp")  # all cache_root ever holds
+CACHE_PARTS = ("clips", "photos", "media", "export", "tmp", "match")  # all cache_root ever holds
 
 
 def cache_root() -> Path:
@@ -407,7 +408,7 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
     else:
         ab = _memmap(ab_path, (n, ch, cw, 2), np.int8)
         redo = list(shots)
-    from ..hintpaint import hints_in, strokes_key
+    from ..hintpaint import group_by_reach, hints_in, strokes_key
     from .hints_pass import carry, keyframe_fix
 
     tol = max(2.0, 3.0 * sigma)
@@ -421,28 +422,58 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
         if shot_hints:
             key = strokes_key(shot_hints)
             hpath = cdir / f"hint_{a}_{b}_{key}.npy"
-            for old in cdir.glob(f"hint_{a}_{b}_*.npy"):
-                if old != hpath:
+            ppath = cdir / f"protect_{a}_{b}_{key}.npy"  # where frame-limited fixes are, see carry()
+            for old in list(cdir.glob(f"hint_{a}_{b}_*.npy")) + list(cdir.glob(f"protect_{a}_{b}_*.npy")):
+                if old not in (hpath, ppath):
                     old.unlink()
             if not hpath.exists():
                 if progress:
                     progress("hints", count, max(1, total))
-                keys = {}
-                for f, strokes in shot_hints.items():
-                    keys[f] = keyframe_fix(model, info.path, info.fps, f, strokes, (ww, wh), (cw, ch),
-                                           np.asarray(ab_raw[f], np.float32), s.denoise)
+                keys = []
+                used = set()
+                for f, strokes in sorted(shot_hints.items()):
+                    for reach, group in group_by_reach(strokes).items():
+                        # each painted frame's fix is cached on its own, so painting
+                        # frame after frame doesn't redo the frames already done
+                        kf = cdir / f"kf_{f}_{reach}_{strokes_key(group)}.npz"
+                        used.add(kf.name)
+                        if kf.exists():
+                            with np.load(kf) as z:
+                                T, W = z["T"], z["W"]
+                        else:
+                            T, W = keyframe_fix(model, info.path, info.fps, f, group, (ww, wh), (cw, ch),
+                                                np.asarray(ab_raw[f], np.float32), s.denoise)
+                            np.savez(kf, T=T.astype(np.float16), W=W.astype(np.float16))
+                        keys.append((f, np.asarray(T, np.float32), np.asarray(W, np.float32), reach))
+                for old_kf in cdir.glob("kf_*.npz"):
+                    try:
+                        fr = int(old_kf.name.split("_")[1])
+                    except (IndexError, ValueError):
+                        continue
+                    if a <= fr < b and old_kf.name not in used:
+                        old_kf.unlink()
                 hinted = _memmap(hpath.with_suffix(".tmp.npy"), (b - a, ch, cw, 2), np.int8)
                 buf = np.empty((b - a, ch, cw, 2), np.float32) if (b - a) * ch * cw * 8 < 5e8 else \
                     _memmap(cdir / "hbuf.npy", (b - a, ch, cw, 2))
-                carry(Ldn, ab_raw, a, b, keys, flow, tol, buf)
+                prot = _memmap(ppath.with_suffix(".tmp.npy"), (b - a, ch, cw), np.uint8) \
+                    if any(k[3] >= 0 for k in keys) else None
+                pbuf = np.zeros((b - a, ch, cw), np.float32) if prot is not None else None
+                carry(Ldn, ab_raw, a, b, keys, flow, tol, buf, protect=pbuf)
                 hinted[:] = _to_i8(np.asarray(buf))
                 hinted.flush()
                 del hinted, buf
                 (cdir / "hbuf.npy").unlink(missing_ok=True)
+                if prot is not None:
+                    prot[:] = np.clip(pbuf * 255 + 0.5, 0, 255).astype(np.uint8)
+                    prot.flush()
+                    del prot, pbuf
+                    ppath.with_suffix(".tmp.npy").rename(ppath)
                 hpath.with_suffix(".tmp.npy").rename(hpath)
             src = _Slice(np.load(hpath, mmap_mode="r"), 0, b - a)
+            protect = np.load(ppath, mmap_mode="r") if ppath.exists() else None
         else:
-            for old in cdir.glob(f"hint_{a}_{b}_*.npy"):
+            protect = None
+            for old in list(cdir.glob(f"hint_{a}_{b}_*.npy")) + list(cdir.glob(f"protect_{a}_{b}_*.npy")):
                 old.unlink()
         if (b - a) * ch * cw * 2 * 4 < 5e8:
             scratch = np.empty((b - a, ch, cw, 2), np.float32)
@@ -452,6 +483,11 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
             out = _memmap(cdir / "out.npy", (b - a, ch, cw, 2))
         stabilize_chroma(_Slice(Ldn, a, b), src, out, strength=s.stabilize, tol=tol, flow=flow,
                          scratch=scratch)
+        if protect is not None:  # frame-by-frame strokes keep their own frame's colour
+            for i in range(b - a):
+                pw = np.asarray(protect[i], np.float32)[..., None] / 255.0
+                if pw.max() > 0:
+                    out[i] = pw * np.asarray(src[i], np.float32) + (1 - pw) * np.asarray(out[i], np.float32)
         ab[a:b] = _to_i8(out)
         count += b - a
         prog(count)
@@ -532,14 +568,15 @@ class FrameRenderer:
         self.eps: float | None = None
         self.g = float(np.clip(s.grain, 0.0, 100.0)) / 100.0
 
-    def __call__(self, gray: np.ndarray, ab_small: np.ndarray) -> np.ndarray:
-        """gray: float 0..1 HxW. Returns sRGB float HxWx3."""
+    def __call__(self, gray: np.ndarray, ab_small: np.ndarray, bias: np.ndarray | None = None) -> np.ndarray:
+        """gray: float 0..1 HxW. bias: the shot's colour cast (chroma.ShotCasts).
+        Returns sRGB float HxWx3."""
+        from ..chroma import adjust
+
         Lfull = srgb_to_l(gray)
         if self.eps is None:
             self.eps = float(np.clip((2.0 * estimate_noise(Lfull)) ** 2, 1.0, 100.0))
-        ab = np.asarray(ab_small, np.float32)
-        if self.s.saturation != 1.0:
-            ab = ab * float(self.s.saturation)
+        ab = adjust(ab_small, self.s.saturation, self.s.cast, bias)
         if self.s.guided:
             abf = guided_upsample(ab, Lfull, self.eps)
         else:
@@ -574,9 +611,14 @@ def render(pieces: list[Piece], plan: ExportPlan, out: str | Path, s: VideoSetti
     try:
         for p in pieces:
             ab = np.load(p.analysis / "ab.npy", mmap_mode="r")
+            casts = None
+            if s.cast:
+                from ..chroma import ShotCasts
+
+                casts = ShotCasts(p.analysis, ab)
             for i, g16 in enumerate(iter_range(p.path, p.fps, p.src_in, p.src_out)):
                 gray = g16.astype(np.float32) / 65535.0
-                rgb = rend(gray, ab[p.src_in + i])
+                rgb = rend(gray, ab[p.src_in + i], casts.at(p.src_in + i) if casts else None)
                 if grades is not None:
                     from ..grade import apply as grade_apply
 

@@ -33,6 +33,7 @@ class Viewer(_base()):
     strokeFinished = Signal(dict)  # a painted stroke, coordinates as fractions of the frame
     eraseAt = Signal(float, float)
     picked = Signal(float, float, object)  # x, y, (r, g, b) 0..1 from the ungraded colour, or None
+    suggestionClicked = Signal(str, bool)  # a match marker: its id, True to use it, False to skip
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -56,7 +57,9 @@ class Viewer(_base()):
         self.raw: QImage | None = None  # ungraded colour, for sampling
         # overlays
         self.mask_outline: dict | None = None  # the grade's shape mask
-        self.suggestions: list[tuple[float, float, list, str]] = []
+        self.suggestions: list[tuple] = []  # (x, y, rgb, label, id)
+        self.ghosts: list[dict] = []  # onion skin: a nearby frame's strokes, drawn faint
+        self.frame_note = ""  # "frame by frame, this frame only" and the like
         self.setMinimumSize(320, 180)
         self.setMouseTracking(True)
 
@@ -72,7 +75,8 @@ class Viewer(_base()):
         self.raw = raw if raw is not None else color
         self.update()
 
-    def set_overlays(self, strokes=None, mask=None, suggestions=None) -> None:
+    def set_overlays(self, strokes=None, mask=None, suggestions=None, ghosts=None) -> None:
+        self.ghosts = list(ghosts or [])
         if strokes is not None:
             self.strokes = strokes
         self.mask_outline = mask
@@ -121,6 +125,8 @@ class Viewer(_base()):
         tags = []
         if self.paint_mode:
             tags.append("painting: drag to paint, right-click a stroke to remove it, Ctrl+click picks a colour")
+            if self.frame_note:
+                tags.append(self.frame_note)
         if self.pick_mode:
             tags.append({"colour": "click to pick a colour", "neutral": "click something that should be grey",
                          "hue": "click the colour to isolate"}[self.pick_mode])
@@ -142,6 +148,21 @@ class Viewer(_base()):
         p.save()
         p.setClipRect(rect)
         p.setRenderHint(QPainter.Antialiasing, True)
+        if self.show_strokes and self.ghosts:
+            for st in self.ghosts:
+                pts = st.get("points") or []
+                if not pts:
+                    continue
+                width = max(2.0, 2 * float(st.get("radius", 0.02)) * short)
+                r, g, b = st.get("rgb", [150, 150, 150]) if not st.get("neutral") else (150, 150, 150)
+                p.setBrush(Qt.NoBrush)
+                p.setPen(QPen(QColor(int(r), int(g), int(b), 70), width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+                path = QPainterPath(pt(*pts[0]))
+                for x, y in pts[1:]:
+                    path.lineTo(pt(x, y))
+                if len(pts) == 1:
+                    path.addEllipse(pt(*pts[0]), width / 2, width / 2)
+                p.drawPath(path)
         strokes = list(self.strokes) if self.show_strokes else []
         if self._live:
             strokes.append({**self.brush, "points": self._live})
@@ -185,12 +206,18 @@ class Viewer(_base()):
             else:
                 p.drawRect(QRectF(-rw, -rh, 2 * rw, 2 * rh))
             p.resetTransform()
-        for x, y, rgb, label in self.suggestions:
+        for x, y, rgb, label, _ in self.suggestions:
             c = pt(x, y)
-            p.setPen(QPen(QColor(255, 255, 255, 220), 2))
-            p.setBrush(QColor(int(rgb[0]), int(rgb[1]), int(rgb[2]), 200))
-            p.drawEllipse(c, 9, 9)
-            self._label(p, QPointF(c.x() + 12, c.y() - 10), f"{label}?")
+            p.setPen(QPen(QColor(255, 255, 255, 230), 2.5))
+            p.setBrush(QColor(int(rgb[0]), int(rgb[1]), int(rgb[2]), 210))
+            p.drawEllipse(c, 10, 10)
+            p.setPen(QPen(QColor(0, 0, 0, 160), 1))
+            p.setBrush(Qt.NoBrush)
+            p.drawEllipse(c, 12, 12)
+            text = f"{label}?  click: use  ·  right-click: skip"
+            tw = p.fontMetrics().horizontalAdvance(text) + 16
+            x = c.x() + 15 if c.x() + 15 + tw <= rect.right() else c.x() - 15 - tw
+            self._label(p, QPointF(x, c.y() - 11), text)
         if self.paint_mode and self._mouse is not None and rect.contains(self._mouse):
             rad = max(2.0, float(self.brush["radius"]) * short)
             p.setPen(QPen(QColor(255, 255, 255, 200), 1))
@@ -235,9 +262,24 @@ class Viewer(_base()):
         r = self._target(base)
         return abs(x - (r.left() + r.width() * self.split)) < 8
 
+    def _marker_at(self, pos: QPointF):
+        base = self.gray or self.color
+        if base is None or not self.suggestions:
+            return None
+        r = self._target(base)
+        for x, y, _, _, ident in self.suggestions:
+            c = QPointF(r.left() + x * r.width(), r.top() + y * r.height())
+            if (c.x() - pos.x()) ** 2 + (c.y() - pos.y()) ** 2 <= 13 ** 2:
+                return ident
+        return None
+
     def mousePressEvent(self, ev) -> None:
         pos = ev.position()
         n = self._norm(pos)
+        hit = self._marker_at(pos)
+        if hit is not None and ev.button() in (Qt.LeftButton, Qt.RightButton) and not self.pick_mode:
+            self.suggestionClicked.emit(hit, ev.button() == Qt.LeftButton)
+            return
         if self.pick_mode and ev.button() == Qt.LeftButton:
             if n:
                 self.picked.emit(n[0], n[1], self.sample(*n))

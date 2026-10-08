@@ -87,7 +87,7 @@ def cmd_photo(a: argparse.Namespace) -> int:
         denoise=a.denoise,
         spread=a.spread,
         guided=not a.no_guided,
-        saturation=a.saturation,
+        saturation=a.saturation, cast=a.cast / 100.0,
     )
     dev = RawDevelop(exposure_ev=a.raw_exposure, camera_wb=not a.raw_auto_wb)
     failed = 0
@@ -262,7 +262,7 @@ def cmd_video(a: argparse.Namespace) -> int:
     vs = VideoSettings(
         working_size=a.working_size, grain=a.grain, denoise=a.denoise,
         stabilize=a.stabilize, shot_threshold=a.shot_threshold, guided=not a.no_guided,
-        saturation=a.saturation, frames=a.frames, chroma_size=a.chroma_size,
+        saturation=a.saturation, cast=a.cast / 100.0, frames=a.frames, chroma_size=a.chroma_size,
     )
     try:
         rep = colorize_video(info, model, out, plan, vs, use_cache=not a.no_cache)
@@ -567,6 +567,8 @@ def build_parser() -> argparse.ArgumentParser:
     ph.add_argument("--working-size", type=int, default=512,
                     help="short side in pixels for chroma work (default 512)")
     ph.add_argument("--saturation", type=float, default=1.0, help="chroma multiplier (default 1.0)")
+    ph.add_argument("--cast", type=float, default=0.0,
+                    help="remove the model's all-over colour cast, 0 to 100 percent (default 0)")
     ph.add_argument("--no-guided", action="store_true", help="plain bicubic chroma upscale")
     ph.add_argument("--bits", type=int, choices=[8, 16], help="PNG/TIFF bit depth")
     ph.add_argument("--quality", type=int, default=95, help="JPEG/WebP quality (default 95)")
@@ -593,6 +595,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--chroma-size", type=int, default=256,
                    help="short side of the stored colour (default 256); higher is crisper and bigger")
     g.add_argument("--saturation", type=float, default=1.0, help="chroma multiplier")
+    g.add_argument("--cast", type=float, default=0.0,
+                   help="remove the model's all-over colour cast per shot, 0 to 100 percent (default 0)")
     g.add_argument("--no-guided", action="store_true", help="plain bicubic chroma upscale")
     e = vi.add_argument_group("export")
     e.add_argument("--preset", help="export preset name or .json path (see `epochcolor presets`)")

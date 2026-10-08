@@ -31,7 +31,8 @@ class PhotoSettings:
     denoise: float | None = None  # L* units, None = auto
     spread: float | None = None  # None = per-model default
     guided: bool = True  # snap upscaled chroma to edges of the full-size luma
-    saturation: float = 1.0  # plain chroma multiplier, real grading is milestone 7
+    saturation: float = 1.0  # plain chroma multiplier
+    cast: float = 0.0  # 0..1, colour cast removal (chroma.py)
 
 
 @dataclass
@@ -139,8 +140,10 @@ def colorize_photo(
     elif model.info.mode == "propagation":
         rep.warnings.append("hints model with no hints gives a grey image")
 
-    if s.saturation != 1.0:
-        ab = ab * float(s.saturation)
+    if s.saturation != 1.0 or s.cast:
+        from .chroma import adjust, estimate_cast
+
+        ab = adjust(ab, s.saturation, s.cast, estimate_cast(ab) if s.cast else None)
 
     if s.guided:
         # grain measured at full size sets how much luma texture the

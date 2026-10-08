@@ -92,6 +92,7 @@ def default_settings() -> dict:
         "grain": 100.0,
         "denoise": None,
         "saturation": 1.0,
+        "cast": 0.0,  # colour cast removal, 0..1 (chroma.py)
         "shot_threshold": 6.0,
         "chroma_size": 256,
         "match_mode": "ask",  # saved colours: "ask" marks matches, "auto" paints them

@@ -43,6 +43,7 @@ include = ["epochcolor*"]
 [tool.setuptools.package-data]
 "epochcolor.models" = ["catalog.json"]
 "epochcolor.models.ddcolor_arch" = ["LICENSE"]
+"epochcolor.models.deoldify_arch" = ["LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

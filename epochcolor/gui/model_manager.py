@@ -16,6 +16,29 @@ from ..models.weights import models_dir
 from . import theme
 
 
+FIND_MORE = """
+<p>Everything in the list downloads from here. Beyond that, EpochColor loads weights
+for four network designs, so retrained or fine-tuned versions of them work too:</p>
+<ul>
+<li><b>DeOldify</b>: variant <i>wide</i> (the Video and Stable generators) or <i>deep</i> (Artistic).
+ <a href="https://github.com/jantic/DeOldify">github.com/jantic/DeOldify</a>,
+ <a href="https://huggingface.co/models?search=deoldify">DeOldify on Hugging Face</a></li>
+<li><b>DDColor</b>: model_size <i>tiny</i> or <i>large</i>.
+ <a href="https://github.com/piddnad/DDColor">github.com/piddnad/DDColor</a>,
+ <a href="https://huggingface.co/models?search=ddcolor">DDColor on Hugging Face</a></li>
+<li><b>Zhang et al.</b>: <i>eccv16</i> and <i>siggraph17</i>.
+ <a href="https://github.com/richzhang/colorization">github.com/richzhang/colorization</a></li>
+</ul>
+<p>Download the .pth or .safetensors file, then use <b>Add from file</b> with a small manifest
+that says which design it is (the button explains the format). The weights are checked
+against the design when they're added, so a file that doesn't fit is refused instead of
+giving garbage.</p>
+<p>Other colorizers (BigColor, DISCO, ColorFormer and the like) are different networks and
+need an adapter written for them first. Their weights won't load as any of the above.</p>
+<p>Check each model's license before using it for anything you publish.</p>
+"""
+
+
 class ModelManager(QDialog):
     """Downloads and installs go through the main window's job runner (the
     worker process), so they show progress there and can be cancelled."""
@@ -47,13 +70,14 @@ class ModelManager(QDialog):
         self.download_btn = QPushButton("Download")
         self.remove_btn = QPushButton("Remove")
         self.use_btn = QPushButton("Use for this project")
+        more = QPushButton("Find more models...")
         add = QPushButton("Add from file...")
         refresh = QPushButton("Refresh catalog")
         move = QPushButton("Storage folder...")
         for b in (self.download_btn, self.remove_btn, self.use_btn):
             row.addWidget(b)
         row.addStretch(1)
-        for b in (add, refresh, move):
+        for b in (more, add, refresh, move):
             row.addWidget(b)
         lay.addLayout(row)
         bb = QDialogButtonBox(QDialogButtonBox.Close)
@@ -63,6 +87,7 @@ class ModelManager(QDialog):
         self.remove_btn.clicked.connect(self._remove)
         self.use_btn.clicked.connect(self._use)
         add.clicked.connect(self._add)
+        more.clicked.connect(self._more)
         refresh.clicked.connect(lambda: self.submit.emit("refresh_catalog", "Refresh model catalog", {}))
         move.clicked.connect(self._move)
         self.chosen: str | None = None
@@ -148,6 +173,14 @@ class ModelManager(QDialog):
             self.chosen = e["id"]
             self.current_model = e["id"]
             self.reload()
+
+    def _more(self) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle("Find more models")
+        box.setTextFormat(Qt.RichText)
+        box.setText(FIND_MORE)
+        box.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        box.exec()
 
     def _add(self) -> None:
         w, _ = QFileDialog.getOpenFileName(self, "Weights file", "", "Weights (*.pth *.pt *.bin *.safetensors *.ckpt)")

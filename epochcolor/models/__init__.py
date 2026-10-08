@@ -16,9 +16,11 @@ DEFAULT_MODEL = "siggraph17"
 
 def adapters() -> dict[str, type]:
     from .ddcolor import DDColorAdapter
+    from .deoldify import DeOldifyAdapter
     from .zhang import ECCV16, SIGGRAPH17
 
-    return {"eccv16": ECCV16, "siggraph17": SIGGRAPH17, "ddcolor": DDColorAdapter}
+    return {"eccv16": ECCV16, "siggraph17": SIGGRAPH17, "ddcolor": DDColorAdapter,
+            "deoldify": DeOldifyAdapter}
 
 
 def info_for(e: dict) -> ModelInfo:

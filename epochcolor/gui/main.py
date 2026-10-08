@@ -56,6 +56,8 @@ M            marker with a note
 P            paint hints on/off; [ and ] (or the wheel) brush size
              drag paints, right-click removes a stroke, Ctrl+click picks a colour
 H            show or hide strokes
+F            paint frame by frame: strokes colour only their own frame (or a set reach)
+N  Shift+N   carry this frame's strokes to the next / previous frame along the motion
 Ctrl+Return  apply hints now
 Ctrl+R       colorize the selected clip (Ctrl+Shift+R: all)
 Ctrl+Alt+C/V copy / paste a shot's grade
@@ -116,6 +118,14 @@ class Inspector(QWidget):
         self.saturation = QDoubleSpinBox()
         self.saturation.setRange(0, 3)
         self.saturation.setSingleStep(0.05)
+        self.cast = QSpinBox()
+        self.cast.setRange(0, 100)
+        self.cast.setSingleStep(10)
+        self.cast.setSuffix(" %")
+        self.cast.setToolTip("Takes out the all-over tint a model lays on a whole shot (the orange or sepia "
+                             "wash). It measures how far the least colourful parts of each shot lean, and "
+                             "shifts the colour back by that much. 100% takes all of it out; a shot that's "
+                             "honestly warm, like a sunset, may want less.")
         self.denoise_auto = QCheckBox("auto")
         self.denoise = QDoubleSpinBox()
         self.denoise.setRange(0, 30)
@@ -131,9 +141,10 @@ class Inspector(QWidget):
         f.addRow("Stabilize", self.stabilize)
         f.addRow("Grain kept", self.grain)
         f.addRow("Saturation", self.saturation)
+        f.addRow("Remove colour cast", self.cast)
         f.addRow("Denoise", dn)
         note = QLabel("Model, working size, chroma size and denoise need a new colorize pass. "
-                      "Stabilize reruns a quick pass. Grain and saturation apply right away.")
+                      "Stabilize reruns a quick pass. Grain, saturation and cast removal apply right away.")
         note.setWordWrap(True)
         note.setStyleSheet(f"color: {theme.DIM}; font-size: 11px;")
         f.addRow(note)
@@ -175,6 +186,7 @@ class Inspector(QWidget):
         self.stabilize.valueChanged.connect(lambda v: self._queue("stabilize", round(v, 3)))
         self.grain.valueChanged.connect(lambda v: self._queue("grain", float(v)))
         self.saturation.valueChanged.connect(lambda v: self._queue("saturation", round(v, 3)))
+        self.cast.valueChanged.connect(lambda v: self._queue("cast", round(v / 100.0, 2)))
         self.denoise.valueChanged.connect(lambda v: self._denoise())
         self.denoise_auto.toggled.connect(self._denoise)
 
@@ -208,7 +220,7 @@ class Inspector(QWidget):
 
     def show_settings(self, s: dict) -> None:
         widgets = (self.model, self.working, self.chroma, self.stabilize, self.grain, self.saturation,
-                   self.denoise, self.denoise_auto)
+                   self.cast, self.denoise, self.denoise_auto)
         for w in widgets:
             w.blockSignals(True)
         if self.model.findData(s.get("model")) < 0 or self.model.count() == 0:
@@ -219,6 +231,7 @@ class Inspector(QWidget):
         self.stabilize.setValue(float(s.get("stabilize", 0.9)))
         self.grain.setValue(float(s.get("grain", 100)))
         self.saturation.setValue(float(s.get("saturation", 1.0)))
+        self.cast.setValue(int(round(float(s.get("cast", 0.0)) * 100)))
         dn = s.get("denoise")
         self.denoise_auto.setChecked(dn is None)
         self.denoise.setEnabled(dn is not None)
@@ -259,6 +272,7 @@ class MainWindow(QMainWindow):
         self.play_timer = QTimer(self)
         self.play_timer.setInterval(8)
         self.play_timer.timeout.connect(self._tick)
+        self._flow_readers: dict = {}  # proxy readers for carrying strokes, per clip
         self.hint_timer = QTimer(self)
         self.hint_timer.setSingleShot(True)
         self.hint_timer.setInterval(900)
@@ -318,11 +332,14 @@ class MainWindow(QMainWindow):
         self.viewer.strokeFinished.connect(self._stroke_added)
         self.viewer.eraseAt.connect(self._erase_at)
         self.viewer.picked.connect(self._picked)
+        self.viewer.suggestionClicked.connect(self._suggestion_clicked)
         top = QWidget()
         topl = QVBoxLayout(top)
         topl.setContentsMargins(0, 0, 0, 0)
         topl.setSpacing(0)
         topl.addWidget(self.paintbar)
+        topl.addWidget(self.paintbar.options_bar)
+        topl.addWidget(self.paintbar.frame_bar)
         topl.addWidget(self.viewer, 1)
         topl.addWidget(transport)
 
@@ -471,6 +488,9 @@ class MainWindow(QMainWindow):
         act(m, "Fit timeline", self._fit, "Shift+Z")
         m.addSeparator()
         act(m, "Paint hints", lambda: self.paintbar.paint.toggle(), "P")
+        act(m, "Paint frame by frame", self.toggle_frame_mode, "F")
+        act(m, "Carry strokes to the next frame", lambda: self.carry_strokes(1), "N")
+        act(m, "Carry strokes to the previous frame", lambda: self.carry_strokes(-1), "Shift+N")
         act(m, "Show strokes", lambda: self.paintbar.show.toggle(), "H")
         act(m, "Smaller brush", lambda: self.paintbar.size.setValue(int(self.paintbar.size.value() / 1.25)), "[")
         act(m, "Bigger brush", lambda: self.paintbar.size.setValue(int(self.paintbar.size.value() * 1.25) + 1), "]")
@@ -913,10 +933,10 @@ class MainWindow(QMainWindow):
             cimg = raw = None
             if res.exists():
                 rgb = self._photo_display(str(res)).astype(np.float32) / 255.0
-                sat = float(self.project.d.settings.get("saturation", 1.0))
-                if sat != 1.0:
-                    lab = srgb_to_lab(rgb)
-                    rgb = lab_to_srgb(lab[..., 0], lab[..., 1:] * sat)
+                from ..chroma import adjust_rgb
+
+                rgb = adjust_rgb(rgb, float(self.project.d.settings.get("saturation", 1.0)),
+                                 float(self.project.d.settings.get("cast", 0.0)))
                 raw = to_qimage((np.clip(rgb, 0, 1) * 255 + 0.5).astype(np.uint8))
                 cimg = raw
                 if ph.grade and not G.is_identity(ph.grade):
@@ -1104,7 +1124,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"done: {msg}", 8000)
             self.runner.shutdown()  # a fresh worker sees the new models folder
         elif job.kind == "match":
-            self._matches_found(result["suggestions"])
+            self._matches_found(result)
         elif job.kind == "track_mask":
             self._track_done(job, result)
         else:
@@ -1167,12 +1187,20 @@ class MainWindow(QMainWindow):
         self.viewer.erase_mode = pb.erase.isChecked()
         self.viewer.show_strokes = pb.show.isChecked() or pb.paint.isChecked()
         self.viewer.brush = {"rgb": list(pb.rgb), "neutral": pb.neutral.isChecked(), "radius": pb.radius()}
+        reach = pb.stroke_reach()
+        if reach is not None:
+            self.viewer.brush["reach"] = reach
+        self.viewer.frame_note = "" if reach is None else (
+            "frame by frame: this frame only" if reach == 0 else f"frame by frame: reach ±{reach}")
+        self._update_overlays()
         self.viewer.update()
 
     def _stroke_added(self, stroke: dict) -> None:
         t = self._paint_target()
         if t is None:
             return
+        if t[0] == "photo":
+            stroke.pop("reach", None)  # one frame anyway
         self._set_target_strokes(t, self._target_strokes(t) + [stroke], "paint")
         self._after_paint()
 
@@ -1204,6 +1232,68 @@ class MainWindow(QMainWindow):
             self._after_paint()
         elif name == "save_colour":
             self.save_colour()
+        elif name in ("carry_next", "carry_prev"):
+            self.carry_strokes(1 if name == "carry_next" else -1)
+
+    def toggle_frame_mode(self) -> None:
+        pb = self.paintbar
+        pb.frame_mode.toggle()
+        if pb.frame_mode.isChecked() and not pb.paint.isChecked():
+            pb.paint.setChecked(True)
+
+    def _gray_frame(self, clip_id: str, frame: int):
+        """A proxy frame as float L-ish (0..100) for optical flow, or None."""
+        from fractions import Fraction
+
+        from ..media import FrameReader
+
+        mi = self.media_info.get(clip_id)
+        if mi is None:
+            return None
+        r = self._flow_readers.get(clip_id)
+        if r is None or r.path != str(mi.proxy):
+            c = self.project.d.clips[clip_id]
+            r = self._flow_readers[clip_id] = FrameReader(mi.proxy, Fraction(c.fps_num, c.fps_den), "gray", cache=4)
+            r.path = str(mi.proxy)
+        g = r.get(frame)
+        return None if g is None else g.astype(np.float32) / 2.55
+
+    def carry_strokes(self, step: int) -> None:
+        """Move this frame's strokes onto the next (or previous) frame along the
+        optical flow between them, then go there: the frame-by-frame loop is
+        paint, carry, touch up, carry."""
+        from ..hintpaint import move_strokes
+        from ..video.temporal import Flow
+
+        t = self._paint_target()
+        if t is None or t[0] != "clip":
+            self.statusBar().showMessage("carrying strokes works on video frames", 4000)
+            return
+        cid, f = t[1], t[2]
+        strokes = self.project.strokes_at(cid, f)
+        if not strokes:
+            self.statusBar().showMessage("nothing painted on this frame to carry", 4000)
+            return
+        g = f + step
+        c = self.project.d.clips[cid]
+        if not (0 <= g < c.frames) or self.project.shot_start(cid, g) != self.project.shot_start(cid, f):
+            self.statusBar().showMessage("that's across a cut; strokes don't carry into another shot", 5000)
+            return
+        La, Lb = self._gray_frame(cid, f), self._gray_frame(cid, g)
+        if La is None or Lb is None:
+            self.statusBar().showMessage("no proxy frame to track with yet", 4000)
+            return
+        moved = move_strokes(strokes, Flow("medium")(La, Lb))
+        for st in moved:
+            st["from"] = f
+            if self.paintbar.frame_mode.isChecked():
+                st["reach"] = self.paintbar.reach.value()
+        keep = [st for st in self.project.strokes_at(cid, g) if st.get("from") != f]
+        self.project.set_strokes(cid, g, keep + moved, "carry strokes")
+        self.step(step)
+        if self._paint_target() != ("clip", cid, g):
+            self.statusBar().showMessage(f"carried to frame {g}, which isn't next on the timeline", 5000)
+        self._after_paint()
 
     def apply_hints(self) -> None:
         """Rerun the hint pass for what's in the viewer: the clip's changed
@@ -1241,7 +1331,7 @@ class MainWindow(QMainWindow):
                     if self.project.shot_start(t[1], m["frame"]) != shot:
                         continue
                 for x, y in m["points"]:
-                    sugs.append((x, y, c["rgb"], c["name"]))
+                    sugs.append((x, y, c["rgb"], c["name"], m["id"]))
         mask = None
         g = self.grade_panel.grade if self.grade_panel.isEnabled() else None
         if g and g["mask"]["shape"] != "none" and self.grade_dock.isVisible():
@@ -1250,7 +1340,15 @@ class MainWindow(QMainWindow):
                 dx, dy = G.GradeBook(self.project.d.grades,
                                      {cid: c.shots for cid, c in self.project.d.clips.items()}).mask_offset(t[1], t[2])
                 mask["_dx"], mask["_dy"] = dx, dy
-        self.viewer.set_overlays(strokes, mask, sugs)
+        ghosts = []
+        pb = self.paintbar
+        if t is not None and t[0] == "clip" and pb.frame_mode.isChecked() and pb.onion.isChecked():
+            shot = self.project.shot_start(t[1], t[2])
+            earlier = [k for k in self.project.hint_frames(t[1])
+                       if k < t[2] and self.project.shot_start(t[1], k) == shot]
+            if earlier:
+                ghosts = self.project.strokes_at(t[1], earlier[-1])
+        self.viewer.set_overlays(strokes, mask, sugs, ghosts)
 
     def _picked(self, x: float, y: float, rgb) -> None:
         mode = self.viewer.pick_mode
@@ -1298,8 +1396,10 @@ class MainWindow(QMainWindow):
         return out
 
     def _refresh_colours(self) -> None:
+        from ..worker import match_thumb_path
+
         self.colours.show_data(self.project.d.colors, self.project.d.suggestions, self._names(),
-                               self.project.d.settings)
+                               self.project.d.settings, thumbs=match_thumb_path)
 
     def _colour_request(self, action: str, ident: str) -> None:
         p = self.project
@@ -1311,22 +1411,35 @@ class MainWindow(QMainWindow):
                     p.rename_color(ident, name.strip())
         elif action == "delete":
             p.remove_color(ident)
+        elif action == "save_colour":
+            self.save_colour()
+            return
         elif action == "find":
             if not p.d.colors:
-                self.statusBar().showMessage("save a colour first (paint a stroke, then Save colour)", 5000)
+                self.statusBar().showMessage("save a colour first: paint a stroke, then Save last stroke", 5000)
                 return
+            cols = [c for c in p.d.colors if c["id"] == ident] if ident else list(p.d.colors)
             clips = {cid: {"path": c.path, "fps_num": c.fps_num, "fps_den": c.fps_den, "shots": c.shots}
                      for cid, c in p.d.clips.items()}
             photos = {ph.id: ph.path for ph in p.d.photos}
-            self.runner.submit("match", "Find saved colours",
-                               {**self._job_payload(), "colors": p.d.colors, "clips": clips, "photos": photos})
+            label = f"Find {cols[0]['name']}" if ident and cols else "Find saved colours"
+            self.colours_dock.show()
+            self.colours_dock.raise_()
+            self.runner.submit("match", label,
+                               {**self._job_payload(), "colors": cols, "clips": clips, "photos": photos})
+            self.statusBar().showMessage("looking through every shot and photo...", 4000)
             return
         elif action == "goto":
             self._goto_match(ident)
             return
         elif action == "apply":
-            p.apply_suggestion(ident)
+            sug = p.apply_suggestion(ident)
+            if sug:
+                name = next((c["name"] for c in p.d.colors if c["id"] == sug["color"]), "colour")
+                self.statusBar().showMessage(f"used {name} there; the hint pass runs next", 5000)
             self._after_paint()
+            if not self.paintbar.auto.isChecked():
+                self.apply_hints()
             return
         elif action == "dismiss":
             p.dismiss_suggestion(ident)
@@ -1334,20 +1447,37 @@ class MainWindow(QMainWindow):
             for m in list(p.d.suggestions):
                 p.apply_suggestion(m["id"])
             self._after_paint()
+            if not self.paintbar.auto.isChecked():
+                self.apply_hints()
             return
+        elif action == "dismiss_all":
+            if p.d.suggestions:
+                p.set_suggestions([])
         self._refresh()
 
-    def _matches_found(self, items: list) -> None:
+    def _matches_found(self, result: dict) -> None:
+        items = result.get("suggestions", [])
+        searched = set(result.get("colors") or [c["id"] for c in self.project.d.colors])
+        # a search for one colour replaces only that colour's matches
+        keep = [m for m in self.project.d.suggestions if m["color"] not in searched]
+        self.project.set_suggestions(keep + items)
+        self.colours_dock.show()
+        self.colours_dock.raise_()
         if self.project.d.settings.get("match_mode") == "auto" and items:
-            self.project.set_suggestions(items)
             for m in items:
                 self.project.apply_suggestion(m["id"])
-            self.statusBar().showMessage(f"painted {len(items)} match(es); Apply hints to see them", 8000)
-            self._refresh()
+            self.statusBar().showMessage(f"used {len(items)} match(es); the hint pass runs next", 8000)
+            self._after_paint()
             return
-        self.project.set_suggestions(items)
-        self.statusBar().showMessage(f"{len(items)} match(es) found, see the Colours panel", 8000)
+        if items:
+            self.statusBar().showMessage(f"{len(items)} match(es) found. Check each in the Colours panel: "
+                                         "Use or Skip, or click the marker on the picture.", 10000)
+        else:
+            self.statusBar().showMessage("no matches. Slide toward More matches and find again.", 10000)
         self._refresh()
+
+    def _suggestion_clicked(self, ident: str, accept: bool) -> None:
+        self._colour_request("apply" if accept else "dismiss", ident)
 
     def _goto_match(self, ident: str) -> None:
         m = next((x for x in self.project.d.suggestions if x["id"] == ident), None)

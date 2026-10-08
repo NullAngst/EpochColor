@@ -139,7 +139,7 @@ def test_add_from_file_and_wrong_size(models, tmp_path):
     with pytest.raises(RuntimeError, match="does not fit DDColor-large"):
         M.check_loads("wrong-size")
     with pytest.raises(M.ModelError, match="no adapter"):
-        M.add_from_file(w, dict(man, id="x", architecture="deoldify"))
+        M.add_from_file(w, dict(man, id="x", architecture="bigcolor"))
 
 
 def test_catalog_refresh_and_storage(models, monkeypatch, tmp_path, server):
@@ -188,3 +188,36 @@ def test_matching_plumbing():
     assert len(pts) >= 2 and any(abs(p[0] - 0.3) < 0.12 for p in pts) and any(p[0] > 0.6 for p in pts), pts
     assert all(not (0.0 < p[0] < 0.18) for p in pts)  # the flat background isn't a match
     assert peaks(S, threshold=1.5)[1] == []
+
+
+def test_deoldify_adds_loads_and_refuses_the_wrong_variant(models, tmp_path):
+    """DeOldify's generator, rebuilt without fastai, round-trips a checkpoint
+    saved the way DeOldify saves it (an old-style state dict, no BatchNorm
+    step counters), and a deep checkpoint can't pass as wide."""
+    from epochcolor.models import create
+    from epochcolor.models.deoldify import DeOldifyAdapter
+
+    net = DeOldifyAdapter(params={"variant": "deep"}).build()
+    sd = {k: v for k, v in net.state_dict().items() if not k.endswith("num_batches_tracked")}
+    w = tmp_path / "ColorizeArtistic_gen.pth"
+    torch.save(sd, w)
+    man = {"id": "my-deoldify", "name": "Mine", "architecture": "deoldify", "mode": "automatic",
+           "license": "MIT", "params": {"variant": "deep", "render_size": 96}}
+    mid = M.add_from_file(w, man)
+    M.check_loads(mid)
+    m = create(mid)
+    m.load("cpu")
+    out = m.predict(np.full((48, 80), 40, np.float32))
+    assert out.shape == (48, 80, 2) and np.isfinite(out).all()
+    assert m.features(np.full((48, 80), 40, np.float32)).shape[0] == 256  # ResNet-34 layer3
+    M.add_from_file(w, dict(man, id="as-wide", params={"variant": "wide", "render_size": 96}))
+    with pytest.raises(RuntimeError, match="does not fit DeOldify-wide"):
+        M.check_loads("as-wide")
+
+
+def test_catalog_has_deoldify_with_full_hashes():
+    ids = {e["id"]: e for e in M.catalog()}
+    for mid in ("deoldify-video", "deoldify-stable", "deoldify-artistic"):
+        e = ids[mid]
+        assert e["architecture"] == "deoldify" and len(e["source"]["sha256"]) == 64
+        assert M.validate_entry(e) == []

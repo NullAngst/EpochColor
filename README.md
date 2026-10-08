@@ -2,7 +2,7 @@
 
 EpochColor colorizes black and white photos and film footage while keeping the original grain and detail exactly as they were. It's for one person working through an archive on a Linux desktop, with or without a GPU.
 
-**Where it's at:** the editor with a before/after viewer, a timeline for multiple clips, painted colour hints that follow objects through a shot, saved colours, per-shot grading with keyframes and scopes, a model manager with newer models, and the full export matrix. Still to come: negative inversion, regrain and deflicker, the Flatpak, and Windows.
+**Where it's at:** the editor with a before/after viewer, a timeline for multiple clips, painted colour hints that follow objects through a shot or stay on one frame, saved colours with picture matches, colour cast removal, per-shot grading with keyframes and scopes, a model manager with newer models, and the full export matrix. Still to come: negative inversion, regrain and deflicker, the Flatpak, and Windows.
 
 ## Download and run
 
@@ -122,9 +122,27 @@ Everything is undoable, without limit, for the session: Ctrl+Z and Ctrl+Shift+Z.
 
 Only the painted shot reruns, and the expensive model pass stays cached, so it takes seconds rather than minutes. Paint on several frames of a long shot and each frame of it takes the nearest fixes. White dots on the timeline mark painted frames.
 
+**Frame by frame.** Sometimes carrying a stroke through the whole shot is wrong: a face turning, a flag waving, something that changes colour under the light. Press F (or Frame by frame on the paint bar) and new strokes colour only their own frame. Set the reach next to it to let them cover a few frames either side. Then the loop is:
+
+1. Paint the frame.
+2. Press N. The strokes get carried onto the next frame along the motion (optical flow on the proxy), and the playhead moves there. Shift+N goes backward.
+3. Touch up what drifted: right-click a stroke to remove it, paint over what's off. Onion skin shows the previous painted frame's strokes faintly, to trace over.
+4. N again.
+
+Each painted frame's fix is cached on its own, so painting the next frame costs one frame's worth of work, not the whole shot again. The stabilizer that smooths colour between frames leaves frame-by-frame strokes alone, so what you paint on a frame is what that frame gets. Strokes painted with frame by frame off still follow their object through the whole shot, and both kinds mix fine in one shot.
+
+To be clear about what this is: the strokes steer the colour of those frames. They don't retrain the model, so painting a hundred frames of a coat doesn't make the model better at coats elsewhere. Saved colours are how one painted colour gets reused across shots.
+
 Photos work the same way: paint in the viewer with the Photos tab open.
 
-**Saved colours.** Paint a stroke, click Save colour, call it "Anna's coat, navy". In the Colours panel (next to Clips), Find in every shot and photo looks for that object everywhere else. By default the matches get marked in the viewer and listed, and you click Apply on the right ones. "Paint matches straight away" skips the asking, at the cost of sometimes painting the wrong thing. It's matching on what the model's own features say, at the moment you ask; nothing gets trained.
+**Saved colours.** For the coat that shows up in forty shots.
+
+1. Paint a stroke on it, then Save last stroke in the Colours panel (next to Clips) and call it "Anna's coat, navy". The list shows a picture of where it came from.
+2. Find this one (or Find all) looks at the middle frame of every other shot and every photo.
+3. Each match comes back with a small picture of that frame and the spot ringed, plus how sure it is: strong, likely, or possible. Use paints the colour there, Skip drops it, Go to (or a double-click) shows it full size. On the picture itself, matches in the current shot are markers: click one to use it, right-click to skip it.
+4. Nothing found? Slide toward More matches and find again. Too many wrong ones? Slide toward Closer matches.
+
+"Use every match straight away" skips the asking, at the cost of sometimes painting the wrong thing. Matching compares what the model's own features say about the stroke's object with every other place, at the moment you ask; nothing gets trained. It needs a network model (any of them; the `hints` model has no features). It finds the same object well and look-alikes too, which is why it asks by default.
 
 **Grading.** The Grade panel (a tab next to the Inspector) grades the shot under the playhead, or the photo you picked. In order of how it's applied:
 
@@ -141,9 +159,14 @@ A shot's grade is static until you press Add key. With two or more keys the valu
 
 **Scopes.** The Scopes panel shows a waveform, RGB parade, vectorscope (with skin tone line and 75% targets) or histogram of what the viewer shows.
 
-**Models.** Colour > Model manager lists the catalog: the two Zhang models and four DDColor variants. It downloads with progress and resume, checks every file's SHA-256 before keeping it, and asks you to accept a license before downloading anything whose terms aren't plainly open. Add from file takes your own weights for an architecture EpochColor knows (DDColor, or either Zhang model) plus a small JSON manifest; it test-loads them before keeping them. Storage folder moves everything somewhere with room. The catalog refreshes from this repo's `catalog.json`, so a new set of weights for a known architecture shows up without an app update.
+**Models.** Colour > Model manager lists the catalog: three DeOldify generators, four DDColor variants and the two Zhang models. Find more models says where to look for others and which kinds load. It downloads with progress and resume, checks every file's SHA-256 before keeping it, and asks you to accept a license before downloading anything whose terms aren't plainly open. Add from file takes your own weights for an architecture EpochColor knows (DeOldify, DDColor, or either Zhang model) plus a small JSON manifest; it test-loads them before keeping them. Storage folder moves everything somewhere with room. The catalog refreshes from this repo's `catalog.json`, so a new set of weights for a known architecture shows up without an app update.
 
-**Settings.** The Inspector's Colour box holds the project settings. Model, working size and denoise change what the model sees, so they need a new colorize pass, and the clip shows as not colorized until it's done. Stabilize reruns only the quick stabilizer pass. Grain and saturation apply straight away. Colour > Model device picks the GPU, `auto` by default.
+**Settings.** The Inspector's Colour box holds the project settings. Model, working size and denoise change what the model sees, so they need a new colorize pass, and the clip shows as not colorized until it's done. Stabilize reruns only the quick stabilizer pass. Grain, saturation and Remove colour cast apply straight away.
+
+**Everything came out orange?** Colorizing models play it safe with warm, brownish tones when they're unsure, and some lay that over whole scenes. Two things to try, and they stack:
+
+- Another model. DeOldify Video (Stable for photos) is a different family trained a different way, so where it goes wrong isn't where DDColor or the Zhang models go wrong. It has its own lean toward brown on some footage, so compare on a few shots of yours.
+- Turn up Remove colour cast in the Inspector. Each shot gets measured: the least colourful 40% of it is where the model had the least reason to put colour, so if even that part leans orange, the lean is the model's and not the scene's. 100% shifts it all back to neutral, and since it's measured per shot it can't flicker. A shot that's honestly warm, like a sunset, keeps some neutral somewhere and reads as little cast. A shot with nothing neutral in it at all gets cooled, so turn it down there or set that shot's white balance in the Grade panel. Colour > Model device picks the GPU, `auto` by default.
 
 **From the command line.** `epochcolor render film.epochcolor -o film.mkv` exports a saved project, hints, grades and all, without the editor. It uses the export settings you last picked in the editor, or `--preset`.
 
@@ -183,6 +206,9 @@ For a set, put hint files in a folder named after each photo (`scan01.png` for `
 
 | Model | Size | What it does |
 | --- | --- | --- |
+| `deoldify-video` | 834 MB | DeOldify 2019, ResNet-101. Trained for film: calm, natural colour that holds steady between frames. The one to try first on footage. |
+| `deoldify-stable` | 834 MB | The same network trained for photos: portraits and landscapes, fewer stray blotches. |
+| `deoldify-artistic` | 244 MB | DeOldify with a ResNet-34. Bolder and more varied, and more often wrong. Good for stills you'll touch up. |
 | `siggraph17` (default) | 130 MB | Zhang et al. 2017. Automatic, and reads your hints as input. Small and quick, muted colour. |
 | `eccv16` | 125 MB | Zhang et al. 2016. Automatic only, more muted still. Hints still apply afterward. |
 | `ddcolor-modelscope` | 912 MB | DDColor 2023, ConvNeXt-L. Far more saturated and specific. The authors' all-round pick. |
@@ -191,7 +217,7 @@ For a set, put hint files in a folder named after each photo (`scan01.png` for `
 | `ddcolor-tiny` | 220 MB | DDColor with ConvNeXt-T. Much faster, a little less accurate. The one to try on CPU. |
 | `hints` | built in | No network at all. Your strokes are the only colour, everything unpainted stays grey. |
 
-The Zhang models are BSD-2-Clause, from [richzhang/colorization](https://github.com/richzhang/colorization). DDColor's code is Apache-2.0 and ships inside EpochColor (in `epochcolor/models/ddcolor_arch`, with its license); its weights come from the authors' Hugging Face repos, and their terms are on those model cards.
+The Zhang models are BSD-2-Clause, from [richzhang/colorization](https://github.com/richzhang/colorization). DeOldify is MIT, by Jason Antic, from [jantic/DeOldify](https://github.com/jantic/DeOldify); its network ships inside EpochColor as ModelScope's fastai-free port (`epochcolor/models/deoldify_arch`, Apache-2.0, with the notices), and the weights download from a Hugging Face mirror of the official files, [spensercai/DeOldify](https://huggingface.co/spensercai/DeOldify), checked against SHA-256. DDColor's code is Apache-2.0 and ships inside EpochColor (in `epochcolor/models/ddcolor_arch`, with its license); its weights come from the authors' Hugging Face repos, and their terms are on those model cards.
 
 `epochcolor models` lists them with what's installed. `epochcolor models add weights.pth manifest.json` adds your own, `epochcolor models remove ID` deletes one, `epochcolor models refresh` pulls the newest catalog.
 
@@ -287,6 +313,7 @@ Why 10-bit by default? Colorized footage is mostly smooth gradients: skies, skin
 - `--denoise N` sets the strength of the model's denoise in L* units. Auto by default. Raise it if colored blotches show up in grainy areas.
 - `--spread 0.15` is how far a hint travels through flat areas, as a fraction of the short side. Raise it when a stroke doesn't fill its object, lower it when it leaks.
 - `--working-size 512` is the short side for color work. Higher costs time and memory, and rarely looks different, since soft color is the whole trick.
+- `--cast 70` takes 70% of the model's all-over colour cast out, measured per shot (per photo with `photo`). The fix for an orange wash.
 - `--saturation 1.2` is a plain chroma boost. For real grading, use the editor's Grade panel and `epochcolor render`.
 - `--device cpu` forces CPU. `cuda:1` picks a second GPU.
 
@@ -301,9 +328,13 @@ Honest list, so nobody is surprised.
 - The RAW develop path is written but hasn't been run against a real RAW file yet.
 - Large scans are fine on memory, but a 100 MP file will take a while on the final recombine. That part is CPU-only for now.
 - Video needs a network model; the `hints` model is for photos only.
+- **DeOldify has never run on its real weights either.** The network is ModelScope's port, which ModelScope itself runs on DeOldify's weights, and I rebuilt its ResNet bodies to match torchvision's layer names. The check I could do from here: the rebuilt network's tensors add up to within 0.02% of both published files (874,066,230 and 255,144,681 bytes), and the leftover is the same few hundred bytes per tensor in both, which is file format overhead. One missing or extra layer would be at least 147 KB off. The loader refuses anything that doesn't fit exactly. What's still unchecked is the preprocessing: the grey input, ImageNet normalization and the render sizes follow DeOldify's and ModelScope's code, but I haven't compared a frame against DeOldify's own output.
 - **DDColor has never run on its real weights.** The architecture is the authors' own code, vendored unchanged, and builds with the paper's parameter counts (55.0M tiny, 227.9M large), but my build machine couldn't reach Hugging Face. The loader refuses weights that don't fit exactly, so a mismatch fails loudly instead of producing garbage. Which file each Hugging Face repo holds is looked up at download time, and its SHA-256 comes from Hugging Face's own listing.
 - **DDColor's weight licenses are marked unverified.** The code is Apache-2.0, but I couldn't read the model cards from here, so the manager asks you to accept the terms before downloading. Read the card.
 - Hint carrying is translation along optical flow plus an edge-aware fill. It holds well on things that move and turn slowly, and fades on fast motion, heavy motion blur, or objects that leave and come back. Paint another frame where it fades.
+- Saved-colour matching looks at the middle frame of each shot, so an object that's only in the first or last second of a long shot can be missed. Paint it there by hand.
+- Remove colour cast is a heuristic: the median of the least colourful 40% of each shot. It assumes most scenes have something near neutral in them, which most do.
+- Carrying strokes to the next frame tracks on the proxy, which is small. Fine detail (an eye, a button) can drift by a pixel or two per frame; that's what the touch-up step is for.
 - Saved-colour matching uses the model's features as they are. It finds the same object in other shots well enough to be useful and also finds look-alikes; that's why it asks by default. The `hints` model has no features, so matching needs a network model.
 - The qualifier and secondary corrections work in HSV, which is quick but shifts brightness a little when saturation changes a lot. Mask tracking follows position only, not scale or rotation.
 - A LUT is stored as a path in the project. Move the .cube and the grade loses it (you're told when it can't be read).
