@@ -22,7 +22,7 @@ from .. import __version__
 from ..export.plan import ExportSettings
 from ..media import MediaInfo, media_dir
 from ..project import Clip, AudioInfo, Project, ProjectError
-from ..timeline_export import analysis_state, project_audio
+from ..timeline_export import analysis_state, project_audio, shot_states
 from ..video.pipeline import VideoSettings, analysis_dir
 from .. import grade as G
 from . import theme
@@ -52,9 +52,13 @@ Delete       ripple delete the selected segment
 Alt+Left/R   move the selected segment
 B            add or remove a shot cut at the playhead
 M            marker with a note
-1  2  3      colour / before-after split / original
-P            paint hints on/off; [ and ] (or the wheel) brush size
+1  2  3  4    colour / before-after split / original / this frame
+Ctrl+F       colorize this frame with the selected model (shows as 4)
+P            paint on/off; [ and ] (or Shift+wheel) brush size
              drag paints, right-click removes a stroke, Ctrl+click picks a colour
+Wheel        zoom the picture at the pointer; middle-drag pans; Ctrl+0 fits
+Ctrl+Shift+C color shot: this shot from its paint alone
+Ctrl+Shift+F fill shot: the model colours the rest of this shot
 H            show or hide strokes
 F            paint frame by frame: strokes colour only their own frame (or a set reach)
 N  Shift+N   carry this frame's strokes to the next / previous frame along the motion
@@ -71,8 +75,11 @@ class Inspector(QWidget):
     negativeToggled = Signal(bool)
     negativeLevels = Signal()
     referencePick = Signal()
+    referencePainted = Signal(str)  # "shot" or "everywhere": use my painting as the reference
     referenceClear = Signal()
     referenceStrength = Signal(float)
+    shotAction = Signal(str)  # color_shot, fill_shot, colorize_all
+    gotoFrame = Signal(int)  # a painted frame of this shot, in clip frames
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -101,14 +108,53 @@ class Inspector(QWidget):
         row.addStretch(1)
         row.addWidget(self.neg_levels)
         gl.addLayout(row)
-        self.ref_label = QLabel("No reference image")
+        self.negative.clicked.connect(lambda on: self.negativeToggled.emit(bool(on)))
+        self.neg_levels.clicked.connect(self.negativeLevels.emit)
+        lay.addWidget(g)
+
+        # ---- This shot: where painting turns into colour
+        sg = QGroupBox("This shot")
+        sl = QVBoxLayout(sg)
+        self.shot_info = QLabel("Put the playhead on a clip")
+        self.shot_info.setWordWrap(True)
+        self.shot_info.setTextFormat(Qt.RichText)
+        sl.addWidget(self.shot_info)
+        self.painted_frames = QComboBox()
+        self.painted_frames.setToolTip("Painted frames in this shot; pick one to go there")
+        self.painted_frames.activated.connect(
+            lambda i: self.painted_frames.itemData(i) is not None and self.gotoFrame.emit(self.painted_frames.itemData(i)))
+        sl.addWidget(self.painted_frames)
+        row = QHBoxLayout()
+        self.color_shot_btn = QPushButton("Color shot")
+        self.color_shot_btn.setToolTip("Colour this shot from your paint alone: each painted object filled out to "
+                                       "its edges and carried through the shot, everything else left grey. No model, "
+                                       "so it takes seconds. Shows exactly what your painting does. (Ctrl+Shift+C)")
+        self.fill_shot_btn = QPushButton("Fill shot")
+        self.fill_shot_btn.setToolTip("Let the model colour the rest of this shot. Your paint keeps every object you "
+                                      "painted; the model only colours what you didn't. (Ctrl+Shift+F)")
+        self.shot_all_btn = QPushButton("Colorize all")
+        self.shot_all_btn.setToolTip("Every shot of every clip: painted shots with their paint, the rest by the "
+                                     "model, learning from your painting if that's switched on below.")
+        for b, name in ((self.color_shot_btn, "color_shot"), (self.fill_shot_btn, "fill_shot"),
+                        (self.shot_all_btn, "colorize_all")):
+            b.clicked.connect(lambda _=False, n=name: self.shotAction.emit(n))
+            row.addWidget(b)
+        sl.addLayout(row)
+        self.ref_label = QLabel("No reference")
         self.ref_label.setWordWrap(True)
         self.ref_label.setStyleSheet(f"color: {theme.DIM};")
-        gl.addWidget(self.ref_label)
+        sl.addWidget(self.ref_label)
         row = QHBoxLayout()
-        self.ref_btn = QPushButton("Reference image...")
-        self.ref_btn.setToolTip("A colour photo of the same place, scene or era whose colours guide this "
-                                "shot (or this photo)")
+        self.ref_btn = QPushButton("Reference...")
+        self.ref_btn.setToolTip("What guides this shot's colours besides your paint: a colour photo of the same "
+                                "place or era, or your own painting")
+        from PySide6.QtWidgets import QMenu
+
+        menu = QMenu(self.ref_btn)
+        menu.addAction("A colour photo...", self.referencePick.emit)
+        menu.addAction("My painting in this shot", lambda: self.referencePainted.emit("shot"))
+        menu.addAction("My painting everywhere in the project", lambda: self.referencePainted.emit("everywhere"))
+        self.ref_btn.setMenu(menu)
         self.ref_clear = QPushButton("Clear")
         self.ref_strength = QSpinBox()
         self.ref_strength.setRange(0, 100)
@@ -118,13 +164,30 @@ class Inspector(QWidget):
         row.addWidget(self.ref_btn, 1)
         row.addWidget(self.ref_strength)
         row.addWidget(self.ref_clear)
-        gl.addLayout(row)
-        self.negative.clicked.connect(lambda on: self.negativeToggled.emit(bool(on)))
-        self.neg_levels.clicked.connect(self.negativeLevels.emit)
-        self.ref_btn.clicked.connect(self.referencePick.emit)
+        sl.addLayout(row)
         self.ref_clear.clicked.connect(self.referenceClear.emit)
         self.ref_strength.editingFinished.connect(lambda: self.referenceStrength.emit(self.ref_strength.value() / 100))
-        lay.addWidget(g)
+        row = QHBoxLayout()
+        self.teach = QCheckBox("Unpainted shots learn from my painting")
+        self.teach.setToolTip("On Colorize all, shots you didn't paint look for the things you painted elsewhere "
+                              "(by what the model sees, not by position) and take their colour. The model "
+                              "colours whatever doesn't match.")
+        self.teach_strength = QSpinBox()
+        self.teach_strength.setRange(0, 100)
+        self.teach_strength.setSuffix(" %")
+        row.addWidget(self.teach, 1)
+        row.addWidget(self.teach_strength)
+        sl.addLayout(row)
+        self.teach.toggled.connect(lambda v: self.settingChanged.emit("teach", bool(v)))
+        self.teach_strength.editingFinished.connect(
+            lambda: self.settingChanged.emit("teach_strength", round(self.teach_strength.value() / 100, 2)))
+        how = QLabel("Paint a few frames, Color shot to see your paint alone, Fill shot to let the model do the "
+                     "rest, Colorize all when you're happy. The strip under each shot on the timeline: grey not "
+                     "coloured, amber painted only, green coloured, striped out of date.")
+        how.setWordWrap(True)
+        how.setStyleSheet(f"color: {theme.DIM}; font-size: 11px;")
+        sl.addWidget(how)
+        lay.addWidget(sg)
 
         c = QGroupBox("Colour")
         f = QFormLayout(c)
@@ -225,12 +288,13 @@ class Inspector(QWidget):
         self.grain_colour.setRange(0, 100)
         self.grain_colour.setSuffix(" %")
         self.grain_colour.setToolTip("Faint colour grain on top of the mono grain, like colour film stock")
+        ff.addRow("Regrain", self.regrain)
         gr = QWidget()
         gl2 = QHBoxLayout(gr)
         gl2.setContentsMargins(0, 0, 0, 0)
-        for w in (self.regrain, QLabel("size"), self.grain_size, QLabel("colour"), self.grain_colour):
+        for w in (self.grain_size, QLabel("colour"), self.grain_colour):
             gl2.addWidget(w)
-        ff.addRow("Regrain", gr)
+        ff.addRow("Grain size", gr)
         fnote = QLabel("Cleaning the model's copy needs a new colorize pass. Output cleaning and regrain show "
                        "on the paused full-size frame and in export.")
         fnote.setWordWrap(True)
@@ -316,7 +380,7 @@ class Inspector(QWidget):
     def show_settings(self, s: dict) -> None:
         widgets = (self.model, self.working, self.chroma, self.stabilize, self.grain, self.saturation,
                    self.cast, self.denoise, self.denoise_auto, self.dfl, self.dust, self.dfl_out, self.dust_out,
-                   self.regrain, self.grain_size, self.grain_colour)
+                   self.regrain, self.grain_size, self.grain_colour, self.teach, self.teach_strength)
         for w in widgets:
             w.blockSignals(True)
         if self.model.findData(s.get("model")) < 0 or self.model.count() == 0:
@@ -328,6 +392,8 @@ class Inspector(QWidget):
         self.grain.setValue(float(s.get("grain", 100)))
         self.saturation.setValue(float(s.get("saturation", 1.0)))
         self.cast.setValue(int(round(float(s.get("cast", 0.0)) * 100)))
+        self.teach.setChecked(bool(s.get("teach", False)))
+        self.teach_strength.setValue(int(round(float(s.get("teach_strength", 0.8)) * 100)))
         self.dfl.setChecked(float(s.get("deflicker", 0.0) or 0.0) > 0)
         self.dust.setChecked(bool(s.get("dust", False)))
         self.dfl_out.setChecked(bool(s.get("deflicker_out", False)))
@@ -351,6 +417,7 @@ class MainWindow(QMainWindow):
         self.media = MediaCache()
         self.media_info: dict[str, MediaInfo] = {}
         self.status: dict[str, str] = {}
+        self.shot_status: dict = {}  # clip id -> shot_states()
         self.photo_icons: dict[str, QIcon] = {}
         self.playhead = 0
         self.speed = 0.0
@@ -384,6 +451,8 @@ class MainWindow(QMainWindow):
         self.play_timer.timeout.connect(self._tick)
         self._flow_readers: dict = {}  # proxy readers for carrying strokes, per clip
         self._measuring: dict = {}  # job id -> what a negative measurement is for
+        self._frame_jobs: dict = {}  # job id -> (clip id, frame) of a Colorize frame
+        self._frame_results: dict = {}  # (clip id, frame) -> (picture, label)
         self.hint_timer = QTimer(self)
         self.hint_timer.setSingleShot(True)
         self.hint_timer.setInterval(900)
@@ -422,8 +491,15 @@ class MainWindow(QMainWindow):
         tl.addWidget(self.tc)
         tl.addWidget(self.speed_label)
         tl.addStretch(1)
+        self.frame_btn = QToolButton()
+        self.frame_btn.setText("Colorize frame")
+        self.frame_btn.setToolTip("Run the selected model on this one frame, with what's painted on it, and show "
+                                  "it under This frame (Ctrl+F). Nothing else changes.")
+        self.frame_btn.clicked.connect(self.colorize_frame)
+        tl.addWidget(self.frame_btn)
         self.mode_btns = {}
-        for mode, text in (("color", "Colour"), ("split", "Before / after"), ("original", "Original")):
+        for mode, text in (("color", "Colour"), ("split", "Before / after"), ("original", "Original"),
+                           ("frame", "This frame")):
             b = QToolButton()
             b.setText(text)
             b.setCheckable(True)
@@ -444,6 +520,7 @@ class MainWindow(QMainWindow):
         self.viewer.eraseAt.connect(self._erase_at)
         self.viewer.picked.connect(self._picked)
         self.viewer.suggestionClicked.connect(self._suggestion_clicked)
+        self.viewer.brushResized.connect(lambda r: self.paintbar.size.setValue(max(1, round(r * 1000))))
         top = QWidget()
         topl = QVBoxLayout(top)
         topl.setContentsMargins(0, 0, 0, 0)
@@ -498,6 +575,10 @@ class MainWindow(QMainWindow):
         self.inspector.negativeLevels.connect(self.negative_levels)
         self.inspector.referencePick.connect(self.pick_reference)
         self.inspector.referenceClear.connect(self.clear_reference)
+        self.inspector.referencePainted.connect(self._use_painting_reference)
+        self.inspector.shotAction.connect(self._shot_action)
+        self.inspector.gotoFrame.connect(lambda f: (t := self._paint_target()) and t[0] == "clip"
+                                         and self.goto_clip_frame(t[1], f))
         self.inspector.referenceStrength.connect(self._reference_strength)
         self.inspector.colorize_all_btn.clicked.connect(self.colorize_all)
         self.inspector.cancel_btn.clicked.connect(lambda: self.runner.cancel(
@@ -513,6 +594,9 @@ class MainWindow(QMainWindow):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # never narrower than what's in it, or the right edge gets cut off
+        scroll.setMinimumWidth(self.inspector.minimumSizeHint().width()
+                               + scroll.verticalScrollBar().sizeHint().width() + 4)
         dock.setWidget(scroll)  # scrolls on a short screen instead of squashing
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
         self.inspector_dock = dock
@@ -532,8 +616,9 @@ class MainWindow(QMainWindow):
         self.colours = ColoursPanel()
         self.colours.useColour.connect(self._use_colour)
         self.colours.request.connect(self._colour_request)
+        self.colours.useItem.connect(self.use_item)
         self.colours.settingChanged.connect(self._setting_changed)
-        cdock = QDockWidget("Colours", self)
+        cdock = QDockWidget("Items", self)
         cdock.setObjectName("colours")
         cdock.setWidget(self.colours)
         self.addDockWidget(Qt.LeftDockWidgetArea, cdock)
@@ -606,6 +691,12 @@ class MainWindow(QMainWindow):
         act(m, "Colour", lambda: self.viewer.set_mode("color"), "1")
         act(m, "Before / after split", lambda: self.viewer.set_mode("split"), "2")
         act(m, "Original black and white", lambda: self.viewer.set_mode("original"), "3")
+        act(m, "This frame (Colorize frame result)", lambda: self.viewer.set_mode("frame"), "4")
+        act(m, "Colorize this frame", self.colorize_frame, "Ctrl+F")
+        m.addSeparator()
+        act(m, "Zoom picture in", lambda: self.viewer.zoom_at(1.25), "Ctrl+Shift+=")
+        act(m, "Zoom picture out", lambda: self.viewer.zoom_at(0.8), "Ctrl+Shift+-")
+        act(m, "Fit picture", self.viewer.fit, "Ctrl+0")
         m.addSeparator()
         act(m, "Zoom timeline in", lambda: self._zoom(1.5), ["=", "Ctrl+="])
         act(m, "Zoom timeline out", lambda: self._zoom(1 / 1.5), ["-", "Ctrl+-"])
@@ -640,9 +731,11 @@ class MainWindow(QMainWindow):
         m = mb.addMenu("&Colour")
         act(m, "Colorize selected clip", self.colorize_selected, "Ctrl+R")
         act(m, "Colorize all clips", self.colorize_all, "Ctrl+Shift+R")
+        act(m, "Color shot (paint only)", self.color_shot, "Ctrl+Shift+C")
+        act(m, "Fill shot (the model does the rest)", self.fill_shot, "Ctrl+Shift+F")
         act(m, "Colorize selected photos", self.colorize_photos, "Ctrl+Alt+R")
         act(m, "Apply hints", self.apply_hints, ["Ctrl+Return", "Ctrl+Enter"])
-        act(m, "Find saved colours everywhere", lambda: self._colour_request("find", ""))
+        act(m, "Find items everywhere", lambda: self._colour_request("find", ""))
         m.addSeparator()
         act(m, "Model manager...", self.open_model_manager)
         act(m, "Install PyTorch...", lambda: self.setup_torch(False))
@@ -674,22 +767,27 @@ class MainWindow(QMainWindow):
             mi = self.media_info.get(c.id)
             if mi is None:
                 continue
-            ab = None
-            if self.status.get(c.id) in ("ready", "update"):
-                # "update": hints or the stabilizer changed; show the last result until it reruns
-                ab = str(analysis_dir(Path(c.path), s, model, negative=c.neg) / "ab.npy")
+            # each shot shows what it has: the full colorize, the paint-only
+            # colour from Color shot, or grey; an out-of-date result stays up
+            # until it's redone
+            ab = str(analysis_dir(Path(c.path), s, model, negative=c.neg) / "ab.npy")
+            shots = tuple((int(k.split("-")[0]), int(k.split("-")[1]), v["state"], v["file"])
+                          for k, v in self.shot_status.get(c.id, {}).items())
             out.append(LayoutPiece(start, seg.length, c.id, seg.src_in, str(mi.proxy), c.path, c.fps, ab,
-                                   c.neg))
+                                   c.neg, shots))
         return out
 
     def _refresh(self) -> None:
         """Bring every view in line with the project."""
         s = VideoSettings.from_project(self.project.d.settings)
         model = self.project.d.settings["model"]
-        self.status = {cid: analysis_state(c, s, model, hints=self.project.d.hints.get(cid),
-                                           references=self.project.d.references.get(cid))
+        refs = {cid: self.project.expanded_references(cid) for cid in self.project.d.clips}
+        self.status = {cid: analysis_state(c, s, model, hints=self.project.d.hints.get(cid), references=refs[cid])
                        for cid, c in self.project.d.clips.items()}
+        self.shot_status = {cid: shot_states(c, s, model, hints=self.project.d.hints.get(cid), references=refs[cid])
+                            for cid, c in self.project.d.clips.items()}
         self.timeline.canvas.status = self.status
+        self.timeline.canvas.shot_status = self.shot_status
         self.audio.project_changed(self.project)
         self.timeline.set_project(self.project) if self.timeline.canvas.project is not self.project \
             else self.timeline.refresh()
@@ -773,7 +871,7 @@ class MainWindow(QMainWindow):
                 ph = self.project.d.photos[row]
                 try:
                     done = photo_result_path(ph.path, self.project.d.settings, self.project.d.settings["model"],
-                                             ph.strokes, ph.neg, ph.reference).exists()
+                                             ph.strokes, ph.neg, self.project.photo_reference(ph)).exists()
                 except OSError:
                     done = False
                 state = "colorized" if done else ("hints changed, apply them" if ph.strokes else "not colorized yet")
@@ -814,30 +912,148 @@ class MainWindow(QMainWindow):
         kind, ident, obj, frame = tt
         return obj.reference if kind == "photo" else self.project.reference_at(ident, frame)
 
+    SHOT_STATE_TEXT = {
+        ("none", True): "not coloured yet",
+        ("painted", True): "<span style='color:#d9a441'>painted only</span> (Color shot): the model hasn't touched it",
+        ("painted", False): "<span style='color:#d9a441'>painted only, out of date</span>: the paint changed, "
+                            "Color shot again",
+        ("colored", True): "<span style='color:#6fbf73'>coloured</span>: your paint plus the model",
+        ("colored", False): "<span style='color:#6fbf73'>coloured, out of date</span>: Fill shot (or Colorize all) "
+                            "to bring it up to date",
+    }
+
+    def _current_shot(self):
+        """(clip, shot number from 1, (a, b), clip frame) under the playhead, or None."""
+        t = self._paint_target()
+        if t is None or t[0] != "clip":
+            return None
+        c = self.project.d.clips[t[1]]
+        for i, (a, b) in enumerate(c.shots):
+            if a <= t[2] < b:
+                return c, i + 1, (a, b), t[2]
+        return None
+
     def _refresh_target_widgets(self) -> None:
         ins = self.inspector
         tt = self._target_object()
         for w in (ins.negative, ins.neg_levels, ins.ref_btn, ins.ref_clear, ins.ref_strength):
             w.setEnabled(tt is not None)
+        shot = self._current_shot()
+        for w in (ins.color_shot_btn, ins.fill_shot_btn, ins.painted_frames):
+            w.setEnabled(shot is not None)
+        ins.painted_frames.clear()
+        self.viewer.shot_note = ""
         if tt is None:
-            ins.ref_label.setText("No reference image")
+            ins.ref_label.setText("No reference")
+            ins.shot_info.setText("Put the playhead on a clip, or pick a photo")
             return
         kind, ident, obj, frame = tt
         ins.negative.blockSignals(True)
         ins.negative.setChecked(bool(obj.negative))
         ins.negative.blockSignals(False)
         ins.neg_levels.setEnabled(bool(obj.negative and obj.negative_params))
+        if shot is not None:
+            c, no, (a, b), f = shot
+            st = self.shot_status.get(c.id, {}).get(f"{a}-{b}", {"state": "none", "current": True})
+            frames = [k for k in self.project.hint_frames(c.id) if a <= k < b]
+            strokes = [x for k in frames for x in self.project.strokes_at(c.id, k)]
+            names = {col["id"]: col["name"] for col in self.project.d.colors}
+            items = sorted({names[x["item"]] for x in strokes if x.get("item") in names})
+            unlabelled = sum(1 for x in strokes if x.get("item") not in names)
+            painted = (f"{len(frames)} painted frame(s), {len(strokes)} stroke(s)" if frames
+                       else "nothing painted here yet")
+            if items:
+                painted += "<br>items: " + ", ".join(items) + (f" + {unlabelled} unlabelled" if unlabelled else "")
+            ins.shot_info.setText(f"<b>Shot {no} of {len(c.shots)}</b> in {c.name}: frames {a} to {b - 1} "
+                                  f"({b - a} frames)<br>{self.SHOT_STATE_TEXT[(st['state'], st['current'])]}"
+                                  f"<br>{painted}")
+            ins.painted_frames.addItem("Go to a painted frame..." if frames else "No painted frames", None)
+            for k in frames:
+                ins.painted_frames.addItem(f"frame {k}" + ("  (here)" if k == f else "")
+                                           + f"  {len(self.project.strokes_at(c.id, k))} stroke(s)", k)
+            ins.fill_shot_btn.setText("Update shot" if st["state"] == "colored" else "Fill shot")
+            self.viewer.shot_note = f"shot {no}: " + {"none": "not coloured", "painted": "painted only",
+                                                      "colored": "coloured"}[st["state"]] + \
+                ("" if st["current"] else ", out of date")
+        else:
+            ins.shot_info.setText("A photo: paint it, then Colorize photo. Color shot and Fill shot are for "
+                                  "video shots.")
         ref = self._target_reference(tt)
-        where = "this photo" if kind == "photo" else \
-            f"shot {next((i + 1 for i, (a, b) in enumerate(obj.shots) if a <= frame < b), '?')}"
-        if ref:
+        where = "this photo" if kind == "photo" else f"shot {shot[1] if shot else '?'}"
+        if ref and ref.get("kind") == "painted":
+            what = "your painting in this shot" if ref.get("scope") == "shot" else "your painting, everywhere"
+            ins.ref_label.setText(f"Reference for {where}: {what}")
+        elif ref:
             ins.ref_label.setText(f"Reference for {where}: {Path(ref['path']).name}")
+        else:
+            taught = self.project.d.settings.get("teach") and self.project.painted_sources()
+            ins.ref_label.setText(f"No reference for {where}" + (" (it learns from your painting on Colorize all)"
+                                                                  if taught and kind == "clip" else ""))
+        if ref:
             ins.ref_strength.blockSignals(True)
             ins.ref_strength.setValue(int(round(float(ref.get("strength", 1.0)) * 100)))
             ins.ref_strength.blockSignals(False)
-        else:
-            ins.ref_label.setText(f"No reference image for {where}")
         ins.ref_clear.setEnabled(bool(ref))
+
+    # ------------------------------------------------- shots: paint, fill
+
+    def color_shot(self, quiet: bool = False) -> None:
+        """Color shot: this shot from its paint alone, no model."""
+        shot = self._current_shot()
+        if shot is None:
+            self.statusBar().showMessage("put the playhead on a shot of a clip first", 5000)
+            return
+        c, no, (a, b), _ = shot
+        frames = [k for k in self.project.hint_frames(c.id) if a <= k < b]
+        if not frames:
+            self.statusBar().showMessage(f"nothing painted in shot {no} yet: press P and paint on a frame first", 6000)
+            return
+        n = sum(len(self.project.strokes_at(c.id, k)) for k in frames)
+        self.runner.cancel_where(lambda j: j.kind in ("paint_shot", "analyze") and j.payload.get("shot") == [a, b]
+                                 and j.payload.get("clip", {}).get("id") == c.id)
+        self.runner.submit("paint_shot", f"Color shot {no} of {c.name} from {len(frames)} painted frame(s), {n} stroke(s)",
+                           {**self._job_payload(), "clip": asdict(c), "hints": self.project.d.hints.get(c.id),
+                            "shot": [a, b]})
+        if not quiet:
+            self.statusBar().showMessage(f"Color shot {no}: your {n} stroke(s) filling their objects and riding the "
+                                         f"motion through {b - a} frames; nothing else gets colour", 8000)
+
+    def fill_shot(self, quiet: bool = False) -> None:
+        """Fill shot: the model colours the rest of this shot, the paint keeps what it covers."""
+        shot = self._current_shot()
+        if shot is None:
+            self.statusBar().showMessage("put the playhead on a shot of a clip first", 5000)
+            return
+        c, no, (a, b), _ = shot
+        self.runner.cancel_where(lambda j: j.kind in ("paint_shot", "analyze") and j.payload.get("shot") == [a, b]
+                                 and j.payload.get("clip", {}).get("id") == c.id)
+        self.runner.submit("analyze", f"Fill shot {no} of {c.name} ({b - a} frames)",
+                           {**self._job_payload(), "clip": asdict(c), "hints": self.project.d.hints.get(c.id),
+                            "references": self.project.expanded_references(c.id), "only_shots": [[a, b]],
+                            "shot": [a, b]})
+        if not quiet:
+            self.statusBar().showMessage(f"Fill shot {no}: the model colours what you didn't paint; the first time "
+                                         f"it runs the model over all {b - a} frames, after that it's quick", 8000)
+
+    def _shot_action(self, name: str) -> None:
+        {"color_shot": self.color_shot, "fill_shot": self.fill_shot, "colorize_all": self.colorize_all}[name]()
+
+    def goto_clip_frame(self, clip_id: str, frame: int) -> None:
+        for start, seg in zip(self.project.seg_starts(), self.project.d.timeline):
+            if seg.clip == clip_id and seg.src_in <= frame < seg.src_out:
+                self.seek(start + frame - seg.src_in)
+                return
+        self.statusBar().showMessage(f"frame {frame} isn't on the timeline", 4000)
+
+    def _use_painting_reference(self, scope: str) -> None:
+        tt = self._target_object()
+        if tt is None:
+            return
+        if not self.project.painted_sources():
+            self.statusBar().showMessage("paint something first; then your painting can be the reference", 6000)
+            return
+        self._set_reference(tt, {"kind": "painted", "scope": "shot" if scope == "shot" else "project",
+                                 "strength": self.inspector.ref_strength.value() / 100.0})
 
     # ------------------------------------------------- negatives, references
 
@@ -946,6 +1162,45 @@ class MainWindow(QMainWindow):
         for m, b in self.mode_btns.items():
             b.setChecked(m == mode)
 
+    # ------------------------------------------------------ this frame
+
+    def colorize_frame(self) -> None:
+        """The selected model on the frame under the playhead, with that
+        frame's paint and the shot's reference, as a temporary picture."""
+        t = self._paint_target()
+        if t is None or t[0] != "clip":
+            self.statusBar().showMessage("Colorize frame works on a clip frame; photos have Colorize photo", 5000)
+            return
+        cid, f = t[1], t[2]
+        c = self.project.d.clips[cid]
+        a, b = next(((x, y) for x, y in c.shots if x <= f < y), (f, f + 1))
+        refs = self.project.expanded_references(cid)
+        from ..video.pipeline import shot_reference
+
+        strokes = self.project.strokes_at(cid, f)
+        ref = shot_reference(refs, a, b, painted=bool(self.project.hint_frames(cid) and
+                                                       any(a <= k < b for k in self.project.hint_frames(cid))))
+        self.runner.cancel_where(lambda j: j.kind == "frame_preview")
+        job = self.runner.submit("frame_preview", f"Colorize frame {f} of {c.name}",
+                                 {**self._job_payload(), "path": c.path, "fps_num": c.fps_num, "fps_den": c.fps_den,
+                                  "frame": f, "negative": c.neg, "strokes": strokes, "reference": ref})
+        self._frame_jobs[job.id] = (cid, f)
+        self.statusBar().showMessage(f"colorizing frame {f} with {self.project.d.settings['model']}"
+                                     + (f" and {len(strokes)} stroke(s)" if strokes else "") + "...", 5000)
+
+    def _frame_view_update(self) -> None:
+        """Show this frame's Colorize frame result, if it has one."""
+        t = self._paint_target()
+        res = self._frame_results.get((t[1], t[2])) if t and t[0] == "clip" else None
+        if res and Path(res[0]).exists():
+            from PySide6.QtGui import QImage as _QI
+
+            self.viewer.frame_image = _QI(res[0])
+            self.viewer.frame_label = res[1]
+        else:
+            self.viewer.frame_image = None
+        self.viewer.update()
+
     def seek(self, frame: int, playing: bool = False) -> None:
         dur = self.project.duration
         frame = max(0, min(int(frame), max(0, dur - 1)))
@@ -957,6 +1212,7 @@ class MainWindow(QMainWindow):
             self._refresh_inspector()
             self._update_overlays()
             self._load_grade_panel()
+            self._frame_view_update()
         self._request(playing)
 
     def step(self, n: int) -> None:
@@ -1198,10 +1454,11 @@ class MainWindow(QMainWindow):
                 src = (lab_to_srgb(gray, np.zeros(gray.shape + (2,), np.float32))[..., 0] * 255 + 0.5).astype(np.uint8)
             gimg = to_qimage(src)
             st, model = self.project.d.settings, self.project.d.settings["model"]
-            res = photo_result_path(ph.path, st, model, ph.strokes, ph.neg, ph.reference)
+            pref = self.project.photo_reference(ph)
+            res = photo_result_path(ph.path, st, model, ph.strokes, ph.neg, pref)
             if not res.exists() and ph.strokes:
                 # hints not applied yet: show the last unhinted result meanwhile
-                res = photo_result_path(ph.path, st, model, None, ph.neg, ph.reference)
+                res = photo_result_path(ph.path, st, model, None, ph.neg, pref)
             cimg = raw = None
             if res.exists():
                 rgb = self._photo_display(str(res)).astype(np.float32) / 255.0
@@ -1266,12 +1523,11 @@ class MainWindow(QMainWindow):
                 continue
             self.runner.submit("analyze", f"Colorize {c.name}",
                                {**self._job_payload(), "clip": asdict(c), "hints": self.project.d.hints.get(c.id),
-                            "references": self.project.d.references.get(c.id)})
+                            "references": self.project.expanded_references(c.id)})
 
-    @staticmethod
-    def _photo_payload(ph) -> dict:
+    def _photo_payload(self, ph) -> dict:
         return {"photo": ph.id, "path": ph.path, "strokes": ph.strokes, "negative": ph.neg,
-                "reference": ph.reference}
+                "reference": self.project.photo_reference(ph)}
 
     def colorize_photos(self) -> None:
         rows = sorted({self.filmstrip.row(it) for it in self.filmstrip.selectedItems()}) or \
@@ -1405,6 +1661,14 @@ class MainWindow(QMainWindow):
             self.runner.shutdown()  # a fresh worker sees the new models folder
         elif job.kind == "match":
             self._matches_found(result)
+        elif job.kind == "frame_preview":
+            where = self._frame_jobs.pop(job.id, None)
+            if where:
+                self._frame_results[where] = (result["path"], result["label"])
+                self._frame_view_update()
+                if self._paint_target() == ("clip", where[0], where[1]):
+                    self.viewer.set_mode("frame")
+                self.statusBar().showMessage(f"{result['label']}. 4 or This frame shows it, 1 goes back", 8000)
         elif job.kind == "measure_negative":
             target = self._measuring.pop(job.id, None)
             if target:
@@ -1477,8 +1741,10 @@ class MainWindow(QMainWindow):
         pb = self.paintbar
         self.viewer.paint_mode = pb.paint.isChecked()
         self.viewer.erase_mode = pb.erase.isChecked()
-        self.viewer.show_strokes = pb.show.isChecked() or pb.paint.isChecked()
+        self.viewer.show_strokes = pb.show.isChecked()  # H hides them, painting or not
         self.viewer.brush = {"rgb": list(pb.rgb), "neutral": pb.neutral.isChecked(), "radius": pb.radius()}
+        if pb.item_id and not pb.neutral.isChecked():
+            self.viewer.brush["item"] = pb.item_id
         reach = pb.stroke_reach()
         if reach is not None:
             self.viewer.brush["reach"] = reach
@@ -1493,6 +1759,11 @@ class MainWindow(QMainWindow):
             return
         if t[0] == "photo":
             stroke.pop("reach", None)  # one frame anyway
+        item = next((c for c in self.project.d.colors if c["id"] == stroke.get("item")), None)
+        if item is not None and not item.get("source"):
+            # an item's first stroke is what Find looks for elsewhere
+            item["source"] = {"kind": t[0], "target": t[1], "frame": t[2],
+                              "stroke": {k: v for k, v in stroke.items() if k != "item"}}
         self._set_target_strokes(t, self._target_strokes(t) + [stroke], "paint")
         self._after_paint()
 
@@ -1600,14 +1871,22 @@ class MainWindow(QMainWindow):
             self.runner.submit("photo", f"Hints on {Path(ph.path).name}",
                                {**self._job_payload(), **self._photo_payload(ph)})
             return
-        c = self.project.d.clips[t[1]]
-        if self.status.get(c.id) == "none":
-            self.statusBar().showMessage(f"{c.name} isn't colorized yet; hints go in with its first colorize pass", 6000)
-        self.runner.cancel_where(lambda j: j.kind == "analyze" and j.payload.get("clip", {}).get("id") == c.id,
-                                 running=False)
-        self.runner.submit("analyze", f"Hints on {c.name}",
-                           {**self._job_payload(), "clip": asdict(c), "hints": self.project.d.hints.get(c.id),
-                            "references": self.project.d.references.get(c.id)})
+        # a video shot: paint-only colour while it hasn't been through the
+        # model (seconds), or update its full colour if it has (the model
+        # pass is cached, so that's quick too)
+        shot = self._current_shot()
+        if shot is None:
+            return
+        c, no, (a, b), _ = shot
+        st = self.shot_status.get(c.id, {}).get(f"{a}-{b}", {"state": "none"})
+        has_paint = any(a <= k < b for k in self.project.hint_frames(c.id))
+        if st["state"] == "colored":
+            self.fill_shot(quiet=True)
+        elif has_paint:
+            self.color_shot(quiet=True)
+        elif st["state"] == "painted":  # the last stroke was erased: back to nothing
+            self.statusBar().showMessage(f"shot {no} has no paint left; its old Color shot result stays until "
+                                         "you Fill it or paint again", 6000)
 
     def _update_overlays(self) -> None:
         t = self._paint_target()
@@ -1661,7 +1940,7 @@ class MainWindow(QMainWindow):
             self.paintbar.set_rgb([int(round(c * 255)) for c in rgb])
         self.viewer.update()
 
-    # -------------------------------------------------- saved colours
+    # -------------------------------------------------- items (saved colours)
 
     def save_colour(self) -> None:
         t = self._paint_target()
@@ -1670,11 +1949,15 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("paint a stroke first; its colour is what gets saved", 5000)
             return
         st = strokes[-1]
-        name, ok = QInputDialog.getText(self, "Save colour", "Name (\"Anna's coat, navy\"):")
+        name, ok = QInputDialog.getText(self, "Make item", "What did you paint? (\"Anna's coat\"):")
         if not ok or not name.strip():
             return
-        source = {"kind": t[0], "target": t[1], "frame": t[2], "stroke": st}
-        self.project.add_color(name.strip(), st["rgb"], source)
+        source = {"kind": t[0], "target": t[1], "frame": t[2],
+                  "stroke": {k: v for k, v in st.items() if k != "item"}}
+        c = self.project.add_color(name.strip(), st["rgb"], source)
+        st["item"] = c["id"]  # that stroke now belongs to it
+        self._set_target_strokes(t, self._target_strokes(t), "label stroke")
+        self.paintbar.set_rgb(c["rgb"], c["id"], c["name"])
         self.colours_dock.raise_()
         self._refresh()
 
@@ -1691,8 +1974,81 @@ class MainWindow(QMainWindow):
     def _refresh_colours(self) -> None:
         from ..worker import match_thumb_path
 
+        usage = {c["id"]: self.project.item_usage(c["id"]) for c in self.project.d.colors}
         self.colours.show_data(self.project.d.colors, self.project.d.suggestions, self._names(),
-                               self.project.d.settings, thumbs=match_thumb_path)
+                               self.project.d.settings, thumbs=match_thumb_path, usage=usage,
+                               active=self.paintbar.item_id)
+
+    def use_item(self, ident: str) -> None:
+        """Paint with an item: its colour, and new strokes carry its name."""
+        c = next((c for c in self.project.d.colors if c["id"] == ident), None)
+        if c is None:
+            return
+        self.paintbar.set_rgb(c["rgb"], c["id"], c["name"])
+        if not self.paintbar.paint.isChecked():
+            self.paintbar.paint.setChecked(True)
+        self.statusBar().showMessage(f"painting {c['name']}: new strokes belong to it", 5000)
+        self._refresh_colours()
+
+    def new_item(self, name: str | None = None, rgb=None) -> dict | None:
+        from PySide6.QtGui import QColor
+        from PySide6.QtWidgets import QColorDialog
+
+        if name is None:
+            name, ok = QInputDialog.getText(self, "New item", "What is it? (\"Anna's coat\", \"the sky\")")
+            if not ok or not name.strip():
+                return None
+        if rgb is None:
+            col = QColorDialog.getColor(QColor(*self.paintbar.rgb), self, f"Colour of {name.strip()}")
+            if not col.isValid():
+                return None
+            rgb = [col.red(), col.green(), col.blue()]
+        c = self.project.add_color(name.strip(), rgb, None)
+        self.colours_dock.raise_()
+        self.use_item(c["id"])
+        self._refresh()
+        return c
+
+    def recolour_item(self, ident: str, rgb=None) -> None:
+        from PySide6.QtGui import QColor
+        from PySide6.QtWidgets import QColorDialog
+
+        c = next((c for c in self.project.d.colors if c["id"] == ident), None)
+        if c is None:
+            return
+        if rgb is None:
+            col = QColorDialog.getColor(QColor(*c["rgb"]), self, f"New colour for {c['name']}")
+            if not col.isValid():
+                return
+            rgb = [col.red(), col.green(), col.blue()]
+        n = self.project.recolor_item(ident, rgb)
+        if self.paintbar.item_id == ident:
+            self.paintbar.set_rgb(c["rgb"], ident, c["name"])
+        self.statusBar().showMessage(f"{c['name']}: {n} stroke{'s' if n != 1 else ''} recoloured", 6000)
+        self._after_paint()
+
+    def delete_item(self, ident: str, with_strokes: bool | None = None) -> None:
+        c = next((c for c in self.project.d.colors if c["id"] == ident), None)
+        if c is None:
+            return
+        k, _ = self.project.item_usage(ident)
+        if with_strokes is None:
+            with_strokes = False
+            if k:
+                r = QMessageBox.question(
+                    self, "Delete item", f"Delete {c['name']}'s {k} stroke{'s' if k != 1 else ''} too?\n\n"
+                    "Yes deletes the paint as well. No keeps the paint, without a name.",
+                    QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel)
+                if r == QMessageBox.Cancel:
+                    return
+                with_strokes = r == QMessageBox.Yes
+        self.project.remove_color(ident, with_strokes)
+        if self.paintbar.item_id == ident:
+            self.paintbar.set_rgb(self.paintbar.rgb)
+        if with_strokes and k:
+            self._after_paint()
+        else:
+            self._refresh()
 
     def _colour_request(self, action: str, ident: str) -> None:
         p = self.project
@@ -1703,21 +2059,29 @@ class MainWindow(QMainWindow):
                 if ok and name.strip():
                     p.rename_color(ident, name.strip())
         elif action == "delete":
-            p.remove_color(ident)
+            self.delete_item(ident)
+            return
+        elif action == "new_item":
+            self.new_item()
+            return
+        elif action == "recolour":
+            self.recolour_item(ident)
+            return
         elif action == "save_colour":
             self.save_colour()
             return
         elif action == "find":
-            if not p.d.colors:
-                self.statusBar().showMessage("save a colour first: paint a stroke, then Save last stroke", 5000)
+            cols = [c for c in p.d.colors if c.get("source") and (c["id"] == ident or not ident)]
+            if not cols:
+                self.statusBar().showMessage("paint an item first: Find looks for what its first stroke covers",
+                                             6000)
                 return
-            cols = [c for c in p.d.colors if c["id"] == ident] if ident else list(p.d.colors)
             clips = {cid: {"path": c.path, "fps_num": c.fps_num, "fps_den": c.fps_den, "shots": c.shots,
                            "negative": c.neg}
                      for cid, c in p.d.clips.items()}
             photos = {ph.id: ph.path for ph in p.d.photos}
             photo_neg = {ph.id: ph.neg for ph in p.d.photos if ph.neg}
-            label = f"Find {cols[0]['name']}" if ident and cols else "Find saved colours"
+            label = f"Find {cols[0]['name']}" if ident and cols else "Find items"
             self.colours_dock.show()
             self.colours_dock.raise_()
             self.runner.submit("match", label,
@@ -2066,7 +2430,8 @@ class MainWindow(QMainWindow):
         v = dlg.values()
         v["dir"].mkdir(parents=True, exist_ok=True)
         items = [{"src": ph.path, "dst": str(v["dir"] / f"{Path(ph.path).stem}.{v['ext']}"),
-                  "strokes": ph.strokes, "grade": ph.grade, "negative": ph.neg, "reference": ph.reference}
+                  "strokes": ph.strokes, "grade": ph.grade, "negative": ph.neg,
+                  "reference": self.project.photo_reference(ph)}
                  for ph in photos]
         self.runner.submit("export_photos", f"Export {len(items)} photo(s)",
                            {**self._job_payload(), "items": items, "bits": v["bits"], "quality": v["quality"]})

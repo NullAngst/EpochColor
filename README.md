@@ -2,7 +2,7 @@
 
 EpochColor colorizes black and white photos and film footage while keeping the original grain and detail exactly as they were. It's for one person working through an archive on a Linux desktop, with or without a GPU.
 
-**Where it's at:** the editor with a before/after viewer, a timeline for multiple clips, painted colour hints that follow objects through a shot or stay on one frame, saved colours with picture matches, reference images, colour cast removal, black and white negatives, deflicker, dust removal and regrain, per-shot grading with keyframes and scopes, sound while playing, autosave, a model manager with newer models, and the full export matrix. Still to come: the Flatpak, and Windows.
+**Where it's at:** the editor with a before/after viewer, a timeline for multiple clips, painting that fills each object to its edges with any model and follows it through a shot or stays on one frame, a shot at a time (Color shot, Fill shot) or all at once, named items you can recolour and find in other shots, a This frame preview of any model, reference images or your own painting as one, zoom while painting, colour cast removal, black and white negatives, deflicker, dust removal and regrain, per-shot grading with keyframes and scopes, sound while playing, autosave, a model manager with newer models, and the full export matrix. Still to come: the Flatpak, and Windows.
 
 ## Download and run
 
@@ -89,7 +89,7 @@ The model never touches brightness. A black and white photo already holds all of
 1. The source is reduced to luminance. A sepia or slightly tinted scan loses its tint here.
 2. A copy at working size (512 px short side by default) is denoised. Only this copy goes to the model, since models read grain as texture and paint blotches into it.
 3. The model predicts color.
-4. Painted hints, if any, are enforced: the correction spreads through areas of similar brightness and stops at edges.
+4. Painted strokes, if any, fill their objects: each stroke's colour floods out through areas of similar brightness and stops at edges, and where it lands it replaces the model's colour. The model only decides what you didn't paint.
 5. Color is scaled to full size with a guided filter, so it follows real edges and ignores grain.
 6. Color meets the original luma. Out-of-gamut pixels lose chroma instead of having channels clipped, so brightness stays put. In testing the output L matches the source to within 0.001 L*.
 
@@ -103,7 +103,7 @@ Or run the AppImage, or `epochcolor-gui`. `epochcolor gui reel1.mkv reel2.mkv` o
 
 1. File > Add clips (Ctrl+I). Each clip gets probed, a small proxy built for scrubbing, and its shots detected, in the background. The first clip sets the project's frame rate and resolution, and a clip that doesn't match is refused, same rule as the command line.
 2. Colour > Colorize all clips (Ctrl+Shift+R). This is the slow part. Progress shows in the Inspector, and Cancel stops it. Finished shots stay cached either way.
-3. Scrub and play. The viewer shows the proxy while moving and swaps in a full-size frame from the real pipeline once the playhead rests, so what you judge when paused is what exports. 1, 2 and 3 switch between colour, before/after (drag the divider), and the original.
+3. Scrub and play. The viewer shows the proxy while moving and swaps in a full-size frame from the real pipeline once the playhead rests, so what you judge when paused is what exports. 1, 2 and 3 switch between colour, before/after (drag the divider), and the original. 4 is This frame (see below).
 4. Edit: S splits at the playhead, Delete ripple-deletes the selected segment, drag a segment's edge to trim it, drag its middle onto another segment to move it, I and O set the export range, M drops a marker with a note. Click an audio track's name to switch it on or off.
 5. File > Export video (Ctrl+E). Same options as the command line, with a live plan that says what the RF became and which audio tracks get re-encoded.
 
@@ -113,14 +113,28 @@ Everything is undoable, without limit, for the session: Ctrl+Z and Ctrl+Shift+Z.
 
 **Photos.** File > Add photos switches the bottom panel to a filmstrip. Select one or more, Colour > Colorize selected photos, then File > Export photos to write PNG, 16-bit TIFF, JPEG or WebP into a folder.
 
-**Painting hints.** The automatic pass guesses, and it can't know a coat was navy. Tell it.
+**Painting.** The automatic pass guesses, and it can't know a coat was navy. Tell it. Painting works the same with every model, since the model isn't what reads your strokes: each stroke fills the object it's on out to that object's edges, and the model colours only what you didn't paint. So paint the coat and the wall behind it stays whatever the model made it.
 
-1. Put the playhead on a frame where the object is clearly visible and press P (or Paint hints above the viewer).
-2. Pick the colour with the swatch, or Ctrl+click somewhere in the picture to take a colour from it.
-3. Drag a few strokes across the coat. You don't mask anything: the strokes spread out to the object's edges on their own. Grey paints "no colour here", for a white shirt or a grey wall. Right-click a stroke to remove it. [ and ] or the mouse wheel change the brush size.
-4. A moment after each stroke the hint pass runs (switch "Apply as I paint" off to do it by hand with Ctrl+Return). The fix gets carried forward and backward through the whole shot along the motion, and fades where the object leaves the frame or something covers it.
+The loop, one shot at a time:
 
-Only the painted shot reruns, and the expensive model pass stays cached, so it takes seconds rather than minutes. Paint on several frames of a long shot and each frame of it takes the nearest fixes. White dots on the timeline mark painted frames.
+1. Put the playhead on a frame where the thing is clearly visible and press P (or Paint hints above the viewer).
+2. Pick what you're painting in the Items panel (a tab next to Clips): click an item, or New item to name one ("Anna's coat") and pick its colour. The paint bar shows "Item: Anna's coat" in orange. Picking a colour with the swatch, or Ctrl+click in the picture, paints without a name.
+3. Drag a stroke or two across it. No masking. Grey paints "no colour here", for a white shirt or a grey wall. Right-click a stroke to remove it.
+4. Zoom in for the small stuff. The mouse wheel zooms at the pointer, middle-drag pans, Ctrl+0 fits the picture again (Ctrl+Shift+= and Ctrl+Shift+- zoom from the keyboard). Shift+wheel, or [ and ], change the brush size.
+5. Paint a few more frames if the shot changes a lot through it. The This shot box in the Inspector lists the shot's painted frames; pick one to go there.
+6. Color shot (Ctrl+Shift+C). Seconds, and no model: only your painted objects get colour, carried through the shot along the motion, and everything else stays grey. What you see is exactly what your paint does.
+7. Fill shot (Ctrl+Shift+F). The model colours the rest of the shot, and your paint keeps every object it covers. The first Fill runs the model over the whole shot. After that the model pass is cached, so changing the paint reruns in seconds. Once the shot is coloured the button says Update shot.
+8. Colorize all, when you're happy. Every shot of every clip: painted shots with their paint, the rest by the model. With "Unpainted shots learn from my painting" on, the shots you didn't paint look for the things you did (see Teaching below).
+
+You can stop at any step. Paint one shot, Color shot it, look at it on the timeline, Fill it, move to the next shot, and only hit Colorize all at the end. Or paint a handful of shots and Colorize all straight away.
+
+With Apply as I paint on (the default), each stroke does step 6 or 7 by itself a moment later: a shot that's only painted gets Color shot again, a coloured shot gets updated. Switch it off to press the buttons yourself.
+
+**Where each shot stands.** A strip under each clip on the timeline shows it: grey is not coloured, amber is painted only, green is coloured, and stripes mean out of date (the paint changed since). The Inspector says the same in words, with how many frames and strokes the shot has and which items are in it. The label at the bottom of the viewer says it too. White dots on the timeline mark painted frames.
+
+**Seeing under your paint.** H (or Show strokes on the paint bar) hides the strokes, painting or not, so you see the colour they made. 1, 2 and 3 switch between colour, before/after and the original.
+
+**This frame.** Colorize frame (Ctrl+F, next to the view buttons under the picture) runs the model you've picked on the frame under the playhead, with that frame's paint and the shot's reference, and shows it as This frame (4). Nothing gets cached or committed: it's a quick picture to judge a model by. Flip between This frame and Colour to compare, pick another model in the Inspector, and press it again. Each frame keeps its own result for the session, so another frame shows "not colorized yet" until you press it there.
 
 **Frame by frame.** Sometimes carrying a stroke through the whole shot is wrong: a face turning, a flag waving, something that changes colour under the light. Press F (or Frame by frame on the paint bar) and new strokes colour only their own frame. Set the reach next to it to let them cover a few frames either side. Then the loop is:
 
@@ -131,20 +145,27 @@ Only the painted shot reruns, and the expensive model pass stays cached, so it t
 
 Each painted frame's fix is cached on its own, so painting the next frame costs one frame's worth of work, not the whole shot again. The stabilizer that smooths colour between frames leaves frame-by-frame strokes alone, so what you paint on a frame is what that frame gets. Strokes painted with frame by frame off still follow their object through the whole shot, and both kinds mix fine in one shot.
 
-To be clear about what this is: the strokes steer the colour of those frames. They don't retrain the model, so painting a hundred frames of a coat doesn't make the model better at coats elsewhere. Saved colours are how one painted colour gets reused across shots.
+Photos work the same way: paint in the viewer with the Photos tab open, then Colorize photo.
 
-Photos work the same way: paint in the viewer with the Photos tab open.
+**Items.** For the coat that shows up in forty shots. An item is a name and a colour, and every stroke painted with it carries the name.
 
-**Saved colours.** For the coat that shows up in forty shots.
+- Click an item to paint with it. The list shows how many frames and strokes each one has, and >> marks the one the brush is on.
+- Recolour changes every stroke of that item, everywhere, and the shots it's in update.
+- Delete asks whether to delete its strokes too, or keep them as paint without a name.
+- From last stroke makes an item out of a stroke you already painted.
+- Find this one (or Find all) looks for an item in the middle frame of every other shot and every photo, using the item's first stroke as the example. Each match comes back with a small picture of that frame and the spot ringed, plus how sure it is: strong, likely, or possible. Use paints the colour there, Skip drops it, Go to (or a double-click) shows it full size. On the picture itself, matches in the current shot are markers: click one to use it, right-click to skip it. Nothing found? Slide toward More matches and find again. Too many wrong ones? Slide toward Closer matches.
 
-1. Paint a stroke on it, then Save last stroke in the Colours panel (next to Clips) and call it "Anna's coat, navy". The list shows a picture of where it came from.
-2. Find this one (or Find all) looks at the middle frame of every other shot and every photo.
-3. Each match comes back with a small picture of that frame and the spot ringed, plus how sure it is: strong, likely, or possible. Use paints the colour there, Skip drops it, Go to (or a double-click) shows it full size. On the picture itself, matches in the current shot are markers: click one to use it, right-click to skip it.
-4. Nothing found? Slide toward More matches and find again. Too many wrong ones? Slide toward Closer matches.
+Find needs a network model, since it compares what the model's own features say about the item's object with every other place. It finds the same object well and look-alikes too, which is why it asks by default. "Use every match straight away" skips the asking, at the cost of sometimes painting the wrong thing.
 
-"Use every match straight away" skips the asking, at the cost of sometimes painting the wrong thing. Matching compares what the model's own features say about the stroke's object with every other place, at the moment you ask; nothing gets trained. It needs a network model (any of them; the `hints` model has no features). It finds the same object well and look-alikes too, which is why it asks by default.
+**Teaching, and what it is.** Nothing gets retrained, so painting a hundred coats doesn't make the model better at coats. What happens instead is matching at the moment you colorize. With "Unpainted shots learn from my painting" on (it is in a new project), Colorize all takes everything you've painted, describes each painted object by the model's own features, and looks for the same kind of thing in the shots you didn't paint. A close match takes your colour, at the strength next to the checkbox. Anything that doesn't match gets the model's colour as usual. It asks for a closer match than a reference photo does, since a few painted objects are a thin sample. Shots you painted go by their own paint only.
 
-**Reference images.** Got a colour photo of the same street, the same kind of uniform, a period postcard, an Autochrome from the era? Put the playhead on the shot, click Reference image in the Inspector and pick it. Every part of the frame gets matched against every part of the photo by what the model's own features say it is (sky, brick, skin, leaves) and how bright it is, and takes the colour of its closest matches. Where nothing in the photo looks like it, the model's own colour stays. Strength sets how much the photo wins. It goes in through the hint pass like a painted stroke, matched every couple of seconds through the shot and carried along the motion between, so painted strokes still win where you put them. Each shot has its own reference; photos take one each too. It needs a network model, since the `hints` model has no features.
+**References.** Each shot can have one, from the Reference menu in This shot. Photos take one each too.
+
+- A colour photo. Got one of the same street, the same kind of uniform, a period postcard, an Autochrome from the era? Every part of the frame gets matched against every part of the photo by what the model's own features say it is (sky, brick, skin, leaves) and how bright it is, and takes the colour of its closest matches. Where nothing in the photo looks like it, the model's own colour stays.
+- My painting in this shot. No photo for this shot? Paint a frame or two of it and use that instead. The rest of the shot gets matched against your painted objects by what they are, not only carried along the motion, which helps when something leaves the frame and comes back or turns a lot.
+- My painting everywhere in the project. Everything you've painted, in any shot, as one reference. Handy for a shot that has the same people or places as shots you've already painted.
+
+Strength sets how much the reference wins. It goes in through the same pass as painted strokes, matched every couple of seconds through the shot and carried along the motion between, and painted strokes still win where you put them. It needs a network model, since the `hints` model has no features.
 
 **Negatives.** Scanned or camera-copied black and white negatives go straight in. Tick Negative in the Inspector for the clip under the playhead or the photo you picked. EpochColor measures the film base (the clearest part of the film, usually the rebate along the edge; for a tightly cropped scan, the clearest part of the picture) and the density range, then inverts by density, which is how a print would have come out. Levels opens the numbers: film base, shadow and highlight density, contrast, with the picture updating as you drag. It runs before everything else, so the model, the proxy view and the export all see the positive. RAW copies give the best result, since inversion stretches the tones and 8-bit JPEGs band. Colour negatives are out of scope: darktable's negadoctor handles their orange mask far better than this would.
 
@@ -226,8 +247,8 @@ For a set, put hint files in a folder named after each photo (`scan01.png` for `
 | `deoldify-video` | 834 MB | DeOldify 2019, ResNet-101. Trained for film: calm, natural colour that holds steady between frames. The one to try first on footage. |
 | `deoldify-stable` | 834 MB | The same network trained for photos: portraits and landscapes, fewer stray blotches. |
 | `deoldify-artistic` | 244 MB | DeOldify with a ResNet-34. Bolder and more varied, and more often wrong. Good for stills you'll touch up. |
-| `siggraph17` (default) | 130 MB | Zhang et al. 2017. Automatic, and reads your hints as input. Small and quick, muted colour. |
-| `eccv16` | 125 MB | Zhang et al. 2016. Automatic only, more muted still. Hints still apply afterward. |
+| `siggraph17` (default) | 130 MB | Zhang et al. 2017. Automatic. Small and quick, muted colour. |
+| `eccv16` | 125 MB | Zhang et al. 2016. Automatic, more muted still. |
 | `ddcolor-modelscope` | 912 MB | DDColor 2023, ConvNeXt-L. Far more saturated and specific. The authors' all-round pick. |
 | `ddcolor-paper` | 912 MB | DDColor with the paper's weights, more conservative. |
 | `ddcolor-artistic` | 912 MB | DDColor trained for bolder colour. Less faithful, more striking. |
@@ -235,6 +256,10 @@ For a set, put hint files in a folder named after each photo (`scan01.png` for `
 | `hints` | built in | No network at all. Your strokes are the only colour, everything unpainted stays grey. |
 
 The Zhang models are BSD-2-Clause, from [richzhang/colorization](https://github.com/richzhang/colorization). DeOldify is MIT, by Jason Antic, from [jantic/DeOldify](https://github.com/jantic/DeOldify); its network ships inside EpochColor as ModelScope's fastai-free port (`epochcolor/models/deoldify_arch`, Apache-2.0, with the notices), and the weights download from a Hugging Face mirror of the official files, [spensercai/DeOldify](https://huggingface.co/spensercai/DeOldify), checked against SHA-256. DDColor's code is Apache-2.0 and ships inside EpochColor (in `epochcolor/models/ddcolor_arch`, with its license); its weights come from the authors' Hugging Face repos, and their terms are on those model cards.
+
+Painting used to go through SIGGRAPH17's own hint input, which is why it was the only model that took paint. That turned out to be the problem as well: the network treats hints as a suggestion for the whole picture, so painting a coat shifted colours all over the frame. Now strokes fill their objects on their own and every model just colours the rest, so painting behaves the same whichever model you pick.
+
+Is there a newer Zhang model? Not from that group: SIGGRAPH17 (ideepcolor) is their newest colorization network. The closest newer thing is iColoriT (WACV 2023), a hint-based transformer from a different group, MIT licensed. Its weights only live on Google Drive, which has no stable direct download to check a SHA-256 against, so it isn't in the catalog. With painting no longer going through the model, it wouldn't change painting anyway.
 
 `epochcolor models` lists them with what's installed. `epochcolor models add weights.pth manifest.json` adds your own, `epochcolor models remove ID` deletes one, `epochcolor models refresh` pulls the newest catalog.
 
@@ -328,7 +353,7 @@ Why 10-bit by default? Colorized footage is mostly smooth gradients: skies, skin
 
 - `--grain 100` keeps the original luma, the default. Lower it to blend in the denoised copy, `0` for fully clean.
 - `--denoise N` sets the strength of the model's denoise in L* units. Auto by default. Raise it if colored blotches show up in grainy areas.
-- `--spread 0.15` is how far a hint travels through flat areas, as a fraction of the short side. Raise it when a stroke doesn't fill its object, lower it when it leaks.
+- `--spread 0.35` is how far a stroke can reach through its object, as a fraction of the short side. Raise it when a stroke doesn't fill a big object. Edges stop it either way.
 - `--working-size 512` is the short side for color work. Higher costs time and memory, and rarely looks different, since soft color is the whole trick.
 - `--negative` measures and inverts a black and white negative first.
 - `--reference street-1912.jpg` uses a colour photo to guide the colours (every shot, for `video`). `--reference-strength 60` softens it.
@@ -342,8 +367,10 @@ Why 10-bit by default? Colorized footage is mostly smooth gradients: skies, skin
 
 Honest list, so nobody is surprised.
 
-- **The network models haven't been run against their real weights yet.** My build environment couldn't reach the weight host. The architectures match the reference code and load test weights cleanly, and the weights loader errors out if anything doesn't fit. But SIGGRAPH17 hint handling uses the mask convention from the original interactive demo (ideepcolor), and that needs a check on real photos. If hints get ignored or come out wrong with `siggraph17` but work fine with `eccv16`, that's the first place to look: `MASK_CENT` in `epochcolor/models/zhang.py`.
-- Edges come from brightness only. Two objects with the same grey value and no line between them will share a color fix. Add a stroke on the other object to hold it.
+- **The network models haven't been run against their real weights yet.** My build environment couldn't reach the weight host. The architectures match the reference code and load test weights cleanly, and the weights loader errors out if anything doesn't fit.
+- A stroke's fill stops at edges it can see in brightness. In the tests, an object 12 L* or more apart from its surroundings fills completely with nothing outside it. At 6 L* apart it fills about three quarters and spills about 1%. Two objects at the same grey with no line between them share the paint. Add a stroke where it stops short, or a stroke of the other object's colour to hold the edge.
+- **Teaching and painting-as-reference are untuned on real models**, same as reference photos: how close a match has to be (the floor in `epochcolor/reference.py`, plus 0.1 for painted references) was set on reasoning and synthetic tests. If unpainted shots pick up your colours on the wrong things, lower the strength next to the checkbox; if they never pick them up, raise it, and tell me which model.
+- Colorize frame is a still: no stabilizer and nothing carried from other frames, so the shot can come out slightly different from the frame on its own.
 - The auto denoise strength assumes fine grain. Coarse, clumpy grain fools it into going too light. Set `--denoise` by hand.
 - EXIF is kept for JPEG, WebP and 8-bit PNG. 16-bit PNG and TIFF get the sRGB profile but not the EXIF yet.
 - The RAW develop path is written but hasn't been run against a real RAW file yet.
@@ -357,11 +384,11 @@ Honest list, so nobody is surprised.
 - **DeOldify has never run on its real weights either.** The network is ModelScope's port, which ModelScope itself runs on DeOldify's weights, and I rebuilt its ResNet bodies to match torchvision's layer names. The check I could do from here: the rebuilt network's tensors add up to within 0.02% of both published files (874,066,230 and 255,144,681 bytes), and the leftover is the same few hundred bytes per tensor in both, which is file format overhead. One missing or extra layer would be at least 147 KB off. The loader refuses anything that doesn't fit exactly. What's still unchecked is the preprocessing: the grey input, ImageNet normalization and the render sizes follow DeOldify's and ModelScope's code, but I haven't compared a frame against DeOldify's own output.
 - **DDColor has never run on its real weights.** The architecture is the authors' own code, vendored unchanged, and builds with the paper's parameter counts (55.0M tiny, 227.9M large), but my build machine couldn't reach Hugging Face. The loader refuses weights that don't fit exactly, so a mismatch fails loudly instead of producing garbage. Which file each Hugging Face repo holds is looked up at download time, and its SHA-256 comes from Hugging Face's own listing.
 - **DDColor's weight licenses are marked unverified.** The code is Apache-2.0, but I couldn't read the model cards from here, so the manager asks you to accept the terms before downloading. Read the card.
-- Hint carrying is translation along optical flow plus an edge-aware fill. It holds well on things that move and turn slowly, and fades on fast motion, heavy motion blur, or objects that leave and come back. Paint another frame where it fades.
-- Saved-colour matching looks at the middle frame of each shot, so an object that's only in the first or last second of a long shot can be missed. Paint it there by hand.
+- Carrying paint through a shot is translation along optical flow plus the edge-aware fill. It holds well on things that move and turn slowly, and fades on fast motion, heavy motion blur, or objects that leave and come back. Paint another frame where it fades.
+- Find looks at the middle frame of each shot, so an object that's only in the first or last second of a long shot can be missed. Paint it there by hand.
 - Remove colour cast is a heuristic: the median of the least colourful 40% of each shot. It assumes most scenes have something near neutral in them, which most do.
 - Carrying strokes to the next frame tracks on the proxy, which is small. Fine detail (an eye, a button) can drift by a pixel or two per frame; that's what the touch-up step is for.
-- Saved-colour matching uses the model's features as they are. It finds the same object in other shots well enough to be useful and also finds look-alikes; that's why it asks by default. The `hints` model has no features, so matching needs a network model.
+- Find uses the model's features as they are. It finds the same object in other shots well enough to be useful and also finds look-alikes; that's why it asks by default. The `hints` model has no features, so matching needs a network model.
 - The qualifier and secondary corrections work in HSV, which is quick but shifts brightness a little when saturation changes a lot. Mask tracking follows position only, not scale or rotation.
 - A LUT is stored as a path in the project. Move the .cube and the grade loses it (you're told when it can't be read).
 - **None of the hardware encoders have run on real hardware yet.** My build machine has no GPU. Their arguments follow FFmpeg's documentation, `epochcolor encoders` proves whether each one starts, and auto falls back to software when a test encode fails. But the quality mappings (CQ, ICQ, QP) haven't been compared against the software encoders on real footage. VAAPI on AMD is what I'll check first, since that's my hardware. NVENC, QSV and AMF reports are welcome.

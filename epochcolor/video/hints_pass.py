@@ -47,19 +47,19 @@ def guided(p: np.ndarray, I: np.ndarray, r: int = 4, eps: float = 4.0) -> np.nda
     return _box(a, r) * I + _box(b, r)
 
 
-def keyframe_fix(model: ColorModel, source: Path, fps: Fraction, frame: int, strokes: list,
-                 working: tuple[int, int], chroma: tuple[int, int], ab_model_k: np.ndarray | None = None,
-                 denoise=None, spread: float = 0.15, negative: dict | None = None) -> tuple[np.ndarray, np.ndarray]:
-    """Target a/b and weight (both at chroma size) for one painted frame."""
+PAINT_VERSION = 2  # bump when what a stroke does changes, so cached fixes get redone
+
+
+def frame_luma(source: Path, fps: Fraction, frame: int, size: tuple[int, int], negative: dict | None = None,
+               denoise=None) -> np.ndarray:
+    """One frame's L* at size (w, h), lightly denoised, for painting."""
     import cv2
 
     from ..color import srgb_to_l
     from ..denoise import denoise_l
+    from ..film import invert
     from ..media import FrameReader
-    from ..propagate import propagate
 
-    ww, wh = working
-    cw, ch = chroma
     r = FrameReader(source, fps, "gray16le", cache=2)
     try:
         g16 = r.get(frame)
@@ -67,26 +67,25 @@ def keyframe_fix(model: ColorModel, source: Path, fps: Fraction, frame: int, str
         r.close()
     if g16 is None:
         raise RuntimeError(f"{Path(source).name}: frame {frame} could not be decoded for its hints")
-    from ..film import invert
-
     L = srgb_to_l(invert(g16, negative))
-    Lw = cv2.resize(L, (ww, wh), interpolation=cv2.INTER_AREA)
-    Lw = denoise_l(Lw, denoise)
-    hints = rasterize(strokes, ww, wh)
-    # what the strokes change is measured against the model on this same
-    # input without them, so differences between this single-frame run and
-    # the clip's temporally denoised run don't count as part of the fix
-    plain = model.predict(Lw, None)
-    ab = model.predict(Lw, hints) if model.info.takes_hints else plain
-    ab = propagate(Lw, ab, hints, spread=spread)
-    T = cv2.resize(ab, (cw, ch), interpolation=cv2.INTER_AREA)
-    P = cv2.resize(plain, (cw, ch), interpolation=cv2.INTER_AREA)
-    m = cv2.resize(hints.mask, (cw, ch), interpolation=cv2.INTER_AREA)
-    diff = np.linalg.norm(T - P, axis=-1)
-    W = np.clip(diff / 6.0, 0.0, 1.0)
-    W = np.maximum(W, np.clip(m * 2, 0, 1))
-    W = cv2.GaussianBlur(W, (0, 0), 1.0)
-    return T.astype(np.float32), np.clip(W, 0, 1).astype(np.float32)
+    return denoise_l(cv2.resize(L, size, interpolation=cv2.INTER_AREA), denoise)
+
+
+def keyframe_fix(model: ColorModel | None, source: Path, fps: Fraction, frame: int, strokes: list,
+                 working: tuple[int, int], chroma: tuple[int, int], ab_model_k: np.ndarray | None = None,
+                 denoise=None, spread: float = 0.35, negative: dict | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Target a/b and weight (both at chroma size) for one painted frame.
+
+    The strokes fill their own objects out to the objects' edges
+    (propagate.paint_fill) and nothing else; the weight says where. The
+    model isn't involved, so painting works the same whatever model is
+    picked, and the model's colour everywhere you didn't paint is left
+    exactly as it was."""
+    from ..propagate import paint_fill
+
+    cw, ch = chroma
+    L = frame_luma(source, fps, frame, (cw, ch), negative, denoise)
+    return paint_fill(L, rasterize(strokes, cw, ch), spread=spread)
 
 
 def carry(Ldn, ab_raw, a: int, b: int, keys, flow: Flow, tol: float, out, protect=None) -> None:

@@ -495,3 +495,86 @@ def test_autosave_recovers(tmp_path, monkeypatch):
     assert autosave.find(proj.path) is None
     autosave.clear(proj.path)
     assert not autosave.path_for(proj.path).exists()
+
+
+def test_items_shot_states_and_this_frame(tmp_path, window):
+    from epochcolor.timeline_export import clip_info
+
+    app, w = window
+    make_clip(tmp_path / "a.mkv")
+    w.add_clips([str(tmp_path / "a.mkv")])
+    wait(app, w)
+    p = w.project
+    c = next(iter(p.d.clips.values()))
+    a, b = c.shots[0]
+    key = f"{a}-{b}"
+    w.seek(5)
+    w._refresh()
+    assert w.shot_status[c.id][key]["state"] == "none"
+    assert "not coloured" in w.inspector.shot_info.text()
+
+    # zoom and fit
+    w.viewer.zoom_at(2.0)
+    assert w.viewer.zoom == pytest.approx(2.0)
+    w.viewer.fit()
+    assert w.viewer.zoom == 1.0 and w.viewer.pan.x() == 0 and w.viewer.pan.y() == 0
+
+    # a new item is the brush; its strokes carry it, and its first stroke is what Find looks for
+    item = w.new_item("red box", [200, 30, 30])
+    assert w.paintbar.item_id == item["id"] and w.paintbar.paint.isChecked()
+    assert w.viewer.brush["item"] == item["id"] and "red box" in w.paintbar.item_label.text()
+    w.hint_timer.setInterval(10_000)  # this test presses the buttons itself
+    w.viewer.strokeFinished.emit({**w.viewer.brush, "points": [[100 / 320, 0.55]]})
+    st = p.strokes_at(c.id, 5)[0]
+    assert st["item"] == item["id"] and item["source"]["frame"] == 5 and "item" not in item["source"]["stroke"]
+    assert p.item_usage(item["id"]) == (1, 1)
+    assert "painted on 1 frame" in w.colours.colours.item(0).text()
+    assert "red box" in w.inspector.shot_info.text()
+    w.hint_timer.stop()
+
+    # Color shot: paint only, no model
+    w.color_shot()
+    wait(app, w)
+    w._refresh()
+    assert w.shot_status[c.id][key] == {**w.shot_status[c.id][key], "state": "painted", "current": True}
+    assert "painted only" in w.inspector.shot_info.text()
+
+    # Fill shot: the model does the rest
+    w.fill_shot()
+    wait(app, w)
+    w._refresh()
+    assert w.shot_status[c.id][key]["state"] == "colored" and w.shot_status[c.id][key]["current"]
+    assert w.inspector.fill_shot_btn.text() == "Update shot"
+
+    # recolour the item: every stroke of it changes, and the shot is out of date until updated
+    w.recolour_item(item["id"], [30, 160, 60])
+    w.hint_timer.stop()
+    assert p.strokes_at(c.id, 5)[0]["rgb"] == [30, 160, 60]
+    w._refresh()
+    assert not w.shot_status[c.id][key]["current"]
+    w.apply_hints()  # a coloured shot updates
+    wait(app, w)
+    w._refresh()
+    assert w.shot_status[c.id][key]["current"]
+
+    # Colorize frame: a temporary picture of the model on this frame, shown as This frame
+    w.colorize_frame()
+    wait(app, w)
+    pump(app, 0.2)
+    assert w.viewer.mode == "frame" and w.viewer.frame_image is not None
+    w.seek(6)
+    assert w.viewer.frame_image is None, "frame 6 has no result of its own"
+    w.seek(5)
+    assert w.viewer.frame_image is not None
+
+    # an item nobody painted is skipped by Find
+    sky = w.new_item("sky", [120, 160, 220])
+    w._colour_request("find", sky["id"])
+    assert not w.runner.busy()
+
+    # deleting an item can keep its paint, unlabelled
+    w.delete_item(item["id"], with_strokes=False)
+    assert "item" not in p.strokes_at(c.id, 5)[0] and all(x["id"] != item["id"] for x in p.d.colors)
+    w.delete_item(sky["id"])
+    assert w.paintbar.item_id is None
+    assert clip_info(c)  # still a sane clip

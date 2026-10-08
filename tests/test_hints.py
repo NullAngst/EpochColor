@@ -64,7 +64,7 @@ def test_video_hint_follows_the_object(tmp_path, monkeypatch):
     hints = {5: [{"rgb": BLUE, "radius": 0.08, "points": [disc(5)]}]}
     rep = analyze(info, m, s, shots=[(0, 24)], quiet=True, hints=hints)
     after = np.load(rep.dir / "ab.npy").astype(np.float32)
-    assert m.calls - calls_model_pass == 1, "only the keyframe reruns, not the model pass"
+    assert m.calls == calls_model_pass, "painting doesn't rerun the model at all"
 
     def inside(arr, t):
         h, w = arr.shape[1:3]
@@ -129,7 +129,7 @@ def test_frame_only_strokes_stay_on_their_frame(tmp_path, monkeypatch):
     calls = m.calls
     hints[6] = [{"rgb": BLUE, "radius": 0.08, "points": [disc(6)], "reach": 0}]
     rep = analyze(info, m, s, shots=[(0, 24)], quiet=True, hints=hints)
-    assert m.calls - calls == 1
+    assert m.calls == calls, "and no model run for it"
     ab = np.load(rep.dir / "ab.npy").astype(np.float32)
     assert np.linalg.norm(inside(ab, 6) - target) < 10 and inside(ab, 12)[0] > 25
 
@@ -150,3 +150,57 @@ def test_move_strokes_follows_flow():
     assert out[0]["reach"] == 0 and out[0]["rgb"] == BLUE
     assert abs(out[0]["points"][0][0] - (0.25 + 10 / 199)) < 1e-4 and out[0]["points"][0][1] == pytest.approx(0.5)
     assert st[0]["points"][0] == [0.25, 0.5], "the original is left alone"
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg not installed")
+def test_paint_only_then_fill_one_shot(tmp_path, monkeypatch):
+    """Color shot: the painted object gets its colour, the rest stays grey,
+    no model involved. Fill shot: the model colours the rest of that shot
+    only, and the painted object keeps the paint. No leaks either way."""
+    pytest.importorskip("av")
+    from test_video import _make_clip
+
+    from epochcolor.hintpaint import stroke_ab
+    from epochcolor.project import Clip
+    from epochcolor.timeline_export import shot_states
+    from epochcolor.video.io import probe
+    from epochcolor.video.pipeline import VideoSettings, analyze, paint_shot
+
+    monkeypatch.setenv("EPOCHCOLOR_CACHE", str(tmp_path / "cache"))
+    clip = tmp_path / "c.mkv"
+    _make_clip(clip, n=24)
+    info = probe(clip)
+    s = VideoSettings(working_size=96, chroma_size=96)
+    shots = [(0, 12), (12, 24)]
+    c = Clip("c", str(clip), 160, 96, 24, 1, 24, shots=[list(x) for x in shots])
+
+    def disc(t):
+        return [(40 + 2 * t) / 160, 48 / 96]
+
+    hints = {5: [{"rgb": BLUE, "radius": 0.06, "points": [disc(5)]}]}
+    m = CountingJitter()
+    path = paint_shot(info, s, m.info.name, None, (0, 12), hints)
+    assert m.calls == 0, "Color shot doesn't run the model"
+    ab = np.load(path).astype(np.float32)
+    target = np.array(stroke_ab({"rgb": BLUE}))
+
+    def inside(arr, t, off=0):
+        h, w = arr.shape[1:3]
+        x, y = disc(t)
+        return arr[t - off, int(y * h) - 3:int(y * h) + 3, int(x * w) - 3:int(x * w) + 3].reshape(-1, 2).mean(0)
+
+    for t in (0, 5, 11):
+        assert np.linalg.norm(inside(ab, t) - target) < 12, t  # the whole disc, carried through the shot
+    assert np.abs(ab[:, 5:15, 120:150]).max() <= 2, "the background stays grey"
+    st = shot_states(c, s, m.info.name, None, hints)
+    assert st["0-12"]["state"] == "painted" and st["0-12"]["current"] and st["12-24"]["state"] == "none"
+
+    # Fill shot: the model pass for this shot only
+    rep = analyze(info, m, s, shots=shots, quiet=True, hints=hints, only_shots=[(0, 12)])
+    full = np.load(rep.dir / "ab.npy").astype(np.float32)
+    assert m.calls == 12, "only the shot's 12 frames went through the model"
+    assert np.linalg.norm(inside(full, 5) - target) < 12, "the paint wins on the disc"
+    bg = full[5, 5:15, 120:150].reshape(-1, 2).mean(0)
+    assert bg[1] < -8, "the model coloured the background (cool blue-ish in JitterModel)"
+    st = shot_states(c, s, m.info.name, None, hints)
+    assert st["0-12"]["state"] == "colored" and st["12-24"]["state"] == "none"

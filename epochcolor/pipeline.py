@@ -130,9 +130,12 @@ def colorize_photo(
                 "of the photo, paint on a transparent layer instead"
             )
 
-    ab = model.predict(Lw_dn, hw if model.info.takes_hints else None)
+    # the model colours the picture as if nothing were painted; the strokes
+    # then fill their own objects on top and nothing else (paint_fill), so
+    # painting behaves the same with every model and never leaks colour
+    ab = model.predict(Lw_dn, None)
     mark("model")
-    if reference and reference.get("path"):
+    if reference and (reference.get("path") or reference.get("kind") == "painted"):
         from .reference import reference_fix
 
         T, W = reference_fix(model, Lw_dn, reference)
@@ -140,10 +143,13 @@ def colorize_photo(
         mark("reference")
 
     if hw.count:
+        from .propagate import paint_fill
+
         spread = s.spread
         if spread is None:
-            spread = 3.0 if model.info.mode == "propagation" else 0.15
-        ab = propagate(Lw_dn, ab, hw, spread=spread)
+            spread = 3.0 if model.info.mode == "propagation" else 0.35
+        T, W = paint_fill(Lw_dn, hw, spread=spread)
+        ab = W[..., None] * T + (1 - W[..., None]) * ab
         mark("hints")
     elif model.info.mode == "propagation":
         rep.warnings.append("hints model with no hints gives a grey image")

@@ -118,6 +118,9 @@ def default_settings() -> dict:
         "regrain": 0.0,
         "regrain_size": 1.0,
         "regrain_chroma": 0.0,
+        "paint_spread": 0.35,  # how far a painted stroke fills through a flat area
+        "teach": False,  # Colorize all: unpainted shots learn from painted frames (on in new projects)
+        "teach_strength": 0.8,
     }
 
 
@@ -125,7 +128,7 @@ def new_project_settings() -> dict:
     """Defaults for a project started now: the model sees a deflickered,
     dust-free copy. The output stays as filmed unless asked."""
     s = default_settings()
-    s.update({"deflicker": 1.0, "dust": True})
+    s.update({"deflicker": 1.0, "dust": True, "teach": True})
     return s
 
 
@@ -504,10 +507,61 @@ class Project:
         self.d.colors.append(c)
         return c
 
-    def remove_color(self, color_id: str) -> None:
-        self.checkpoint("remove saved colour")
+    def remove_color(self, color_id: str, with_strokes: bool = False) -> None:
+        """Delete an item (saved colour). Its strokes stay, unlabelled, unless with_strokes."""
+        self.checkpoint("remove item")
         self.d.colors = [c for c in self.d.colors if c["id"] != color_id]
         self.d.suggestions = [x for x in self.d.suggestions if x.get("color") != color_id]
+        for strokes in self._all_stroke_lists():
+            keep = []
+            for st in strokes:
+                if st.get("item") == color_id:
+                    if with_strokes:
+                        continue
+                    st.pop("item", None)
+                keep.append(st)
+            strokes[:] = keep
+        self._drop_empty_hints()
+
+    def _all_stroke_lists(self):
+        for frames in self.d.hints.values():
+            for strokes in frames.values():
+                yield strokes
+        for ph in self.d.photos:
+            yield ph.strokes
+
+    def _drop_empty_hints(self) -> None:
+        for cid in list(self.d.hints):
+            self.d.hints[cid] = {f: v for f, v in self.d.hints[cid].items() if v}
+            if not self.d.hints[cid]:
+                del self.d.hints[cid]
+
+    def recolor_item(self, color_id: str, rgb) -> int:
+        """Give an item a new colour, and every stroke painted with it. Returns how many strokes changed."""
+        self.checkpoint("recolour item")
+        rgb = [int(v) for v in rgb]
+        n = 0
+        for c in self.d.colors:
+            if c["id"] == color_id:
+                c["rgb"] = rgb
+                if c.get("source") and c["source"].get("stroke"):
+                    c["source"]["stroke"] = dict(c["source"]["stroke"], rgb=rgb)
+        for strokes in self._all_stroke_lists():
+            for st in strokes:
+                if st.get("item") == color_id:
+                    st["rgb"] = rgb
+                    st["neutral"] = False
+                    n += 1
+        return n
+
+    def item_usage(self, color_id: str) -> tuple[int, int]:
+        """(strokes, painted frames or photos) labelled with this item."""
+        strokes = frames = 0
+        for lst in self._all_stroke_lists():
+            k = sum(1 for st in lst if st.get("item") == color_id)
+            strokes += k
+            frames += 1 if k else 0
+        return strokes, frames
 
     def rename_color(self, color_id: str, name: str) -> None:
         self.checkpoint("rename saved colour")
@@ -567,6 +621,79 @@ class Project:
             g.pop(key, None)
 
     # ------------------------------------------------- references, negatives
+
+    # what painting teaches: painted frames as a reference for other shots
+
+    MAX_SOURCES = 24
+
+    def painted_sources(self, clip_id: str | None = None, shot: tuple[int, int] | None = None) -> list[dict]:
+        """Every painted frame (and painted photo) as a reference source.
+        clip_id and shot narrow it to one shot's painted frames."""
+        out = []
+        for cid, frames in self.d.hints.items():
+            if clip_id is not None and cid != clip_id:
+                continue
+            c = self.d.clips.get(cid)
+            if c is None:
+                continue
+            for f, strokes in sorted(frames.items(), key=lambda kv: int(kv[0])):
+                f = int(f)
+                if not strokes or (shot and not shot[0] <= f < shot[1]):
+                    continue
+                out.append({"path": c.path, "fps_num": c.fps_num, "fps_den": c.fps_den, "frame": f,
+                            "strokes": strokes, "negative": c.neg})
+        if clip_id is None:
+            for ph in self.d.photos:
+                if ph.strokes:
+                    out.append({"path": ph.path, "frame": None, "strokes": ph.strokes, "negative": ph.neg})
+        if len(out) > self.MAX_SOURCES:  # spread the picks over everything painted
+            step = len(out) / self.MAX_SOURCES
+            out = [out[int(i * step)] for i in range(self.MAX_SOURCES)]
+        return out
+
+    def taught_reference(self) -> dict | None:
+        """The fallback for shots nobody painted: everything painted so far,
+        when the project's "teach" setting is on."""
+        if not self.d.settings.get("teach"):
+            return None
+        src = self.painted_sources()
+        if not src:
+            return None
+        return {"kind": "painted", "sources": src, "strength": float(self.d.settings.get("teach_strength", 0.8))}
+
+    def _expand(self, ref: dict | None, clip_id: str | None, shot) -> dict | None:
+        if not ref or ref.get("kind") != "painted":
+            return ref
+        src = self.painted_sources(clip_id, shot) if ref.get("scope") == "shot" and clip_id else []
+        if not src:
+            src = self.painted_sources()
+        return {"kind": "painted", "sources": src, "strength": float(ref.get("strength", 1.0))} if src else None
+
+    def expanded_references(self, clip_id: str) -> dict:
+        """A clip's references as the pipeline wants them: painting turned
+        into sources, plus "*" for what painting teaches unpainted shots."""
+        c = self.d.clips[clip_id]
+        out = {}
+        for key, ref in self.d.references.get(clip_id, {}).items():
+            a = int(key)
+            b = next((y for x, y in c.shots if x == a), a + 1)
+            r = self._expand(ref, clip_id, (a, b))
+            if r:
+                out[key] = r
+        t = self.taught_reference()
+        if t:
+            out["*"] = t
+        return out
+
+    def photo_reference(self, ph) -> dict | None:
+        r = self._expand(ph.reference, None, None)
+        if r is None and not ph.strokes:
+            r = self.taught_reference()
+            if r:  # a photo doesn't learn from its own paint
+                r = dict(r, sources=[x for x in r["sources"] if x.get("path") != ph.path]) or None
+                if not r["sources"]:
+                    r = None
+        return r
 
     def reference_at(self, clip_id: str, frame: int) -> dict | None:
         return self.d.references.get(clip_id, {}).get(str(self.shot_start(clip_id, frame)))

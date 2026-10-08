@@ -65,6 +65,7 @@ class VideoSettings:
     regrain: float = 0.0  # grain strength in percent at mid grey, 0 = off
     regrain_size: float = 1.0  # grain size in pixels at 1080 lines
     regrain_chroma: float = 0.0  # 0..1 colour grain on top of the mono grain
+    paint_spread: float = 0.35  # how far a stroke fills through a flat area, fraction of the short side
     frames: int | None = None  # process only the first N frames
     flow_preset: str = "medium"
     chroma_size: int = 256  # short side of the stored chroma
@@ -73,7 +74,7 @@ class VideoSettings:
     def from_project(cls, d: dict) -> "VideoSettings":
         keys = {"working_size", "grain", "denoise", "stabilize", "shot_threshold", "saturation",
                 "chroma_size", "cast", "deflicker", "dust", "deflicker_out", "dust_out", "regrain",
-                "regrain_size", "regrain_chroma"}
+                "regrain_size", "regrain_chroma", "paint_spread"}
         return cls(**{k: v for k, v in d.items() if k in keys})
 
 
@@ -96,7 +97,7 @@ class Analysis:
 VideoReport = Analysis  # the CLI's report is the analysis plus render timings
 
 
-CACHE_PARTS = ("clips", "photos", "media", "export", "tmp", "match", "audio")  # all cache_root ever holds
+CACHE_PARTS = ("clips", "photos", "media", "export", "tmp", "match", "audio", "frame")  # all cache_root ever holds
 
 
 def cache_root() -> Path:
@@ -273,37 +274,48 @@ def working_size(w: int, h: int, short: int) -> tuple[int, int]:
 # ------------------------------------------------------------- analysis
 
 
-def shot_reference(references: dict | None, a: int, b: int) -> dict | None:
-    """The reference image set on the shot starting at a, if any."""
+def shot_reference(references: dict | None, a: int, b: int, painted: bool = False) -> dict | None:
+    """The reference set on the shot starting at a, if any. "*" is the
+    fallback for every shot without its own: what painting has taught,
+    which a shot with its own painting doesn't need."""
     if not references:
         return None
-    r = references.get(str(a)) or references.get(a) or references.get("*")  # "*": every shot
-    return r if r and r.get("path") else None
+    r = references.get(str(a)) or references.get(a)
+    if r is None and not painted:
+        r = references.get("*")
+    if not r:
+        return None
+    return r if (r.get("path") or (r.get("kind") == "painted" and r.get("sources"))) else None
 
 
-def wanted_stab(shots, strength: float, hints: dict | None, references: dict | None = None) -> dict[str, str]:
+def wanted_stab(shots, strength: float, hints: dict | None, references: dict | None = None,
+                spread: float = 0.35) -> dict[str, str]:
     """What each shot's stabilized chroma has to have been made from: the
     stabilizer strength, the hints painted in that shot and its reference
     image. A shot whose id changes is redone; the rest stay as they are."""
     from ..hintpaint import hints_in, strokes_key
     from ..reference import reference_id
+    from .hints_pass import PAINT_VERSION
 
     out = {}
     for a, b in shots:
         h = hints_in(hints, a, b)
-        rid = reference_id(shot_reference(references, a, b))
-        out[f"{a}-{b}"] = f"{strength}:{strokes_key(h) if h else '-'}" + (f":ref{rid}" if rid else "")
+        rid = reference_id(shot_reference(references, a, b, painted=bool(h)))
+        paint = f"p{PAINT_VERSION}.{spread}.{strokes_key(h)}" if h else "-"
+        out[f"{a}-{b}"] = f"{strength}:{paint}" + (f":ref{rid}" if rid else "")
     return out
 
 
 def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
             shots: list[tuple[int, int]] | None = None, use_cache: bool = True,
             quiet: bool = False, progress: ProgressFn | None = None,
-            hints: dict | None = None, references: dict | None = None) -> Analysis:
+            hints: dict | None = None, references: dict | None = None,
+            only_shots: list | None = None) -> Analysis:
     """Run passes 1 to 4 on a clip. shots, when given, replace detection
     (the GUI passes the shots the user sees and may have edited). hints:
     painted strokes, {clip frame: [stroke, ...]}. references: reference
-    images per shot, {str(shot start): {"path", "strength"}}.
+    images per shot, {str(shot start): {"path", "strength"}}. only_shots:
+    work on just these shots (Fill shot); the rest stay as they are.
 
     What stays on disk is kept small, since a feature has ~130,000 frames:
     chroma at chroma_size (256 px short side by default, which is the
@@ -383,7 +395,8 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
         done = set()
         ab_raw = _memmap(ab_raw_path, (n, ch, cw, 2), np.int8)
         Ldn = _memmap(ldn_path, (n, ch, cw))
-    todo = sorted(sh for sh in shots if tuple(sh) not in done)
+    only = {tuple(x) for x in only_shots} if only_shots else None
+    todo = sorted(sh for sh in shots if tuple(sh) not in done and (only is None or tuple(sh) in only))
     rep.cached_shots = len(shots) - len(todo)
     sigma = float(meta.get("sigma", 0.0))
     if todo:
@@ -445,23 +458,30 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
     rep.timings["model"] = prog.done() if todo else 0.0
 
     # ------------------------------------- 4. hints, then stabilize chroma
-    want = wanted_stab(shots, s.stabilize, hints, references)
+    want = wanted_stab(shots, s.stabilize, hints, references, s.paint_spread)
     have = meta.get("stab") if isinstance(meta.get("stab"), dict) else {}
     ab_path = cdir / "ab.npy"
-    redo = [(a, b) for a, b in shots if have.get(f"{a}-{b}") != want[f"{a}-{b}"] or not ab_path.exists()]
+    redo = [(a, b) for a, b in shots if (have.get(f"{a}-{b}") != want[f"{a}-{b}"] or not ab_path.exists())
+            and (only is None or (a, b) in only)]
+    view = meta.setdefault("view", {})
+    for a, b in shots:  # what the editor shows for each shot: this colorize from now on
+        if only is None or (a, b) in only:
+            view[f"{a}-{b}"] = "filled"
     if not redo:
+        meta_path.write_text(json.dumps(meta))
         return rep
     if ab_path.exists():
         ab = np.load(ab_path, mmap_mode="r+")
         if ab.shape != (n, ch, cw, 2):
             del ab
             ab = _memmap(ab_path, (n, ch, cw, 2), np.int8)
-            redo = list(shots)
+            redo = [sh for sh in shots if only is None or tuple(sh) in only]
+            have = {}
     else:
         ab = _memmap(ab_path, (n, ch, cw, 2), np.int8)
-        redo = list(shots)
+        redo = [sh for sh in shots if only is None or tuple(sh) in only]
     from ..hintpaint import group_by_reach, hints_in, strokes_key
-    from .hints_pass import carry, keyframe_fix
+    from .hints_pass import PAINT_VERSION, carry, keyframe_fix
 
     tol = max(2.0, 3.0 * sigma)
     ref_cache: dict = {}  # a reference's features, kept between its shots and keyframes
@@ -472,12 +492,12 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
     for a, b in redo:
         src = _Slice(ab_raw, a, b)
         shot_hints = hints_in(hints, a, b)
-        ref = shot_reference(references, a, b)
+        ref = shot_reference(references, a, b, painted=bool(shot_hints))
         if shot_hints or ref:
             from ..reference import reference_id
 
             rid = reference_id(ref)
-            key = strokes_key(shot_hints) + (f"r{rid}" if rid else "")
+            key = f"p{PAINT_VERSION}{s.paint_spread}" + strokes_key(shot_hints) + (f"r{rid}" if rid else "")
             hpath = cdir / f"hint_{a}_{b}_{key}.npy"
             ppath = cdir / f"protect_{a}_{b}_{key}.npy"  # where frame-limited fixes are, see carry()
             for old in list(cdir.glob(f"hint_{a}_{b}_*.npy")) + list(cdir.glob(f"protect_{a}_{b}_*.npy")):
@@ -492,14 +512,14 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
                     for reach, group in group_by_reach(strokes).items():
                         # each painted frame's fix is cached on its own, so painting
                         # frame after frame doesn't redo the frames already done
-                        kf = cdir / f"kf_{f}_{reach}_{strokes_key(group)}.npz"
+                        kf = cdir / f"kf_{f}_{reach}_{strokes_key(group)}_p{PAINT_VERSION}_{s.paint_spread}.npz"
                         used.add(kf.name)
                         if kf.exists():
                             with np.load(kf) as z:
                                 T, W = z["T"], z["W"]
                         else:
-                            T, W = keyframe_fix(model, info.path, info.fps, f, group, (ww, wh), (cw, ch),
-                                                np.asarray(ab_raw[f], np.float32), s.denoise, negative=neg)
+                            T, W = keyframe_fix(None, info.path, info.fps, f, group, (ww, wh), (cw, ch),
+                                                None, s.denoise, spread=s.paint_spread, negative=neg)
                             np.savez(kf, T=T.astype(np.float16), W=W.astype(np.float16))
                         keys.append((f, np.asarray(T, np.float32), np.asarray(W, np.float32), reach))
                 if ref:
@@ -571,6 +591,117 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
         (cdir / tmp).unlink(missing_ok=True)
     rep.timings["stabilize"] = prog.done()
     return rep
+
+
+def paint_key(s: VideoSettings, shot_hints: dict) -> str:
+    from ..hintpaint import strokes_key
+    from .hints_pass import PAINT_VERSION
+
+    return f"p{PAINT_VERSION}.{s.paint_spread}.{strokes_key(shot_hints)}"
+
+
+class _Offset:
+    """A shot's own array, indexed by clip frame like the whole-clip ones."""
+
+    def __init__(self, arr, a: int):
+        self.arr, self.a = arr, a
+
+    def __getitem__(self, t):
+        return self.arr[t - self.a]
+
+
+class _Zeros:
+    def __init__(self, shape):
+        self.z = np.zeros(shape, np.float32)
+
+    def __getitem__(self, t):
+        return self.z
+
+
+def paint_shot(info: ClipInfo, s: VideoSettings, model_name: str, weights: str | None,
+               shot: tuple[int, int], hints: dict | None, progress: ProgressFn | None = None) -> Path:
+    """Color shot: colour one shot from its painted strokes alone, no model.
+
+    Each painted frame's strokes fill their objects (keyframe_fix), the
+    fills ride the motion through the shot (carry), and everything nothing
+    was painted on stays grey. Fast, since there's no model pass: what you
+    see is exactly what your painting does. Fill shot then lets the model
+    colour the rest."""
+    from ..film import invert
+    from ..hintpaint import group_by_reach, hints_in, strokes_key
+    from ..media import FrameReader
+    from .hints_pass import PAINT_VERSION, carry, keyframe_fix
+
+    a, b = int(shot[0]), int(shot[1])
+    neg = getattr(info, "negative", None)
+    shot_hints = hints_in(hints, a, b)
+    if not shot_hints:
+        raise RuntimeError("nothing is painted in this shot yet")
+    W, H = info.width, info.height
+    ww, wh = working_size(W, H, s.working_size)
+    cw, ch = working_size(W, H, min(s.working_size, s.chroma_size))
+    cdir = analysis_dir(info.path, s, model_name, weights, neg)
+    cdir.mkdir(parents=True, exist_ok=True)
+    key = paint_key(s, shot_hints)
+    out_path = cdir / f"paint_{a}_{b}_{hashlib.sha1(key.encode()).hexdigest()[:12]}.npy"
+    meta_path = cdir / "meta.json"
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, ValueError):
+        meta = {}
+    n = b - a
+    if not out_path.exists():
+        # the shot's luma at chroma size, for following the motion
+        Ls = np.empty((n, ch, cw), np.float32) if n * ch * cw * 4 < 4e8 else \
+            _memmap(cdir / "pluma.npy", (n, ch, cw), np.float32)
+        r = FrameReader(info.path, info.fps, "gray16le", size=(cw, ch), cache=3)
+        try:
+            for i in range(n):
+                g = r.get(a + i)
+                if g is None:
+                    raise RuntimeError(f"{Path(info.path).name}: frame {a + i} could not be decoded")
+                Ls[i] = srgb_to_l(invert(g, neg))
+                if progress and i % 8 == 0:
+                    progress("reading the shot", i, n)
+        finally:
+            r.close()
+        keys = []
+        frames = sorted(shot_hints)
+        for j, f in enumerate(frames):
+            if progress:
+                progress(f"painted frame {j + 1} of {len(frames)}", j, len(frames))
+            for reach, group in group_by_reach(shot_hints[f]).items():
+                kf = cdir / f"kf_{f}_{reach}_{strokes_key(group)}_p{PAINT_VERSION}_{s.paint_spread}.npz"
+                if kf.exists():
+                    with np.load(kf) as z:
+                        T, Wt = z["T"], z["W"]
+                else:
+                    T, Wt = keyframe_fix(None, info.path, info.fps, f, group, (ww, wh), (cw, ch),
+                                         None, s.denoise, spread=s.paint_spread, negative=neg)
+                    np.savez(kf, T=T.astype(np.float16), W=Wt.astype(np.float16))
+                keys.append((f, np.asarray(T, np.float32), np.asarray(Wt, np.float32), reach))
+        if progress:
+            progress("carrying the paint through the shot", 0, 1)
+        buf = np.zeros((n, ch, cw, 2), np.float32) if n * ch * cw * 8 < 5e8 else \
+            _memmap(cdir / "pbuf.npy", (n, ch, cw, 2), np.float32)
+        sigma = float(meta.get("sigma", 1.0))
+        carry(_Offset(Ls, a), _Zeros((ch, cw, 2)), a, b, keys, Flow(s.flow_preset), max(2.0, 3.0 * sigma), buf)
+        res = _memmap(out_path.with_suffix(".tmp.npy"), (n, ch, cw, 2), np.int8)
+        res[:] = _to_i8(np.asarray(buf))
+        res.flush()
+        del res, buf, Ls
+        for tmp in ("pluma.npy", "pbuf.npy"):
+            (cdir / tmp).unlink(missing_ok=True)
+        out_path.with_suffix(".tmp.npy").rename(out_path)
+    for old in cdir.glob(f"paint_{a}_{b}_*.npy"):  # one painted version per shot
+        if old != out_path and not old.name.endswith(".tmp.npy"):
+            old.unlink()
+    meta.setdefault("painted", {})[f"{a}-{b}"] = {"key": key, "file": out_path.name}
+    meta.setdefault("view", {})[f"{a}-{b}"] = "painted"
+    meta_path.write_text(json.dumps(meta))
+    if progress:
+        progress("done", 1, 1)
+    return out_path
 
 
 def _working_frame(info: ClipInfo, f: int, size: tuple[int, int], negative, denoise) -> np.ndarray:

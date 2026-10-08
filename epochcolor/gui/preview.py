@@ -30,8 +30,10 @@ class LayoutPiece:
     proxy: str
     source: str
     fps: Fraction
-    ab: str | None  # ab.npy of a finished analysis, None if not colorized
+    ab: str | None  # the clip's ab.npy (it may not exist yet); its folder is the analysis
     negative: dict | None = None  # the clip's negative inversion
+    # per shot: (a, b, "colored" | "painted" | "none", chroma file); empty means "ab.npy for everything"
+    shots: tuple = ()
 
 
 def to_qimage(arr: np.ndarray) -> QImage:
@@ -103,6 +105,8 @@ class PreviewProvider(QObject):
             for k in [k for k in d if k not in live]:
                 d.pop(k).close()
         self.ab = {k: v for k, v in self.ab.items() if k in live}
+        wanted = {sh[3] for p in self.layout for sh in p.shots if sh[2] == "painted"}
+        self.paints = {k: v for k, v in getattr(self, "paints", {}).items() if k in wanted}
         self.casts = {}  # chroma.ShotCasts per clip, measured again after any change
         self.restores = {}  # OutputRestore per clip
         for p in self.layout:
@@ -113,6 +117,30 @@ class PreviewProvider(QObject):
                     self.ab[p.clip_id] = np.load(p.ab, mmap_mode="r")
                 except (OSError, ValueError):
                     pass
+            for a, b, kind, path in p.shots:
+                if kind == "painted" and path not in self.paints:
+                    try:
+                        self.paints[path] = np.load(path, mmap_mode="r")
+                    except (OSError, ValueError):
+                        pass
+
+    def _chroma(self, p, src: int):
+        """(a/b for clip frame src, the shot's (a, b), "colored" or "painted"), or Nones."""
+        if not p.shots:
+            ab = self.ab.get(p.clip_id)
+            return (ab[src], None, "colored") if ab is not None and src < len(ab) else (None, None, None)
+        for a, b, kind, path in p.shots:
+            if a <= src < b:
+                if kind == "colored":
+                    ab = self.ab.get(p.clip_id)
+                    if ab is not None and src < len(ab):
+                        return ab[src], (a, b), kind
+                elif kind == "painted":
+                    arr = self.paints.get(path)
+                    if arr is not None and src - a < len(arr):
+                        return arr[src - a], (a, b), kind
+                return None, (a, b), None
+        return None, None, None
 
     @Slot(int, bool)
     def _request(self, frame: int, playing: bool) -> None:
@@ -174,18 +202,18 @@ class PreviewProvider(QObject):
             L = rest._deflicker(src, L)
             g = lab_to_srgb8_fast(L, np.zeros(L.shape + (2,), np.float32))[..., 0]
         gray = to_qimage(g)
-        ab = self.ab.get(p.clip_id)
-        if ab is None or src >= len(ab):
+        abf, shot, kind = self._chroma(p, src)
+        if abf is None:
             return gray, None, None
         import cv2
 
         h, w = g.shape
         from ..chroma import adjust
 
-        abw = cv2.resize(np.asarray(ab[src], np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
+        abw = cv2.resize(np.asarray(abf, np.float32), (w, h), interpolation=cv2.INTER_LINEAR)
         cast = float(self.settings.get("cast", 0.0))
         abw = adjust(abw, float(self.settings.get("saturation", 1.0)), cast,
-                     self._cast(p, ab, src) if cast else None)
+                     self._cast(p, src, kind, abf) if cast else None)
         rgb8 = lab_to_srgb8_fast(L, abw)
         raw = to_qimage(rgb8)
         return gray, self._graded(rgb8.astype(np.float32) / 255.0, p.clip_id, src, raw), raw
@@ -204,11 +232,14 @@ class PreviewProvider(QObject):
                                                          p.fps, (1, 1))
         return r
 
-    def _cast(self, p, ab, src: int):
-        from pathlib import Path
+    def _cast(self, p, src: int, kind=None, abf=None):
+        from ..chroma import ShotCasts, estimate_cast
 
-        from ..chroma import ShotCasts
-
+        if kind == "painted":  # the paint-only colour of a shot: measured on the frame itself
+            return estimate_cast(np.asarray(abf))
+        ab = self.ab.get(p.clip_id)
+        if ab is None:
+            return None
         c = self.casts.get(p.clip_id)
         if c is None:
             c = self.casts[p.clip_id] = ShotCasts(Path(p.ab).parent, ab)
@@ -254,13 +285,13 @@ class PreviewProvider(QObject):
 
             s = VideoSettings.from_project(self.settings)
             L = srgb_to_l(invert(g16, p.negative))
-            ab = self.ab.get(p.clip_id)
-            if ab is not None and (s.deflicker_out or s.dust_out):
+            abf, shot, kind = self._chroma(p, src)
+            if abf is not None and (s.deflicker_out or s.dust_out):
                 rest = OutputRestore(Path(p.ab).parent, s, p.fps, (g16.shape[1], g16.shape[0]))
                 nb = {}
                 if rest.flow is not None:  # dust needs the neighbours, as in export
                     for d in (-1, 1):
-                        gn = r.get(src + d) if 0 <= src + d < len(ab) else None
+                        gn = r.get(src + d) if src + d >= 0 else None
                         nb[d] = srgb_to_l(invert(gn, p.negative)) if gn is not None else None
                 L = rest(src, L, nb.get(-1), nb.get(1))
                 if self.want is not None:
@@ -268,9 +299,9 @@ class PreviewProvider(QObject):
             gray = lab_to_srgb(L, np.zeros(L.shape + (2,), np.float32))[..., 0]
             gimg = to_qimage((np.clip(gray, 0, 1) * 255.0 + 0.5).astype(np.uint8))
             cimg = raw = None
-            if ab is not None and src < len(ab):
-                rgb = FrameRenderer(s)(None, np.asarray(ab[src], np.float32),
-                                       self._cast(p, ab, src) if s.cast else None, L=L)
+            if abf is not None:
+                rgb = FrameRenderer(s)(None, np.asarray(abf, np.float32),
+                                       self._cast(p, src, kind, abf) if s.cast else None, L=L)
                 raw = to_qimage((np.clip(rgb, 0, 1) * 255.0 + 0.5).astype(np.uint8))
                 if self.show_matte:
                     cimg = self._graded(rgb, p.clip_id, src, raw)

@@ -79,3 +79,43 @@ def propagate(
         x = solve(hint_weight * m * d)
         out[..., c] += x.reshape(h, w)
     return out.astype(np.float32)
+
+
+def paint_fill(L: np.ndarray, hints: Hints, spread: float = 0.35, sigma: float | None = None,
+               hint_weight: float = 1e3) -> tuple[np.ndarray, np.ndarray]:
+    """Fill painted objects with their stroke colours, and say where.
+
+    Returns (T, W): T the a/b the strokes ask for, W from 0 to 1 how much of
+    each pixel belongs to a painted object. The colour and a plain "painted
+    here" signal both flood out from the strokes along the same
+    edge-weighted solve, so they stop at the same edges; W is that signal,
+    and T is the colour divided by it, so a stroke's colour holds at full
+    strength across its whole object instead of fading with distance.
+
+    This is what makes painting the same with every model: only W decides
+    where a stroke counts, and everywhere W is 0 the model's own colour
+    stays untouched. A neutral (grey) stroke has a/b 0, so it paints "no
+    colour" with the same reach.
+    """
+    import scipy.sparse as sp
+    import scipy.sparse.linalg as spla
+
+    h, w = L.shape
+    if hints.count == 0:
+        return np.zeros((h, w, 2), np.float32), np.zeros((h, w), np.float32)
+    lap = edge_laplacian(L, sigma)
+    reach = max(1.0, spread * min(h, w))
+    lam = 1.0 / (reach * reach)
+    m = (hints.mask.ravel() > 0.5).astype(np.float64)
+    A = (lap + sp.diags(lam + hint_weight * m)).tocsc()
+    solve = spla.factorized(A)
+    xm = solve(hint_weight * m).reshape(h, w)
+    xa = solve(hint_weight * m * hints.ab[..., 0].ravel().astype(np.float64)).reshape(h, w)
+    xb = solve(hint_weight * m * hints.ab[..., 1].ravel().astype(np.float64)).reshape(h, w)
+    safe = np.maximum(xm, 1e-3)
+    T = np.stack([xa / safe, xb / safe], -1)
+    # the raw signal is ~1 near strokes, sags across a large object and drops
+    # hard at an edge; this keeps the whole object in and the far side out
+    W = np.clip((xm - 0.12) / 0.38, 0.0, 1.0)
+    W = W * W * (3 - 2 * W)  # smoothstep: soft at the boundary, full inside
+    return T.astype(np.float32), W.astype(np.float32)

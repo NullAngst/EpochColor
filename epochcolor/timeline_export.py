@@ -39,13 +39,53 @@ def analysis_state(c: Clip, s: VideoSettings, model_name: str, weights: str | No
     from .video.pipeline import wanted_stab
 
     stab = meta.get("stab")
-    want = wanted_stab([tuple(x) for x in c.shots], s.stabilize, hints, references)
+    want = wanted_stab([tuple(x) for x in c.shots], s.stabilize, hints, references, s.paint_spread)
     if isinstance(stab, dict) and all(stab.get(k) == v for k, v in want.items()) and (d / "ab.npy").exists():
         return "ready"
     done = {tuple(x) for x in meta.get("model_done", [])}
     if done and all(tuple(x) in done for x in c.shots):
         return "update"  # model pass done; only hints or the stabilizer need redoing
     return "partial" if meta.get("model_done") else "none"
+
+
+def shot_states(c: Clip, s: VideoSettings, model_name: str, weights: str | None = None,
+                hints: dict | None = None, references: dict | None = None) -> dict:
+    """What each shot of a clip shows, keyed "a-b":
+
+    {"state": "none" | "painted" | "colored", "current": bool, "file": path or None}
+
+    painted: Color shot made it from the strokes alone (file is its chroma).
+    colored: the full pass (Fill shot or Colorize) did it, from ab.npy.
+    current: False when the strokes, reference or settings changed since,
+    so it's the last result shown until it's redone."""
+    from .hintpaint import hints_in
+    from .video.pipeline import paint_key, wanted_stab
+
+    d = analysis_dir(Path(c.path), s, model_name, weights, c.neg)
+    try:
+        meta = json.loads((d / "meta.json").read_text())
+    except (OSError, ValueError):
+        meta = {}
+    stab = meta.get("stab") if isinstance(meta.get("stab"), dict) else {}
+    painted = meta.get("painted") or {}
+    view = meta.get("view") or {}
+    want = wanted_stab([tuple(x) for x in c.shots], s.stabilize, hints, references, s.paint_spread)
+    have_ab = (d / "ab.npy").exists()
+    out = {}
+    for a, b in c.shots:
+        k = f"{a}-{b}"
+        p = painted.get(k)
+        pfile = d / p["file"] if p and (d / p["file"]).exists() else None
+        colored = have_ab and k in stab
+        v = view.get(k) or ("colored" if colored else "painted" if pfile else "none")
+        if v == "painted" and pfile is not None:
+            sh = hints_in(hints, a, b)
+            out[k] = {"state": "painted", "current": bool(sh) and p["key"] == paint_key(s, sh), "file": str(pfile)}
+        elif colored:
+            out[k] = {"state": "colored", "current": stab.get(k) == want[k], "file": str(d / "ab.npy")}
+        else:
+            out[k] = {"state": "none", "current": True, "file": None}
+    return out
 
 
 def project_audio(p: Project) -> list[AudioStream]:
@@ -121,7 +161,7 @@ def build_export(p: Project, model: ColorModel | None, es: ExportSettings, out: 
 
     job = ExportJob(pieces, plan, out, s, name, weights, clips=clips, hints=dict(p.d.hints),
                     grades=GradeBook(p.d.grades, {cid: c.shots for cid, c in p.d.clips.items()}),
-                    references=dict(p.d.references))
+                    references={cid: p.expanded_references(cid) for cid in p.d.clips})
     if plan.audio_maps:
         if edited:
             inputs, index = [], {}

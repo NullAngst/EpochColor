@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPen, QPolygonF
+from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPainterPath, QPen, QPolygonF
 from PySide6.QtWidgets import QScrollBar, QToolTip, QVBoxLayout, QWidget
 
 from ..project import Project
@@ -73,6 +73,7 @@ class TimelineCanvas(QWidget):
         self.zoom = 2.0  # px per frame
         self.offset = 0.0  # first visible frame
         self.status: dict[str, str] = {}  # clip id -> none/partial/ready
+        self.shot_status: dict = {}  # clip id -> {"a-b": {"state", "current"}}, see timeline_export.shot_states
         self._drag = None
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.ClickFocus)
@@ -224,8 +225,26 @@ class TimelineCanvas(QWidget):
             p.setPen(QColor("#e6e6e6"))
             p.setFont(QFont(self.font().family(), 8))
             p.drawText(QRectF(r.left() + 13, r.top(), r.width() - 15, 14), Qt.AlignVCenter, name)
-            # shot cuts inside the segment
+            # each shot's state: a strip along the bottom. Grey: not coloured;
+            # amber: painted only (Color shot); green: coloured. Striped: out
+            # of date (the paint or settings changed since), the last result
+            # still shows until it's redone
             clip = self.project.d.clips[seg.clip]
+            states = self.shot_status.get(seg.clip, {})
+            for a, b in clip.shots:
+                lo, hi = max(a, seg.src_in), min(b, seg.src_out)
+                if hi <= lo:
+                    continue
+                st = states.get(f"{a}-{b}", {"state": "none", "current": True})
+                col = {"painted": QColor("#d9a441"), "colored": QColor("#6fbf73")}.get(st["state"], QColor("#5a5a5a"))
+                sr = QRectF(self.x_of(start + lo - seg.src_in), r.bottom() - 4,
+                            max(1.0, self.x_of(start + hi - seg.src_in) - self.x_of(start + lo - seg.src_in)), 4)
+                if st.get("current", True):
+                    p.fillRect(sr, col)
+                else:
+                    p.fillRect(sr, QColor(col.red(), col.green(), col.blue(), 90))
+                    p.fillRect(sr, QBrush(col, Qt.BDiagPattern))
+            # shot cuts inside the segment
             p.setPen(QPen(QColor(theme.CUT), 1))
             for a, _ in clip.shots:
                 if seg.src_in < a < seg.src_out:
@@ -237,7 +256,7 @@ class TimelineCanvas(QWidget):
                 if seg.src_in <= f < seg.src_out:
                     xc = self.x_of(start + f - seg.src_in + 0.5)
                     p.setBrush(QColor("#e8e8e8"))
-                    p.drawEllipse(QPointF(xc, r.bottom() - 6), 3.5, 3.5)
+                    p.drawEllipse(QPointF(xc, r.bottom() - 9), 3.5, 3.5)
             for track in self.project.d.grades.get(seg.clip, {}).values():
                 keys = track.get("keys", [])
                 if len(keys) < 2:

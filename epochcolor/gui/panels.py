@@ -1,4 +1,4 @@
-"""Smaller docks: scopes, saved colours with their matches, and the paint bar."""
+"""Smaller docks: scopes, items (named colours) with their matches, and the paint bar."""
 
 from __future__ import annotations
 
@@ -67,11 +67,11 @@ class ScopesPanel(QWidget):
 
 
 HOW_MATCHING_WORKS = (
-    "<b>1.</b> Paint a stroke on something whose colour you know: a coat, a car, a wall.<br>"
-    "<b>2.</b> <b>Save last stroke</b> gives it a name.<br>"
-    "<b>3.</b> <b>Find</b> looks for the same thing in the other shots and photos. Each match below "
-    "shows where it found it. <b>Use</b> paints the colour there, <b>Skip</b> drops it. On the picture, "
-    "click a marker to use it, right-click to skip it.")
+    "<b>Items</b> are the things you paint, each with a name and a colour: Anna's coat, the sky, the car.<br>"
+    "<b>1.</b> <b>New item</b>, or click one below, then paint it (P). Its strokes carry its name.<br>"
+    "<b>2.</b> <b>Recolour</b> changes every stroke painted with that item, everywhere, and the shots redo.<br>"
+    "<b>3.</b> <b>Find</b> looks for an item in the other shots and photos. <b>Use</b> or <b>Skip</b> each "
+    "match, or click / right-click its marker on the picture.")
 
 
 def _thumb_icon(path, rgb, size=(144, 81)) -> QIcon:
@@ -93,9 +93,11 @@ def confidence(score: float, threshold: float) -> str:
 
 
 class ColoursPanel(QWidget):
-    """Saved colours and the matches found for them."""
+    """Items (named colours you paint with) and the matches found for them."""
     useColour = Signal(list)
-    # rename, delete, find (id, "" for all), goto, apply, dismiss, apply_all, dismiss_all, save_colour
+    useItem = Signal(str)  # paint with this item
+    # rename, delete, recolour, new_item, find (id, "" for all), goto, apply, dismiss, apply_all,
+    # dismiss_all, save_colour
     request = Signal(str, str)
     settingChanged = Signal(str, object)
 
@@ -110,28 +112,37 @@ class ColoursPanel(QWidget):
         how.setStyleSheet(f"color: {theme.DIM}; font-size: 11px;")
         lay.addWidget(how)
 
-        lay.addWidget(QLabel("<b>Saved colours</b>"))
+        lay.addWidget(QLabel("<b>Items</b> (click one to paint with it)"))
         lists_css = (f"QListWidget::item {{ padding: 3px; }}"
                      f"QListWidget::item:selected {{ background: #3a3a3a; color: {theme.TEXT};"
                      f" border-left: 3px solid {theme.ACCENT}; }}")
         self.colours = QListWidget()
         self.colours.setStyleSheet(lists_css)
         self.colours.setIconSize(QSize(96, 54))
-        self.colours.itemDoubleClicked.connect(self._use)
-        self.colours.setToolTip("Double-click to paint with it")
-        lay.addWidget(self.colours, 1)
+        self.colours.setMinimumHeight(190)  # three items or so without scrolling
+        self.colours.itemClicked.connect(self._use)
+        self.colours.setToolTip("Click to paint with it")
+        lay.addWidget(self.colours, 2)
         row = QHBoxLayout()
-        self.save_btn = QPushButton("Save last stroke...")
+        new_btn = QPushButton("New item...")
+        new_btn.setToolTip("Name a thing and pick its colour, then paint it")
+        new_btn.clicked.connect(lambda: self.request.emit("new_item", ""))
+        self.save_btn = QPushButton("From last stroke...")
+        self.save_btn.setToolTip("Make an item out of the stroke you just painted, and label that stroke with it")
         self.save_btn.clicked.connect(lambda: self.request.emit("save_colour", ""))
+        row.addWidget(new_btn)
+        row.addWidget(self.save_btn)
+        lay.addLayout(row)
+        row = QHBoxLayout()
         self.find_one = QPushButton("Find this one")
         self.find_one.clicked.connect(lambda: self._colour_action("find"))
         self.find_all = QPushButton("Find all")
         self.find_all.clicked.connect(lambda: self.request.emit("find", ""))
-        for b in (self.save_btn, self.find_one, self.find_all):
+        for b in (self.find_one, self.find_all):
             row.addWidget(b)
         lay.addLayout(row)
         row = QHBoxLayout()
-        for action, text in (("use", "Paint with it"), ("rename", "Rename"), ("delete", "Delete")):
+        for action, text in (("recolour", "Recolour..."), ("rename", "Rename"), ("delete", "Delete...")):
             b = QPushButton(text)
             b.clicked.connect(lambda _=False, a=action: self._colour_action(a))
             row.addWidget(b)
@@ -162,7 +173,7 @@ class ColoursPanel(QWidget):
         self.matches.itemDoubleClicked.connect(lambda it: it.data(Qt.UserRole) and
                                                self.request.emit("goto", it.data(Qt.UserRole)))
         self.matches.setToolTip("Double-click to go there")
-        lay.addWidget(self.matches, 2)
+        lay.addWidget(self.matches, 1)
         row = QHBoxLayout()
         for action, text, tip in (("apply", "Use", "Paint this colour where it was found"),
                                   ("dismiss", "Skip", "Drop this match"),
@@ -177,8 +188,11 @@ class ColoursPanel(QWidget):
         self._colours = []
         self._threshold = 0.75
 
-    def show_data(self, colours: list, matches: list, names: dict, settings: dict, thumbs=None) -> None:
-        """thumbs: id -> picture path, for saved colours and matches."""
+    def show_data(self, colours: list, matches: list, names: dict, settings: dict, thumbs=None,
+                  usage=None, active: str | None = None) -> None:
+        """thumbs: id -> picture path, for items and matches. usage: id -> (strokes,
+        painted frames). active: the item the brush paints with."""
+        usage = usage or {}
         thumbs = thumbs or (lambda ident: None)
         self._colours = colours
         self._threshold = float(settings.get("match_threshold", 0.75))
@@ -186,25 +200,31 @@ class ColoursPanel(QWidget):
         for m in matches:
             counts[m["color"]] = counts.get(m["color"], 0) + 1
         cur = self.colours.currentRow()
+        act = next((i for i, c in enumerate(colours) if c["id"] == active), None)
+        if act is not None:
+            cur = act
+        self.colours.blockSignals(True)
         self.colours.clear()
         for c in colours:
-            src = c.get("source", {})
-            where = names.get((src.get("kind"), src.get("target")), "?")
-            if src.get("kind") == "clip":
-                where += f", frame {src.get('frame')}"
+            k, fr = usage.get(c["id"], (0, 0))
+            used = (f"painted on {fr} frame{'s' if fr != 1 else ''}, {k} stroke{'s' if k != 1 else ''}"
+                    if k else "not painted yet")
             n = counts.get(c["id"], 0)
-            text = f"{c['name']}\nfrom {where}" + (f"\n{n} match{'es' if n != 1 else ''} waiting" if n else "")
+            text = ((">> " if c["id"] == active else "") + c["name"] + f"\n{used}"
+                    + (f"\n{n} match{'es' if n != 1 else ''} waiting" if n else ""))
             it = QListWidgetItem(_thumb_icon(thumbs(c["id"]), c["rgb"], (96, 54)), text)
             it.setData(Qt.UserRole, c["id"])
             self.colours.addItem(it)
         if not colours:
-            it = QListWidgetItem("No saved colours yet. Paint a stroke, then Save last stroke.")
+            it = QListWidgetItem("No items yet. New item names a thing and its colour. Or paint a stroke "
+                                 "and use From last stroke.")
             it.setFlags(Qt.NoItemFlags)
             self.colours.addItem(it)
         elif 0 <= cur < self.colours.count():
             self.colours.setCurrentRow(cur)
         elif self.colours.count():
             self.colours.setCurrentRow(0)
+        self.colours.blockSignals(False)
         for b in (self.find_one, self.find_all):
             b.setEnabled(bool(colours))
 
@@ -224,7 +244,7 @@ class ColoursPanel(QWidget):
             self.matches.addItem(it)
         self.matches_label.setText(f"<b>Matches</b> ({len(matches)} waiting)" if matches else "<b>Matches</b>")
         if not matches:
-            it = QListWidgetItem("Nothing waiting. Find looks for your saved colours; if it finds nothing, "
+            it = QListWidgetItem("Nothing waiting. Find looks for your items; if it finds nothing, "
                                  "slide toward More matches and find again.")
             it.setFlags(Qt.NoItemFlags)
             self.matches.addItem(it)
@@ -238,9 +258,8 @@ class ColoursPanel(QWidget):
         self.strict.blockSignals(False)
 
     def _use(self, it) -> None:
-        c = next((c for c in self._colours if c["id"] == it.data(Qt.UserRole)), None)
-        if c:
-            self.useColour.emit(c["rgb"])
+        if it is not None and it.data(Qt.UserRole):
+            self.useItem.emit(it.data(Qt.UserRole))
 
     def _colour_action(self, a: str) -> None:
         it = self.colours.currentItem()
@@ -276,6 +295,10 @@ class PaintBar(QToolBar):
         self.colour = QToolButton()
         self.colour.setToolTip("Brush colour. Ctrl+click on the picture picks one from it.")
         self.colour.clicked.connect(self._choose)
+        self.item_id: str | None = None
+        self.item_label = QLabel(" no item ")
+        self.item_label.setToolTip("The item new strokes belong to. Pick one in the Items panel. "
+                                   "Choosing a colour by hand paints without one.")
         self.neutral = QToolButton()
         self.neutral.setText("Grey")
         self.neutral.setCheckable(True)
@@ -285,10 +308,10 @@ class PaintBar(QToolBar):
         self.erase.setCheckable(True)
         self.erase.setToolTip("Click a stroke to remove it (right-click does this too)")
         self.size = QSlider(Qt.Horizontal)
-        self.size.setRange(3, 120)
+        self.size.setRange(1, 200)
         self.size.setValue(20)
         self.size.setFixedWidth(80)
-        self.size.setToolTip("Brush size ([ and ], or the mouse wheel while painting)")
+        self.size.setToolTip("Brush size ([ and ], or Shift+wheel on the picture; the wheel alone zooms)")
         self.show = QCheckBox("Show strokes")
         self.show.setChecked(True)
         self.auto = QCheckBox("Apply as I paint")
@@ -327,7 +350,7 @@ class PaintBar(QToolBar):
         # options_bar, which shows while painting
         self.options_bar = QToolBar("Paint options", parent)
         self.options_bar.setObjectName("paintoptions")
-        for w in (self.paint, self.colour, self.neutral, self.erase):
+        for w in (self.paint, self.colour, self.item_label, self.neutral, self.erase):
             self.addWidget(w)
         self.addWidget(QLabel(" Size "))
         self.addWidget(self.size)
@@ -345,8 +368,8 @@ class PaintBar(QToolBar):
         ob.addWidget(self.show)
         ob.addWidget(self.auto)
         save = QToolButton()
-        save.setText("Save colour...")
-        save.setToolTip("Name the last stroke's colour to reuse it and find it elsewhere")
+        save.setText("Make item...")
+        save.setToolTip("Name the last stroke as an item, to paint with again, recolour and find elsewhere")
         save.clicked.connect(lambda: self.action.emit("save_colour"))
         ob.addWidget(save)
         self.frame_bar = QToolBar("Frame by frame", parent)
@@ -376,8 +399,12 @@ class PaintBar(QToolBar):
         self.colour.setIcon(swatch(self.rgb, 18))
         self.colour.setText("")
 
-    def set_rgb(self, rgb) -> None:
+    def set_rgb(self, rgb, item: str | None = None, name: str = "") -> None:
+        """Brush colour. With an item, new strokes belong to it; without, they're unlabelled."""
         self.rgb = [int(v) for v in rgb]
+        self.item_id = item
+        self.item_label.setText(f" Item: {name} " if item else " no item ")
+        self.item_label.setStyleSheet(f"color: {theme.ACCENT};" if item else f"color: {theme.DIM};")
         self.neutral.setChecked(False)
         self._update_swatch()
         self.changed.emit()

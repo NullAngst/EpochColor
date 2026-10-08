@@ -28,12 +28,13 @@ def _base():
 
 
 class Viewer(_base()):
-    MODES = ("color", "split", "original")
+    MODES = ("color", "split", "original", "frame")
     modeChanged = Signal(str)
     strokeFinished = Signal(dict)  # a painted stroke, coordinates as fractions of the frame
     eraseAt = Signal(float, float)
     picked = Signal(float, float, object)  # x, y, (r, g, b) 0..1 from the ungraded colour, or None
     suggestionClicked = Signal(str, bool)  # a match marker: its id, True to use it, False to skip
+    brushResized = Signal(float)  # Shift+wheel changed the brush radius
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -60,6 +61,14 @@ class Viewer(_base()):
         self.suggestions: list[tuple] = []  # (x, y, rgb, label, id)
         self.ghosts: list[dict] = []  # onion skin: a nearby frame's strokes, drawn faint
         self.frame_note = ""  # "frame by frame, this frame only" and the like
+        # zoom and pan: zoom 1 fits the picture; pan moves its centre, in widget pixels
+        self.zoom = 1.0
+        self.pan = QPointF(0, 0)
+        self._panning: QPointF | None = None
+        # "This frame": the selected model run on the current frame alone (Colorize frame)
+        self.frame_image: QImage | None = None
+        self.frame_label = ""
+        self.shot_note = ""  # the shot's state, shown in the label line
         self.setMinimumSize(320, 180)
         self.setMouseTracking(True)
 
@@ -92,9 +101,44 @@ class Viewer(_base()):
     def _target(self, img: QImage) -> QRectF:
         w, h = self.width(), self.height()
         iw, ih = img.width(), img.height()
-        k = min(w / iw, h / ih)
+        k = min(w / iw, h / ih) * self.zoom
         tw, th = iw * k, ih * k
-        return QRectF((w - tw) / 2, (h - th) / 2, tw, th)
+        cx, cy = w / 2 + self.pan.x(), h / 2 + self.pan.y()
+        return QRectF(cx - tw / 2, cy - th / 2, tw, th)
+
+    def zoom_at(self, factor: float, at: QPointF | None = None) -> None:
+        """Zoom by factor, keeping the picture point under `at` (default the centre) still."""
+        base = self.gray or self.color
+        if base is None:
+            return
+        at = at or QPointF(self.width() / 2, self.height() / 2)
+        before = self._target(base)
+        nx = (at.x() - before.left()) / before.width()
+        ny = (at.y() - before.top()) / before.height()
+        self.zoom = float(min(16.0, max(1.0, self.zoom * factor)))
+        if self.zoom == 1.0:
+            self.pan = QPointF(0, 0)
+        else:
+            after = self._target(base)
+            self.pan += QPointF(at.x() - (after.left() + nx * after.width()),
+                                at.y() - (after.top() + ny * after.height()))
+            self._clamp_pan()
+        self.update()
+
+    def fit(self) -> None:
+        self.zoom, self.pan = 1.0, QPointF(0, 0)
+        self.update()
+
+    def _clamp_pan(self) -> None:
+        base = self.gray or self.color
+        if base is None:
+            return
+        r = self._target(base)
+        w, h = self.width(), self.height()
+        # keep the picture covering at least a quarter of the view each way
+        dx = min(0.0, r.right() - w * 0.25) or max(0.0, r.left() - w * 0.75)
+        dy = min(0.0, r.bottom() - h * 0.25) or max(0.0, r.top() - h * 0.75)
+        self.pan -= QPointF(dx, dy)
 
     def paintEvent(self, ev) -> None:
         p = QPainter(self)
@@ -107,7 +151,12 @@ class Viewer(_base()):
             return
         rect = self._target(base)
         show_color = self.color is not None
-        if self.mode == "original" or not show_color:
+        if self.mode == "frame":
+            if self.frame_image is not None:
+                p.drawImage(rect, self.frame_image)
+            else:
+                p.drawImage(rect, self.gray or self.color)
+        elif self.mode == "original" or not show_color:
             p.drawImage(rect, self.gray or self.color)
         elif self.mode == "color":
             p.drawImage(rect, self.color)
@@ -119,8 +168,9 @@ class Viewer(_base()):
                         QRectF(src_w, 0, self.color.width() - src_w, self.color.height()))
             p.setPen(QPen(QColor(theme.ACCENT), 1.5))
             p.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
-            self._label(p, QPointF(rect.left() + 8, rect.top() + 8), "before")
-            self._label(p, QPointF(rect.right() - 48, rect.top() + 8), "after")
+            vis = rect.intersected(QRectF(self.rect()))
+            self._label(p, QPointF(vis.left() + 8, vis.top() + 8), "before")
+            self._label(p, QPointF(vis.right() - 48, vis.top() + 8), "after")
         self._paint_overlays(p, rect)
         tags = []
         if self.paint_mode:
@@ -130,14 +180,22 @@ class Viewer(_base()):
         if self.pick_mode:
             tags.append({"colour": "click to pick a colour", "neutral": "click something that should be grey",
                          "hue": "click the colour to isolate"}[self.pick_mode])
-        if not show_color:
+        if self.mode == "frame":
+            tags.append(self.frame_label if self.frame_image is not None
+                        else "this frame: not colorized yet, press Colorize frame (Ctrl+F)")
+        elif not show_color:
             tags.append("not colorized")
         elif self.mode == "original":
             tags.append("original")
+        if self.shot_note and self.mode != "frame":
+            tags.append(self.shot_note)
+        if self.zoom > 1.0:
+            tags.append(f"zoom {self.zoom * 100:.0f}% (Ctrl+0 fits)")
         tags.append("full size" if self.full else "proxy")
         if self.note:
             tags.append(self.note)
-        self._label(p, QPointF(rect.left() + 8, rect.bottom() - 26), "  ·  ".join(tags))
+        vis = rect.intersected(QRectF(self.rect()))  # zoomed in, the picture runs past the edges
+        self._label(p, QPointF(vis.left() + 8, vis.bottom() - 26), "  ·  ".join(tags))
 
     def _paint_overlays(self, p: QPainter, rect: QRectF) -> None:
         short = min(rect.width(), rect.height())
@@ -275,6 +333,10 @@ class Viewer(_base()):
 
     def mousePressEvent(self, ev) -> None:
         pos = ev.position()
+        if ev.button() == Qt.MiddleButton:
+            self._panning = pos
+            self.setCursor(Qt.ClosedHandCursor)
+            return
         n = self._norm(pos)
         hit = self._marker_at(pos)
         if hit is not None and ev.button() in (Qt.LeftButton, Qt.RightButton) and not self.pick_mode:
@@ -301,6 +363,12 @@ class Viewer(_base()):
 
     def mouseMoveEvent(self, ev) -> None:
         pos = ev.position()
+        if self._panning is not None:
+            self.pan += pos - self._panning
+            self._panning = pos
+            self._clamp_pan()
+            self.update()
+            return
         self._mouse = pos
         if self._live is not None:
             n = self._norm(pos)
@@ -323,6 +391,10 @@ class Viewer(_base()):
                        else Qt.ArrowCursor)
 
     def mouseReleaseEvent(self, ev) -> None:
+        if ev.button() == Qt.MiddleButton and self._panning is not None:
+            self._panning = None
+            self.setCursor(Qt.CrossCursor if self.paint_mode else Qt.ArrowCursor)
+            return
         if self._live is not None:
             pts, self._live = self._live, None
             self.strokeFinished.emit({**self.brush, "points": pts})
@@ -334,13 +406,19 @@ class Viewer(_base()):
         self.update()
 
     def wheelEvent(self, ev) -> None:
-        if self.paint_mode:  # wheel resizes the brush
-            k = 1.15 if ev.angleDelta().y() > 0 else 1 / 1.15
-            self.brush["radius"] = float(min(0.2, max(0.003, self.brush["radius"] * k)))
+        up = ev.angleDelta().y() > 0
+        if self.paint_mode and ev.modifiers() & Qt.ShiftModifier:  # Shift+wheel: brush size
+            k = 1.15 if up else 1 / 1.15
+            self.brush["radius"] = float(min(0.2, max(0.001, self.brush["radius"] * k)))
+            self.brushResized.emit(self.brush["radius"])
             self.update()
             ev.accept()
             return
-        super().wheelEvent(ev)
+        if self.gray is None and self.color is None:
+            super().wheelEvent(ev)
+            return
+        self.zoom_at(1.25 if up else 0.8, ev.position())  # the wheel zooms at the pointer
+        ev.accept()
 
     def _move_split(self, x: float) -> None:
         base = self.gray or self.color

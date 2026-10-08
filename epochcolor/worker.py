@@ -77,6 +77,10 @@ def photo_result_path(src: str, settings: dict, model: str, strokes: list | None
     keys = {k: settings.get(k) for k in ("working_size", "grain", "denoise")}
     d = {"p": str(p.resolve()), "s": st.st_size, "m": st.st_mtime_ns,
          "set": keys, "model": model, "hints": strokes_key(strokes) if strokes else None}
+    if strokes:  # what painting does, and how far it reaches
+        from .video.hints_pass import PAINT_VERSION
+
+        d["paint"] = f"{PAINT_VERSION}:{settings.get('paint_spread', 0.35)}"
     if negative:  # only when set, so earlier results keep their names
         d["neg"] = dict(sorted(negative.items()))
     if reference_id(reference):
@@ -107,7 +111,8 @@ def _photo_settings(settings: dict):
     from .pipeline import PhotoSettings
 
     return PhotoSettings(working_size=settings.get("working_size", 512),
-                         grain=settings.get("grain", 100.0), denoise=settings.get("denoise"))
+                         grain=settings.get("grain", 100.0), denoise=settings.get("denoise"),
+                         spread=settings.get("paint_spread"))
 
 
 def _colorize_photo(job: dict, models: dict) -> Path:
@@ -154,8 +159,21 @@ def run_job(kind: str, job: dict, progress, models: dict) -> dict:
         model = _model(models, job["model"], job.get("weights"), job.get("device", "auto"))
         s = VideoSettings.from_project(job["settings"])
         rep = analyze(clip_info(clip), model, s, shots=clip.shots, quiet=True, progress=progress,
-                      hints=job.get("hints"), references=job.get("references"))
+                      hints=job.get("hints"), references=job.get("references"),
+                      only_shots=job.get("only_shots"))
         return {"clip": clip.id, "dir": str(rep.dir), "timings": rep.timings}
+
+    if kind == "paint_shot":
+        from .project import AudioInfo, Clip
+        from .timeline_export import clip_info
+        from .video.pipeline import VideoSettings, paint_shot
+
+        cd = dict(job["clip"])
+        cd["audio"] = [AudioInfo(**a) for a in cd.get("audio", [])]
+        clip = Clip(**cd)
+        path = paint_shot(clip_info(clip), VideoSettings.from_project(job["settings"]), job["model"],
+                          job.get("weights"), tuple(job["shot"]), job.get("hints"), progress)
+        return {"clip": clip.id, "file": str(path)}
 
     if kind == "photo":
         progress("colorize", 0, 1)
@@ -241,6 +259,9 @@ def run_job(kind: str, job: dict, progress, models: dict) -> dict:
     if kind == "match":
         return _match(job, progress, models)
 
+    if kind == "frame_preview":
+        return _frame_preview(job, progress, models)
+
     if kind == "export_frame":
         return _export_frame(job, progress)
 
@@ -310,7 +331,9 @@ def _match(job: dict, progress, models: dict) -> dict:
 
     colors, ex = [], []
     for col in job["colors"]:
-        src = col["source"]
+        src = col.get("source")
+        if not src or not src.get("stroke"):
+            continue  # an item nobody has painted yet: nothing to look for
         path, frame, fps, neg = where(src["kind"], src["target"], src.get("frame"))
         L = _working_l(path, frame, fps, size, neg)
         e = exemplar(model, L, [src["stroke"]])
@@ -350,6 +373,61 @@ def _match(job: dict, progress, models: dict) -> dict:
     return {"suggestions": out, "colors": [c["id"] for c in job["colors"]]}
 
 
+def _frame_preview(job: dict, progress, models: dict) -> dict:
+    """Colorize frame: the selected model on one frame, the frame's paint
+    and the shot's reference on top, cast and saturation applied, saved as
+    a picture for the viewer's This frame view."""
+    from fractions import Fraction
+
+    import cv2
+    import numpy as np
+
+    from .chroma import adjust_rgb
+    from .film import invert
+    from .hintpaint import rasterize, strokes_key
+    from .imageio import save_image
+    from .media import FrameReader
+    from .pipeline import colorize_photo
+    from .reference import reference_id
+    from .video.pipeline import cache_root
+
+    progress("decoding", 0, 3)
+    r = FrameReader(job["path"], Fraction(job["fps_num"], job["fps_den"]), "gray16le", cache=2)
+    try:
+        g = r.get(int(job["frame"]))
+    finally:
+        r.close()
+    if g is None:
+        raise RuntimeError(f"frame {job['frame']} could not be decoded")
+    gray = invert(g, job.get("negative"))
+    h, w = gray.shape
+    k = min(1.0, 1600 / max(h, w))  # the viewer's size; plenty to judge colour
+    if k < 1:
+        gray = cv2.resize(gray, (round(w * k), round(h * k)), interpolation=cv2.INTER_AREA)
+    img = np.repeat(gray[..., None], 3, axis=2).astype(np.float32)
+    strokes = job.get("strokes") or []
+    hints = rasterize(strokes, img.shape[1], img.shape[0]) if strokes else None
+    progress("model", 1, 3)
+    model = _model(models, job["model"], job.get("weights"), job.get("device", "auto"))
+    rgb, _ = colorize_photo(img, model, _photo_settings(job["settings"]), hints, reference=job.get("reference"))
+    rgb = adjust_rgb(rgb, float(job["settings"].get("saturation", 1.0)), float(job["settings"].get("cast", 0.0)))
+    ident = json.dumps([job["path"], job["frame"], job["model"], strokes_key(strokes),
+                        reference_id(job.get("reference")), job.get("negative"),
+                        {k: job["settings"].get(k) for k in ("working_size", "denoise", "saturation", "cast",
+                                                            "paint_spread")}], sort_keys=True, default=str)
+    out = cache_root() / "frame" / (hashlib.sha1(ident.encode()).hexdigest()[:16] + ".png")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    save_image(out, rgb, bits=8)
+    progress("model", 3, 3)
+    extra = []
+    if strokes:
+        extra.append(f"{len(strokes)} stroke(s)")
+    if job.get("reference"):
+        extra.append("reference")
+    label = f"this frame: {job['model']}" + (" + " + " + ".join(extra) if extra else "") + f", frame {job['frame']}"
+    return {"path": str(out), "label": label}
+
+
 def _export_frame(job: dict, progress) -> dict:
     """One frame at full size through the export path: inversion, output
     cleanup, colour, grade, regrain."""
@@ -367,16 +445,23 @@ def _export_frame(job: dict, progress) -> dict:
     c = p.d.clips[job["clip"]]
     f = int(job["frame"])
     s = VideoSettings.from_project(p.d.settings)
-    if analysis_state(c, s, job["model"], job.get("weights"), p.d.hints.get(c.id),
-                      p.d.references.get(c.id)) not in ("ready", "update"):
-        raise RuntimeError(f"{c.name} isn't colorized with the current settings; colorize it first")
+    from .timeline_export import shot_states
+
+    st = shot_states(c, s, job["model"], job.get("weights"), p.d.hints.get(c.id),
+                     p.expanded_references(c.id))
+    here = next((v for k, v in st.items() if int(k.split("-")[0]) <= f < int(k.split("-")[1])), None)
+    if here is None or here["state"] == "none":
+        raise RuntimeError(f"this shot of {c.name} isn't coloured yet; Color shot or Fill shot first")
     d = analysis_dir(Path(c.path), s, job["model"], job.get("weights"), c.neg)
-    ab = np.load(d / "ab.npy", mmap_mode="r")
+    a0 = int(next(k for k in st if st[k] is here).split("-")[0])
+    painted = here["state"] == "painted"
+    arr = np.load(here["file"], mmap_mode="r")
+    abf = np.asarray(arr[f - a0] if painted else arr[f], np.float32)
     progress("rendering", 0, 1)
     r = FrameReader(c.path, c.fps, "gray16le", cache=4)
     try:
         def L_at(i):
-            g = r.get(i) if 0 <= i < len(ab) else None
+            g = r.get(i) if 0 <= i < c.frames else None
             return srgb_to_l(invert(g, c.neg)) if g is not None else None
 
         L = L_at(f)
@@ -389,10 +474,10 @@ def _export_frame(job: dict, progress) -> dict:
         r.close()
     bias = None
     if s.cast:
-        from .chroma import ShotCasts
+        from .chroma import ShotCasts, estimate_cast
 
-        bias = ShotCasts(d, ab).at(f)
-    rgb = FrameRenderer(s)(None, np.asarray(ab[f], np.float32), bias, L=L)
+        bias = estimate_cast(abf) if painted else ShotCasts(d, arr).at(f)
+    rgb = FrameRenderer(s)(None, abf, bias, L=L)
     rgb = finish(rgb, s, GradeBook(p.d.grades, {cid: x.shots for cid, x in p.d.clips.items()}), c.id, f)
     out = Path(job["out"])
     save_image(out, rgb, bits=8 if out.suffix.lower() in (".jpg", ".jpeg") else 16)
