@@ -165,13 +165,19 @@ def default_cache_root() -> Path:
 
 
 def cache_key(path: Path, s: VideoSettings, model_name: str, weights: str | None,
-              negative: dict | None = None) -> str:
-    st = path.stat()
-    ident = {
-        "src": str(path.resolve()), "size": st.st_size, "mtime": st.st_mtime_ns,
-        "ws": s.working_size, "dn": s.denoise, "frames": s.frames,
-        "model": model_name, "weights": str(weights or ""), "cs": s.chroma_size, "v": 2,
-    }
+              negative: dict | None = None, legacy: bool = False) -> str:
+    """The analysis folder's name: the source by its content (sourceid.py),
+    plus everything that changes what the model sees. legacy: the name
+    versions before 0.9 used, from the path and modification time."""
+    if legacy:
+        st = path.stat()
+        ident = {"src": str(path.resolve()), "size": st.st_size, "mtime": st.st_mtime_ns, "v": 2}
+    else:
+        from ..sourceid import source_id
+
+        ident = {"src_id": source_id(path), "v": 3}
+    ident.update({"ws": s.working_size, "dn": s.denoise, "frames": s.frames,
+                  "model": model_name, "weights": str(weights or ""), "cs": s.chroma_size})
     # what the model sees; only added when on, so caches from before stay valid
     if s.deflicker:
         ident["dfl"] = round(float(s.deflicker), 3)
@@ -182,15 +188,61 @@ def cache_key(path: Path, s: VideoSettings, model_name: str, weights: str | None
     return hashlib.sha256(json.dumps(ident, sort_keys=True).encode()).hexdigest()[:20]
 
 
+def made_with(s: VideoSettings, model_name: str, negative: dict | None) -> dict:
+    """The settings an analysis folder depends on, kept next to it so an
+    earlier colorize can be found again after the settings changed."""
+    return {"model": model_name, "working_size": s.working_size, "denoise": s.denoise,
+            "chroma_size": s.chroma_size, "deflicker": s.deflicker, "dust": s.dust, "negative": bool(negative)}
+
+
 def analysis_dir(path: Path, s: VideoSettings, model_name: str, weights: str | None = None,
                  negative: dict | None = None) -> Path:
     """weights: the model's cache id; None looks up the installed model's.
-    negative: the clip's negative inversion, when it's a negative."""
+    negative: the clip's negative inversion, when it's a negative. A folder
+    under the old path-and-time name gets renamed to the content name the
+    first time it's looked up."""
     if weights is None:
         from ..models import cache_id_for
 
         weights = cache_id_for(model_name)
-    return cache_root() / "clips" / cache_key(Path(path), s, model_name, weights, negative)
+    from ..sourceid import adopt, source_id
+
+    path = Path(path)
+    d = cache_root() / "clips" / cache_key(path, s, model_name, weights, negative)
+    if not d.exists():
+        legacy = cache_root() / "clips" / cache_key(path, s, model_name, weights, negative, legacy=True)
+        if adopt(legacy, d):
+            try:
+                (d / "made_with.json").write_text(json.dumps({**made_with(s, model_name, negative),
+                                                              "src": source_id(path)}))
+            except OSError:
+                pass
+    return d
+
+
+def earlier_analyses(path: Path, negative: dict | None = None) -> list[dict]:
+    """Analysis folders of this source made with other settings: the
+    made_with dicts of every folder that has colour in it, newest first.
+    For "this clip was colorized before, with DDColor"."""
+    from ..sourceid import source_id
+
+    try:
+        src = source_id(path)
+    except OSError:
+        return []
+    out = []
+    for f in (cache_root() / "clips").glob("*/made_with.json"):
+        try:
+            mw = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if mw.get("src") != src or bool(mw.get("negative")) != bool(negative):
+            continue
+        if not (f.parent / "ab.npy").exists():
+            continue
+        out.append((f.stat().st_mtime, {k: v for k, v in mw.items() if k != "src"}))
+    out.sort(key=lambda x: -x[0])
+    return [mw for _, mw in out]
 
 
 def finished_analysis(path: Path, s: VideoSettings, model_name: str,
@@ -336,6 +388,11 @@ def analyze(info: ClipInfo, model: ColorModel, s: VideoSettings | None = None,
         rep.warnings.append("frames are flagged interlaced; deinterlace first if you see combing")
     meta_path = cdir / "meta.json"
     meta = json.loads(meta_path.read_text()) if (use_cache and meta_path.exists()) else {}
+    if not (cdir / "made_with.json").exists():
+        from ..sourceid import source_id
+
+        (cdir / "made_with.json").write_text(json.dumps({**made_with(s, model.info.name, neg),
+                                                         "src": source_id(info.path)}))
     flow = Flow(s.flow_preset)
     for stale in ("L.raw", "L.npy"):  # from versions that kept working-size luma
         (cdir / stale).unlink(missing_ok=True)

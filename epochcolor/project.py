@@ -147,6 +147,9 @@ class ProjectData:
     suggestions: list = field(default_factory=list)  # saved-colour matches waiting for a click
     grades: dict = field(default_factory=dict)  # clip id -> {str(shot start): track}
     references: dict = field(default_factory=dict)  # clip id -> {str(shot start): {"path", "strength"}}
+    # where you were: playhead, timeline zoom, view mode, paint bar. Written
+    # on save, restored on open; changing it doesn't count as an edit
+    view: dict = field(default_factory=dict)
 
 
 class Project:
@@ -785,4 +788,5 @@ def _data_from_dict(d: dict) -> ProjectData:
         suggestions=list(d.get("suggestions", [])),
         grades=dict(d.get("grades", {})),
         references=dict(d.get("references", {})),
+        view=dict(d.get("view") or {}),
     )

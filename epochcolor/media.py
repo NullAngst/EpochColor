@@ -29,12 +29,19 @@ Progress = Callable[[str, int, int], None]
 
 
 def media_dir(path: str | Path) -> Path:
+    """Where a clip's proxy, thumbnails and waveforms live, named after the
+    source's content (sourceid.py). An entry under the old path-and-time
+    name gets renamed the first time it's looked up."""
+    from .sourceid import adopt, source_id
     from .video.pipeline import cache_root
 
     p = Path(path).resolve()
-    st = p.stat()
-    key = hashlib.sha256(f"{p}:{st.st_size}:{st.st_mtime_ns}:m1".encode()).hexdigest()[:20]
-    return cache_root() / "media" / key
+    d = cache_root() / "media" / hashlib.sha256(f"{source_id(p)}:m2".encode()).hexdigest()[:20]
+    if not d.exists():
+        st = p.stat()
+        legacy = hashlib.sha256(f"{p}:{st.st_size}:{st.st_mtime_ns}:m1".encode()).hexdigest()[:20]
+        adopt(cache_root() / "media" / legacy, d)
+    return d
 
 
 def _even(x: float) -> int:

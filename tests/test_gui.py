@@ -13,6 +13,7 @@ pytest.importorskip("av")
 torch = pytest.importorskip("torch")
 pytestmark = pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg not installed")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("EPOCHCOLOR_FRESH_LAYOUT", "1")  # not the window layout of whoever ran the tests last
 
 
 class Oracle:
@@ -582,3 +583,122 @@ def test_items_shot_states_and_this_frame(tmp_path, window):
     w.delete_item(sky["id"])
     assert w.paintbar.item_id is None
     assert clip_info(c)  # still a sane clip
+
+
+def test_save_open_keeps_settings_view_and_colour(tmp_path, window, monkeypatch):
+    import os
+    from pathlib import Path
+
+    from PySide6.QtWidgets import QFileDialog, QMessageBox
+
+    from epochcolor.media import media_dir
+    from epochcolor.timeline_export import clip_info
+    from epochcolor.video.pipeline import VideoSettings, analysis_dir, analyze, cache_key, cache_root
+
+    app, w = window
+    truth = make_clip(tmp_path / "a.mkv", n=36)
+    w.add_clips([str(tmp_path / "a.mkv")])
+    wait(app, w)
+    p = w.project
+    c = next(iter(p.d.clips.values()))
+    analyze(clip_info(c), Oracle(truth), VideoSettings.from_project(p.d.settings), shots=c.shots, quiet=True)
+    w._refresh()
+    assert w.status[c.id] == "ready"
+
+    # an edit still settling on its timer is kept by a save right after it
+    w.inspector.saturation.setValue(1.4)
+    # where you were: playhead, timeline zoom, view mode, paint bar
+    w.paintbar.frame_mode.setChecked(True)
+    w.paintbar.reach.setValue(3)
+    w.paintbar.auto.setChecked(False)
+    w.seek(17)
+    w.timeline.canvas.zoom_to(10.0)
+    w.viewer.set_mode("original")
+    path = tmp_path / "p.epochcolor"
+    p.path = path
+    assert w.save_project()
+    assert p.d.settings["saturation"] == 1.4
+
+    w._set_project(type(p)())  # something else open in between
+    w.open_project(str(path))
+    pump(app, 0.3)
+    q = w.project
+    assert q.d.settings["saturation"] == 1.4
+    assert w.playhead == 17 and w.timeline.canvas.zoom == pytest.approx(10.0)
+    assert w.paintbar.frame_mode.isChecked() and w.paintbar.reach.value() == 3 and not w.paintbar.auto.isChecked()
+    assert w.viewer.mode == "original"
+    assert w.status[c.id] == "ready" and c.id in w.media_info
+
+    # the source's time changes (a sync tool, a remount): the colour stays
+    os.utime(c.path, (1_000_000_000, 1_000_000_000))
+    w._refresh()
+    assert w.status[c.id] == "ready"
+
+    # a cache from before 0.9 (named after path and time) gets adopted, not redone
+    s = VideoSettings.from_project(q.d.settings)
+    new = analysis_dir(c.path, s, q.d.settings["model"])
+    from epochcolor.models import cache_id_for
+
+    legacy = cache_root() / "clips" / cache_key(Path(c.path), s, q.d.settings["model"],
+                                                cache_id_for(q.d.settings["model"]), legacy=True)
+    new.rename(legacy)
+    w._refresh()
+    assert w.status[c.id] == "ready" and new.exists() and not legacy.exists()
+
+    # another model selected (say, to try it with Colorize frame): the earlier colour is one click away
+    w._setting_changed("model", "eccv16")
+    w._refresh()
+    assert w.status[c.id] == "none"
+    w.timeline.canvas.sel = 0
+    w._refresh_inspector()
+    assert w.inspector.earlier_btn.isVisible() and "siggraph17" in w.inspector.clip_info.text()
+    w.use_earlier_colour()
+    assert q.d.settings["model"] == "siggraph17" and w.status[c.id] == "ready"
+    assert not w.inspector.earlier_btn.isVisible()
+
+    # the source moved (another mount point): point at it once, the colour comes back with it
+    q.dirty = False
+    assert w.save_project()
+    moved = tmp_path / "Disk1"
+    moved.mkdir()
+    old_media = media_dir(c.path)
+    os.rename(c.path, moved / "a.mkv")
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.Yes))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", staticmethod(lambda *a, **k: (str(moved / "a.mkv"), "")))
+    w.open_project(str(path))
+    pump(app, 0.3)
+    c2 = next(iter(w.project.d.clips.values()))
+    assert c2.path == str((moved / "a.mkv").resolve())
+    assert media_dir(c2.path) == old_media, "the proxy is found by content, no rebuild"
+    w._refresh()
+    assert w.status[c2.id] == "ready"
+    assert not w.runner.busy()
+
+
+def test_timeline_zoom_bar_and_frame_clicks(tmp_path, window):
+    from epochcolor.gui.timeline import FRAMES_ZOOM, HEAD_W, MAX_ZOOM
+
+    app, w = window
+    make_clip(tmp_path / "a.mkv", n=48)
+    w.add_clips([str(tmp_path / "a.mkv")])
+    wait(app, w)
+    tl, cv = w.timeline, w.timeline.canvas
+    w.seek(20)
+    tl.frames()
+    assert cv.zoom == FRAMES_ZOOM
+    assert HEAD_W <= cv.x_of(20) <= cv.width(), "the playhead stays on screen"
+    assert "px per frame" in tl.zoom_label.text()
+    # a click anywhere on a frame's box picks that frame
+    for dx in (0.5, FRAMES_ZOOM / 2, FRAMES_ZOOM - 0.5):
+        assert cv.frame_at(cv.x_of(21) + dx) == 21
+    # the slider follows, and moving it zooms
+    v = tl.zoom_slider.value()
+    tl.zoom_slider.setValue(v - 200)
+    assert cv.zoom < FRAMES_ZOOM
+    for _ in range(12):
+        tl.zoom_by(2.0)
+    assert cv.zoom == MAX_ZOOM and not tl.zoom_in.isEnabled()
+    tl.fit()
+    assert cv.visible_frames() >= w.project.duration
+    w._zoom(1.5)  # = key
+    assert cv.zoom > 0

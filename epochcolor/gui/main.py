@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -67,7 +68,8 @@ Ctrl+R       colorize the selected clip (Ctrl+Shift+R: all)
 Ctrl+Alt+C/V copy / paste a shot's grade
 Ctrl+E       export video
 Ctrl+Z       undo, Ctrl+Shift+Z redo
-Ctrl+wheel   zoom the timeline, Shift+Z fits it"""
+Ctrl+wheel   zoom the timeline (or = and -, or the zoom bar under it)
+Shift+Z      fit the whole timeline; Shift+F zooms to single frames"""
 
 
 class Inspector(QWidget):
@@ -79,6 +81,7 @@ class Inspector(QWidget):
     referenceClear = Signal()
     referenceStrength = Signal(float)
     shotAction = Signal(str)  # color_shot, fill_shot, colorize_all
+    useEarlier = Signal()  # switch to the settings an earlier colorize of this clip was made with
     gotoFrame = Signal(int)  # a painted frame of this shot, in clip frames
 
     def __init__(self, parent=None):
@@ -98,6 +101,12 @@ class Inspector(QWidget):
         row.addWidget(self.colorize_btn)
         row.addWidget(self.colorize_all_btn)
         gl.addLayout(row)
+        self.earlier_btn = QPushButton("Use the earlier colour")
+        self.earlier_btn.setToolTip("This clip was colorized before with other settings (another model, say). "
+                                    "Switch back to those settings and that colour shows again, no new colorize.")
+        self.earlier_btn.clicked.connect(self.useEarlier.emit)
+        self.earlier_btn.setVisible(False)
+        gl.addWidget(self.earlier_btn)
         row = QHBoxLayout()
         self.negative = QCheckBox("Negative")
         self.negative.setToolTip("This clip or photo is a black and white negative: invert it before "
@@ -462,10 +471,85 @@ class MainWindow(QMainWindow):
         self.grade_timer.setInterval(500)
         self.grade_timer.timeout.connect(self._commit_grade)
 
+        self._earlier: dict = {}  # (clip id, settings) -> earlier colorizes with other settings
         self.resize(1440, 900)
+        self._restore_layout()
         if project_path:
             self.open_project(project_path)
         self._refresh()
+
+    # ------------------------------------------------- window layout, view
+
+    def _restore_layout(self) -> None:
+        """Window size and where the panels are, as you left them. Global,
+        not per project. EPOCHCOLOR_FRESH_LAYOUT=1 starts from the default."""
+        if os.environ.get("EPOCHCOLOR_FRESH_LAYOUT"):
+            return
+        geo, state = self.qs.value("window/geometry"), self.qs.value("window/state")
+        if geo is not None:
+            self.restoreGeometry(geo)
+        if state is not None:
+            self.restoreState(state)
+        # the paint option rows follow the paint bar, whatever the saved state said
+        pb = self.paintbar
+        pb.options_bar.setVisible(pb.paint.isChecked())
+        pb.frame_bar.setVisible(pb.frame_mode.isChecked())
+
+    def _save_layout(self) -> None:
+        if os.environ.get("EPOCHCOLOR_FRESH_LAYOUT"):
+            return
+        self.qs.setValue("window/geometry", self.saveGeometry())
+        self.qs.setValue("window/state", self.saveState())
+
+    def _flush_edits(self) -> None:
+        """Settle edits still waiting on a timer (a spin box settles for a
+        moment, a grade drag commits after half a second), so a save or a
+        close right after a change keeps it."""
+        ins = self.inspector
+        if ins._debounce.isActive() or ins._pending:
+            ins._debounce.stop()
+            ins._flush()
+        if self.grade_timer.isActive() or self._grade_before is not None:
+            self.grade_timer.stop()
+            self._commit_grade()
+
+    def _capture_view(self) -> dict:
+        pb, cv = self.paintbar, self.timeline.canvas
+        return {"playhead": int(self.playhead), "tl_zoom": float(cv.zoom), "tl_offset": float(cv.offset),
+                "mode": self.viewer.mode, "tab": "photos" if self.bottom.currentWidget() is self.filmstrip
+                else "timeline", "photo": self.filmstrip.currentRow(),
+                "paint": {"frame_mode": pb.frame_mode.isChecked(), "reach": pb.reach.value(),
+                          "auto": pb.auto.isChecked(), "onion": pb.onion.isChecked(), "show": pb.show.isChecked(),
+                          "size": pb.size.value(), "rgb": list(pb.rgb), "item": pb.item_id}}
+
+    def _restore_view(self, v: dict) -> None:
+        if not v:
+            return
+        pb, cv = self.paintbar, self.timeline.canvas
+        paint = v.get("paint") or {}
+        for w, key in ((pb.frame_mode, "frame_mode"), (pb.auto, "auto"), (pb.onion, "onion"), (pb.show, "show")):
+            if key in paint:
+                w.setChecked(bool(paint[key]))
+        if "reach" in paint:
+            pb.reach.setValue(int(paint["reach"]))
+        if "size" in paint:
+            pb.size.setValue(int(paint["size"]))
+        item = next((c for c in self.project.d.colors if c["id"] == paint.get("item")), None)
+        if item is not None:
+            pb.set_rgb(item["rgb"], item["id"], item["name"])
+        elif paint.get("rgb"):
+            pb.set_rgb(paint["rgb"])
+        if v.get("tab") == "photos" and self.project.d.photos:
+            self.bottom.setCurrentWidget(self.filmstrip)
+            self.filmstrip.setCurrentRow(max(0, min(int(v.get("photo", 0)), len(self.project.d.photos) - 1)))
+        if "tl_zoom" in v:
+            cv.zoom = float(v["tl_zoom"])
+            cv.offset = max(0.0, float(v.get("tl_offset", 0.0)))
+            self.timeline.sync_scroll()
+        if v.get("mode") in self.viewer.MODES and v.get("mode") != "frame":  # This frame results don't survive a restart
+            self.viewer.set_mode(v["mode"])
+        self.seek(int(v.get("playhead", 0)))
+        self.timeline.canvas.update()
 
     # ------------------------------------------------------------- UI
 
@@ -581,6 +665,7 @@ class MainWindow(QMainWindow):
                                          and self.goto_clip_frame(t[1], f))
         self.inspector.referenceStrength.connect(self._reference_strength)
         self.inspector.colorize_all_btn.clicked.connect(self.colorize_all)
+        self.inspector.useEarlier.connect(self.use_earlier_colour)
         self.inspector.cancel_btn.clicked.connect(lambda: self.runner.cancel(
             self.runner.current.id if self.runner.current else -1))
         self.inspector.cancel_all_btn.clicked.connect(lambda: self.runner.cancel(None))
@@ -653,6 +738,7 @@ class MainWindow(QMainWindow):
         act(m, "Open project...", self.open_project_dialog, "Ctrl+O")
         act(m, "Save project", self.save_project, "Ctrl+S")
         act(m, "Save project as...", self.save_project_as, "Ctrl+Shift+S")
+        act(m, "Find missing sources...", self.find_missing_sources)
         m.addSeparator()
         act(m, "Add clips...", self.add_clips_dialog, "Ctrl+I")
         act(m, "Add photos...", self.add_photos_dialog, "Ctrl+Shift+I")
@@ -701,6 +787,7 @@ class MainWindow(QMainWindow):
         act(m, "Zoom timeline in", lambda: self._zoom(1.5), ["=", "Ctrl+="])
         act(m, "Zoom timeline out", lambda: self._zoom(1 / 1.5), ["-", "Ctrl+-"])
         act(m, "Fit timeline", self._fit, "Shift+Z")
+        act(m, "Timeline to single frames", self.timeline.frames, "Shift+F")
         m.addSeparator()
         act(m, "Paint hints", lambda: self.paintbar.paint.toggle(), "P")
         act(m, "Paint frame by frame", self.toggle_frame_mode, "F")
@@ -886,6 +973,7 @@ class MainWindow(QMainWindow):
         ins.colorize_all_btn.setText("Colorize all")
         c = self._selected_clip()
         if c is None:
+            self.inspector.earlier_btn.setVisible(False)
             self.inspector.clip_info.setText("Nothing selected")
         else:
             st = {"ready": "colorized", "update": "hints or stabilizer changed: Apply hints (Ctrl+Return)",
@@ -893,6 +981,11 @@ class MainWindow(QMainWindow):
                   "none": "not colorized yet"}[self.status.get(c.id, "none")]
             nh = len(self.project.hint_frames(c.id))
             st += f"<br>{nh} painted frame(s)" if nh else ""
+            earlier = self._earlier_for(c) if self.status.get(c.id, "none") in ("none", "partial") \
+                and Path(c.path).exists() else None
+            if earlier:
+                st += f"<br><span style='color:{theme.ACCENT}'>colorized before with {self._describe(earlier)}</span>"
+            self.inspector.earlier_btn.setVisible(bool(earlier))
             audio = ", ".join(f"{a.codec} {a.channels}ch" for a in c.audio) or "none"
             self.inspector.clip_info.setText(
                 f"<b>{c.name}</b><br>{c.width}x{c.height} at {float(c.fps):.3f} fps, {c.codec}<br>"
@@ -1368,17 +1461,10 @@ class MainWindow(QMainWindow):
             self._refresh()
 
     def _zoom(self, k: float) -> None:
-        cv = self.timeline.canvas
-        anchor = self.playhead
-        px = cv.x_of(anchor)
-        cv.zoom = float(np.clip(cv.zoom * k, 0.01, 40.0))
-        cv.offset = max(0.0, anchor - (px - 96) / cv.zoom)
-        self.timeline.sync_scroll()
-        cv.update()
+        self.timeline.zoom_by(k)
 
     def _fit(self) -> None:
-        self.timeline.canvas.fit()
-        self.timeline.sync_scroll()
+        self.timeline.fit()
 
     # ----------------------------------------------------------- media
 
@@ -1618,6 +1704,7 @@ class MainWindow(QMainWindow):
         ins.cancel_all_btn.setEnabled(self.runner.busy())
 
     def _job_done(self, job, result: dict) -> None:
+        self._earlier.clear()
         if self._manager is not None:
             self._manager.reload()
         if result.get("notice"):
@@ -2439,6 +2526,7 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------- projects
 
     def _confirm_discard(self) -> bool:
+        self._flush_edits()
         if not self.project.dirty:
             return True
         r = QMessageBox.question(self, "Unsaved changes", "Save the project first?",
@@ -2454,23 +2542,136 @@ class MainWindow(QMainWindow):
 
     def _set_project(self, p: Project) -> None:
         self.shuttle(0)
+        self._flush_edits()
+        self.inspector._pending.clear()
         self.project = p
         self.media = MediaCache()
         self.media_info = {}
         self.photo_icons = {}
+        self._frame_results.clear()
+        self._earlier.clear()
+        self.viewer.frame_image = None
+        self.viewer.fit()
+        self.paintbar.set_rgb(self.paintbar.rgb)  # an item from the last project means nothing here
         self.timeline.canvas.media = self.media
         self.timeline.set_project(p)
         self.playhead = 0
-        for c in p.d.clips.values():
-            if not Path(c.path).exists():
-                self.statusBar().showMessage(f"missing source: {c.path}", 10000)
-                continue
-            if not self._load_media(c):
-                job = self.runner.submit("import", f"Rebuild proxy for {c.name}",
-                                         {"path": c.path, "shot_threshold": p.d.settings["shot_threshold"]})
-                self._importing[job.id] = "rebuild"
+        self._relink_missing()
+        self._load_all_media()
         self._refresh()
         self._fit()
+        self._restore_view(p.d.view)
+
+    def _load_all_media(self) -> None:
+        """Proxies and thumbnails for every clip; a missing one gets rebuilt in the background."""
+        p = self.project
+        for c in p.d.clips.values():
+            if not Path(c.path).exists():
+                continue
+            if c.id not in self.media_info and not self._load_media(c):
+                busy = any(j.kind == "import" and j.payload.get("path") == c.path
+                           for j in list(self.runner.pending) + [self.runner.current] if j is not None)
+                if not busy:
+                    job = self.runner.submit("import", f"Rebuild proxy for {c.name}",
+                                             {"path": c.path, "shot_threshold": p.d.settings["shot_threshold"]})
+                    self._importing[job.id] = "rebuild"
+
+    def _missing_sources(self) -> list:
+        p = self.project
+        return ([c for c in p.d.clips.values() if not Path(c.path).exists()]
+                + [ph for ph in p.d.photos if not Path(ph.path).exists()])
+
+    def _relink_missing(self, ask: bool = True) -> int:
+        """Sources that moved (another mount point, another disk, renamed
+        folder): point at the new place of one, and every other missing
+        file with the same name in that folder follows. Returns how many."""
+        missing = self._missing_sources()
+        if not missing:
+            return 0
+        names = ", ".join(Path(x.path).name for x in missing[:4]) + (" and more" if len(missing) > 4 else "")
+        if ask:
+            r = QMessageBox.question(
+                self, "Missing sources",
+                f"{len(missing)} source file(s) aren't where the project left them: {names}.\n\n"
+                f"Last seen at {missing[0].path}.\n\nFind them? Pick the new place of {Path(missing[0].path).name}; "
+                "the others are looked for in the same folder.", QMessageBox.Yes | QMessageBox.No)
+            if r != QMessageBox.Yes:
+                self.statusBar().showMessage(f"missing source: {missing[0].path} (File > Find missing sources)", 15000)
+                return 0
+        f, _ = QFileDialog.getOpenFileName(self, f"Where is {Path(missing[0].path).name}?",
+                                           str(Path(missing[0].path).parent), "All files (*)")
+        if not f:
+            return 0
+        folder = Path(f).parent
+        self.project.checkpoint("find missing sources")
+        moved = 0
+        for x in missing:
+            new = Path(f) if x is missing[0] else folder / Path(x.path).name
+            if new.exists():
+                x.path = str(new.resolve())
+                moved += 1
+        self.statusBar().showMessage(f"found {moved} of {len(missing)} missing source(s) in {folder}", 10000)
+        return moved
+
+    def find_missing_sources(self) -> None:
+        if not self._missing_sources():
+            self.statusBar().showMessage("every source is where the project expects it", 5000)
+            return
+        if self._relink_missing(ask=False):
+            self._load_all_media()
+            self._refresh()
+
+    # ---------------------------------------- an earlier colorize, other settings
+
+    EARLIER_KEYS = ("model", "working_size", "denoise", "chroma_size", "deflicker", "dust")
+
+    def _earlier_for(self, c: Clip) -> dict | None:
+        """Settings an earlier, finished colorize of this clip was made with,
+        if the current settings have none and switching would bring it back."""
+        from ..video.pipeline import earlier_analyses, finished_analysis
+
+        cur = self.project.d.settings
+        memo_key = (c.id, c.path, json.dumps({k: cur.get(k) for k in self.EARLIER_KEYS}, sort_keys=True))
+        if memo_key in self._earlier:
+            return self._earlier[memo_key]
+        found = None
+        try:
+            cands = earlier_analyses(Path(c.path), c.neg)
+            # folders from before 0.9 have no record of their settings: try the
+            # other installed models with the current settings
+            from ..models import choices
+
+            for mid, _, have in choices():
+                if have and mid != cur.get("model"):
+                    cands.append({**{k: cur.get(k) for k in self.EARLIER_KEYS}, "model": mid})
+            for mw in cands:
+                trial = {**cur, **{k: mw[k] for k in self.EARLIER_KEYS if k in mw}}
+                if all(trial.get(k) == cur.get(k) for k in self.EARLIER_KEYS):
+                    continue
+                if finished_analysis(Path(c.path), VideoSettings.from_project(trial), trial["model"],
+                                     negative=c.neg) is not None:
+                    found = {k: trial[k] for k in self.EARLIER_KEYS}
+                    break
+        except OSError:
+            found = None
+        self._earlier[memo_key] = found
+        return found
+
+    def use_earlier_colour(self) -> None:
+        c = self._selected_clip()
+        mw = self._earlier_for(c) if c else None
+        if not mw:
+            return
+        self.project.checkpoint("use the earlier colour's settings")
+        self.project.d.settings.update(mw)
+        self.inspector.set_models(mw["model"])
+        self.statusBar().showMessage(f"switched to the settings {c.name} was colorized with: {self._describe(mw)}", 10000)
+        self._refresh()
+
+    def _describe(self, mw: dict) -> str:
+        cur = self.project.d.settings
+        parts = [f"{k.replace('_', ' ')} {mw[k]}" for k in self.EARLIER_KEYS if mw.get(k) != cur.get(k)]
+        return ", ".join(parts) or "the same settings"
 
     def open_project_dialog(self) -> None:
         if not self._confirm_discard():
@@ -2482,7 +2683,9 @@ class MainWindow(QMainWindow):
     def _autosave(self) -> None:
         from .. import autosave
 
+        self._flush_edits()
         if self.project.dirty and (self.project.d.clips or self.project.d.photos):
+            self.project.d.view = self._capture_view()
             try:
                 autosave.write(self.project)
             except OSError:
@@ -2531,8 +2734,10 @@ class MainWindow(QMainWindow):
     def save_project(self) -> bool:
         from .. import autosave
 
+        self._flush_edits()
         if self.project.path is None:
             return self.save_project_as()
+        self.project.d.view = self._capture_view()
         try:
             self.project.save()
         except OSError as e:
@@ -2568,11 +2773,12 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard():
             ev.ignore()
             return
-        self.project.dirty = False  # saved or discarded: either way nothing to recover
         if self.runner.busy() and QMessageBox.question(
                 self, "Jobs running", "Jobs are still running. Stop them and quit?") != QMessageBox.Yes:
             ev.ignore()
             return
+        self.project.dirty = False  # saved or discarded: either way nothing to recover
+        self._save_layout()
         self.shutdown()
         ev.accept()
 

@@ -72,21 +72,31 @@ def photo_result_path(src: str, settings: dict, model: str, strokes: list | None
     from .reference import reference_id
     from .video.pipeline import cache_root
 
+    from .sourceid import adopt, source_id
+
     p = Path(src)
     st = p.stat()
     keys = {k: settings.get(k) for k in ("working_size", "grain", "denoise")}
-    d = {"p": str(p.resolve()), "s": st.st_size, "m": st.st_mtime_ns,
-         "set": keys, "model": model, "hints": strokes_key(strokes) if strokes else None}
+    common = {"set": keys, "model": model, "hints": strokes_key(strokes) if strokes else None}
+    d = {"src_id": source_id(p), **common}
+    legacy = {"p": str(p.resolve()), "s": st.st_size, "m": st.st_mtime_ns, **common}
     if strokes:  # what painting does, and how far it reaches
         from .video.hints_pass import PAINT_VERSION
 
-        d["paint"] = f"{PAINT_VERSION}:{settings.get('paint_spread', 0.35)}"
+        d["paint"] = legacy["paint"] = f"{PAINT_VERSION}:{settings.get('paint_spread', 0.35)}"
     if negative:  # only when set, so earlier results keep their names
-        d["neg"] = dict(sorted(negative.items()))
+        d["neg"] = legacy["neg"] = dict(sorted(negative.items()))
     if reference_id(reference):
-        d["ref"] = reference_id(reference)
-    ident = json.dumps(d, sort_keys=True)
-    return cache_root() / "photos" / (hashlib.sha256(ident.encode()).hexdigest()[:20] + ".png")
+        d["ref"] = legacy["ref"] = reference_id(reference)
+
+    def name(x):
+        return cache_root() / "photos" / (hashlib.sha256(json.dumps(x, sort_keys=True).encode()).hexdigest()[:20]
+                                          + ".png")
+
+    out = name(d)
+    if not out.exists():  # a result from before 0.9, named after the path and time
+        adopt(name(legacy), out)
+    return out
 
 
 def finish_photo(rgb, settings: dict, grade: dict | None):

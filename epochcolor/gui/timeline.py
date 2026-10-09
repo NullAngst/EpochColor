@@ -7,7 +7,8 @@ keeps it simple and fast at any zoom.
 Mouse: click to move the playhead, drag on the ruler to scrub, click a
 segment to select it, drag a segment's edge to trim it, drag its middle to
 move it, click an audio track's name to switch it on or off. Ctrl+wheel
-zooms around the cursor, the wheel scrolls.
+(or Alt+wheel) zooms around the cursor, the wheel scrolls. The zoom bar
+under it does the same with buttons, down to single frames.
 """
 
 from __future__ import annotations
@@ -15,7 +16,9 @@ from __future__ import annotations
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPainterPath, QPen, QPolygonF
-from PySide6.QtWidgets import QScrollBar, QToolTip, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QHBoxLayout, QLabel, QScrollBar, QSlider, QToolButton, QToolTip, QVBoxLayout, QWidget,
+)
 
 from ..project import Project
 from . import theme
@@ -25,6 +28,8 @@ RULER_H = 22
 VIDEO_H = 58
 AUDIO_H = 30
 EDGE_GRAB = 6
+MIN_ZOOM, MAX_ZOOM = 0.005, 80.0  # px per frame: a feature on one screen, down to one frame per 80 px
+FRAMES_ZOOM = 24.0  # the Frames button: every frame wide enough to click
 
 
 def timecode(frame: int, fps: float) -> str:
@@ -88,15 +93,29 @@ class TimelineCanvas(QWidget):
         return HEAD_W + (frame - self.offset) * self.zoom
 
     def frame_at(self, x: float) -> int:
-        f = int(round((x - HEAD_W) / self.zoom + self.offset))
+        """The frame whose box is under x. Frame f spans x_of(f) to x_of(f + 1),
+        so this floors: clicking anywhere on a frame's box picks that frame."""
+        f = int(np.floor((x - HEAD_W) / self.zoom + self.offset))
         return max(0, min(f, max(0, self.project.duration - 1)))
+
+    def zoom_to(self, zoom: float, frame: float | None = None, x: float | None = None) -> None:
+        """Set the zoom, keeping `frame` at screen x (default: the playhead where it is)."""
+        if frame is None:
+            frame = self.playhead + 0.5
+        if x is None:
+            x = self.x_of(frame)
+            if not HEAD_W <= x <= self.width():  # off screen: bring it to the middle
+                x = HEAD_W + (self.width() - HEAD_W) / 2
+        self.zoom = float(np.clip(zoom, MIN_ZOOM, MAX_ZOOM))
+        self.offset = max(0.0, frame - (x - HEAD_W) / self.zoom)
+        self.update()
 
     def visible_frames(self) -> float:
         return max(1.0, (self.width() - HEAD_W) / self.zoom)
 
     def fit(self) -> None:
         dur = max(1, self.project.duration)
-        self.zoom = max(0.02, (self.width() - HEAD_W - 16) / dur)
+        self.zoom = float(np.clip((self.width() - HEAD_W - 16) / dur, MIN_ZOOM, MAX_ZOOM))
         self.offset = 0
         self.update()
 
@@ -163,8 +182,13 @@ class TimelineCanvas(QWidget):
             yy += AUDIO_H
         p.setPen(QColor(theme.LINE))
         p.drawLine(HEAD_W, 0, HEAD_W, self.height())
-        # playhead
+        # playhead: zoomed in far enough to see frames, the frame it's on is a
+        # lit box, so what you click is what you get
         x = self.x_of(self.playhead)
+        if x >= HEAD_W and self.zoom >= 3:
+            c = QColor(theme.PLAYHEAD)
+            c.setAlpha(55)
+            p.fillRect(QRectF(x, RULER_H, self.zoom, y - RULER_H), c)
         if x >= HEAD_W:
             p.setPen(QPen(QColor(theme.PLAYHEAD), 1.5))
             p.drawLine(QPointF(x, 0), QPointF(x, y))
@@ -179,6 +203,14 @@ class TimelineCanvas(QWidget):
         step = next((s for s in steps if s * self.zoom >= 90), steps[-1])
         f = int(self.offset // step) * step
         f_end = self.offset + self.visible_frames()
+        if self.zoom >= 6:  # a tick per frame
+            p.setPen(QColor(theme.LINE))
+            g = int(self.offset)
+            while g <= f_end:
+                xg = self.x_of(g)
+                if xg >= HEAD_W:
+                    p.drawLine(QPointF(xg, RULER_H - 3), QPointF(xg, RULER_H))
+                g += 1
         p.setFont(QFont(self.font().family(), 8))
         while f <= f_end:
             x = self.x_of(f)
@@ -186,7 +218,7 @@ class TimelineCanvas(QWidget):
                 p.setPen(QColor(theme.LINE))
                 p.drawLine(QPointF(x, RULER_H - 7), QPointF(x, RULER_H))
                 p.setPen(QColor(theme.DIM))
-                p.drawText(QPointF(x + 3, 13), timecode(f, fps))
+                p.drawText(QPointF(x + 3, 13), timecode(f, fps) + (f"  #{f}" if self.zoom >= 6 else ""))
             f += step
         if self.project.d.range:
             a, b = self.project.d.range
@@ -244,6 +276,13 @@ class TimelineCanvas(QWidget):
                 else:
                     p.fillRect(sr, QColor(col.red(), col.green(), col.blue(), 90))
                     p.fillRect(sr, QBrush(col, Qt.BDiagPattern))
+            if self.zoom >= 6:  # frame boundaries, faintly, so a click lands where you mean
+                p.setPen(QPen(QColor(0, 0, 0, 70), 1))
+                g0 = max(seg.src_in, int(seg.src_in + (HEAD_W - x0) / self.zoom))
+                g1 = min(seg.src_out, int(seg.src_in + (self.width() - x0) / self.zoom) + 1)
+                for g in range(g0, g1):
+                    xg = self.x_of(start + g - seg.src_in)
+                    p.drawLine(QPointF(xg, r.top() + 14), QPointF(xg, r.bottom()))
             # shot cuts inside the segment
             p.setPen(QPen(QColor(theme.CUT), 1))
             for a, _ in clip.shots:
@@ -409,11 +448,9 @@ class TimelineCanvas(QWidget):
 
     def wheelEvent(self, ev) -> None:
         dy = ev.angleDelta().y() or ev.angleDelta().x()
-        if ev.modifiers() & Qt.ControlModifier:
+        if ev.modifiers() & (Qt.ControlModifier | Qt.AltModifier):
             x = ev.position().x()
-            anchor = (x - HEAD_W) / self.zoom + self.offset
-            self.zoom = float(np.clip(self.zoom * (1.25 if dy > 0 else 0.8), 0.01, 40.0))
-            self.offset = max(0.0, anchor - (x - HEAD_W) / self.zoom)
+            self.zoom_to(self.zoom * (1.25 if dy > 0 else 0.8), (x - HEAD_W) / self.zoom + self.offset, x)
         else:
             self.offset = max(0.0, self.offset - dy / self.zoom * 0.5)
         if hasattr(self.parent(), "sync_scroll"):
@@ -421,8 +458,16 @@ class TimelineCanvas(QWidget):
         self.update()
 
 
+def _slider_of(zoom: float) -> int:
+    return int(round(1000 * np.log(zoom / MIN_ZOOM) / np.log(MAX_ZOOM / MIN_ZOOM)))
+
+
+def _zoom_of(v: int) -> float:
+    return float(MIN_ZOOM * (MAX_ZOOM / MIN_ZOOM) ** (v / 1000))
+
+
 class Timeline(QWidget):
-    """Canvas plus a horizontal scroll bar."""
+    """Canvas, a horizontal scroll bar, and the zoom bar."""
 
     def __init__(self, project: Project, media: MediaCache, parent=None):
         super().__init__(parent)
@@ -434,6 +479,54 @@ class Timeline(QWidget):
         lay.addWidget(self.canvas, 1)
         lay.addWidget(self.bar)
         self.bar.valueChanged.connect(self._scrolled)
+        # zoom: buttons and a slider, all anchored on the playhead
+        zb = QHBoxLayout()
+        zb.setContentsMargins(6, 2, 6, 2)
+        zb.addWidget(QLabel("Zoom"))
+        self.zoom_out = QToolButton()
+        self.zoom_out.setText("-")
+        self.zoom_out.setToolTip("Zoom out (- or Ctrl+wheel)")
+        self.zoom_in = QToolButton()
+        self.zoom_in.setText("+")
+        self.zoom_in.setToolTip("Zoom in (= or Ctrl+wheel)")
+        self.zoom_slider = QSlider(Qt.Horizontal)
+        self.zoom_slider.setRange(0, 1000)
+        self.zoom_slider.setFixedWidth(220)
+        self.zoom_slider.setToolTip("Zoom, around the playhead. Far right shows single frames.")
+        self.fit_btn = QToolButton()
+        self.fit_btn.setText("Fit")
+        self.fit_btn.setToolTip("The whole timeline on screen (Shift+Z)")
+        self.frames_btn = QToolButton()
+        self.frames_btn.setText("Frames")
+        self.frames_btn.setToolTip("Zoom in to single frames around the playhead (Shift+F), to pick exact frames. "
+                                   "Left and Right step one frame.")
+        self.zoom_label = QLabel("")
+        self.zoom_label.setStyleSheet(f"color: {theme.DIM};")
+        for w in (self.zoom_out, self.zoom_slider, self.zoom_in, self.fit_btn, self.frames_btn, self.zoom_label):
+            zb.addWidget(w)
+        zb.addStretch(1)
+        lay.addLayout(zb)
+        self.zoom_out.clicked.connect(lambda: self.zoom_by(0.5))
+        self.zoom_in.clicked.connect(lambda: self.zoom_by(2.0))
+        self.zoom_slider.valueChanged.connect(self._slid)
+        self.fit_btn.clicked.connect(self.fit)
+        self.frames_btn.clicked.connect(self.frames)
+
+    def zoom_by(self, k: float) -> None:
+        self.canvas.zoom_to(self.canvas.zoom * k)
+        self.sync_scroll()
+
+    def fit(self) -> None:
+        self.canvas.fit()
+        self.sync_scroll()
+
+    def frames(self) -> None:
+        self.canvas.zoom_to(FRAMES_ZOOM)
+        self.sync_scroll()
+
+    def _slid(self, v: int) -> None:
+        self.canvas.zoom_to(_zoom_of(v))
+        self.sync_scroll()
 
     def sync_scroll(self) -> None:
         c = self.canvas
@@ -444,6 +537,15 @@ class Timeline(QWidget):
         self.bar.setPageStep(max(1, vis))
         self.bar.setValue(int(c.offset))
         self.bar.blockSignals(False)
+        self.zoom_slider.blockSignals(True)
+        self.zoom_slider.setValue(_slider_of(c.zoom))
+        self.zoom_slider.blockSignals(False)
+        fps = float(c.project.fps or 24)
+        vis_f = c.visible_frames()
+        span = f"{vis_f:.0f} frames" if vis_f < fps * 10 else timecode(int(vis_f), fps)
+        self.zoom_label.setText(f"showing {span}" + (f", {c.zoom:.0f} px per frame" if c.zoom >= 1 else ""))
+        self.zoom_in.setEnabled(c.zoom < MAX_ZOOM)
+        self.zoom_out.setEnabled(c.zoom > MIN_ZOOM)
 
     def _scrolled(self, v: int) -> None:
         self.canvas.offset = float(v)
